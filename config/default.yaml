@@ -1,0 +1,5 @@
+inspection:
+  statistics_window_frames: 250000
+  diagnostic_plot_frames: 20000
+  compute_sha256: true
+  assumed_iq_order: IQ
