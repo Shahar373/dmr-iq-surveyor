@@ -142,6 +142,7 @@ def _load_attempt(
         ),
         "talkgroup_ids": list(evidence.get("talkgroup_ids", [])),
         "radio_ids": list(evidence.get("radio_ids", [])),
+        "capture_metadata": dict(extraction.get("capture_metadata") or {}),
         "output_dir": str(attempt_dir.resolve()),
         "events": event_rows,
         "sessions": session_rows,
@@ -183,7 +184,9 @@ def build_inventory(
     )
 
     attempts: list[dict[str, Any]] = []
-    for attempt_dir in sorted(source.glob("C*/**/iq")):
+    for attempt_dir in sorted(source.glob("C*/**/iq")) + sorted(
+        source.glob("T*/**/iq")
+    ) + sorted(source.glob("L*/**/iq")):
         attempt = _load_attempt(
             attempt_dir,
             resolved_run_id,
