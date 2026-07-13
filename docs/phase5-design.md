@@ -1,10 +1,12 @@
 # Phase 5 design — persistent DMR event and channel inventory
 
-Phase 5 sits above the Phase 4.1 decoder outputs. It does not demodulate RF again and it does not infer identities that are absent from DSD-FME evidence. Its job is to turn decoder logs into a persistent, queryable history that can grow across future field sessions.
+Phase 5 sits above Phase 4.1 decoder outputs. It does not infer identities absent from DSD-FME evidence. Its job is to turn logs into a persistent, queryable history across field sessions.
+
+Phase 5.1 extends the input paths with targeted known-frequency processing, capture metadata and standalone-log import.
 
 ## Inputs
 
-A Phase 4/4.1 decode tree:
+Standard Phase 4/4.1 tree:
 
 ```text
 decodes/CANDIDATE_ID/RECORDING_ID/iq/
@@ -12,43 +14,51 @@ decodes/CANDIDATE_ID/RECORDING_ID/iq/
 └── decoder/
     ├── decoder_report.json
     ├── dsd_fme_normal_stderr.log
-    ├── dsd_fme_normal_stdout.log
-    ├── dsd_fme_inverted_stderr.log
-    └── dsd_fme_inverted_stdout.log
+    └── dsd_fme_inverted_stderr.log
 ```
 
-Phase 5 reads only the polarity selected by `decoder_report.json`.
+Targeted trees use `T<frequency>` candidate IDs. Standalone imports use `L<frequency>` IDs. Phase 5 reads only the polarity selected by `decoder_report.json`.
 
 ## Event parser
 
-The parser strips ANSI terminal formatting and preserves raw evidence plus source line order. It recognizes:
+The parser strips ANSI formatting, preserves raw line order and recognizes:
 
-- signed `Sync: +DMR` and `Sync: -DMR` lines;
-- the bracketed active slot, `[SLOT1]` or `[slot2]`;
-- numeric Color Codes;
-- IDLE, CSBK, DATA, VOICE, and VC1–VC6 stages;
-- `Activity Update TS1/TS2` states;
-- Talkgroup, Target, Source, and Radio IDs when explicitly printed;
-- Motorola data-channel lines;
-- logical-slot/network-state lines;
-- CRC, FEC, CACH, frame, and other decoder-error evidence.
+- signed `Sync: +DMR` / `Sync: -DMR`;
+- bracketed active slot;
+- numeric Color Code;
+- IDLE, CSBK, DATA, VOICE and VC1–VC6;
+- Activity Update states;
+- explicit Talkgroup/Target and Radio/Source IDs;
+- vendor/network-state evidence;
+- CRC, FEC, CACH, frame and other decoder errors.
 
-The event ledger stores decoder clock text, but it does not claim that the clock is the original RF capture time. Offline DSD-FME runs may print processing-time wall clocks.
+Decoder clock text is evidence only and is not treated as guaranteed RF capture time.
 
 ## Session correlation
 
-Non-idle events are grouped independently per slot. A new burst/session starts when the configurable line gap is exceeded or an IDLE event closes the active slot group. Identity lines are attached to the nearest recent active session within a bounded lookback.
+Non-idle events are grouped independently per slot. A new group starts when the configurable line gap is exceeded or IDLE closes the slot. Identity lines attach to a nearby active group within a bounded lookback.
 
-Session timing fields are conservative:
+Session types:
 
-- `line_order_only` when no usable decoder-clock range exists;
-- `decoder_clock_estimate` when the decoder clock is monotonic and the interval is reasonable.
+```text
+voice
+data
+control
+mixed
+idle
+error_only
+```
 
-These records are useful for call/burst correlation, but they are not a substitute for source capture timestamps.
+`error_only` means every event in the group is a decoder error. These groups remain in SQLite and exports for quality analysis but are excluded from `meaningful_sessions`.
+
+Timing confidence:
+
+- `line_order_only` when no usable clock range exists;
+- `decoder_clock_estimate` when decoder clocks are monotonic and plausible.
 
 ## Persistent database
 
-Phase 5 uses the Python standard-library `sqlite3` module. Tables:
+SQLite tables:
 
 ```text
 runs
@@ -58,22 +68,23 @@ sessions
 channels
 ```
 
-The selected `run_id` is replaced atomically when imported again, making the command idempotent. Different run IDs remain in the same database and rebuild cumulative channel aggregates.
+Re-importing one `run_id` replaces that run before aggregates are rebuilt. Different run IDs accumulate.
+
+The `attempts` table includes `capture_metadata_json`. Existing databases are migrated automatically when the column is missing.
 
 The `channels` table aggregates:
 
-- frequency;
-- dominant Color Code and consistency;
-- clean, degraded, and sync-only attempt counts;
+- frequency and dominant CC consistency;
+- clean/degraded/sync-only attempts;
 - slot activity;
-- voice, data, control, and error counts;
-- unioned Talkgroup and Radio IDs;
-- first and last run IDs;
-- best quality score and worst error ratio.
+- voice/data/control/error counts;
+- unioned explicit TG and Radio IDs;
+- first/last run IDs;
+- best quality and worst error ratio.
 
 ## Commands
 
-Direct directory import:
+Standard tree import:
 
 ```bash
 dmr-surveyor inventory-build \
@@ -89,11 +100,30 @@ Configured import:
 dmr-surveyor inventory-batch config/shahar_recordings.yaml
 ```
 
-Raspberry Pi helper:
+Targeted known-frequency pipeline:
 
 ```bash
-chmod +x scripts/run_shahar_inventory.sh
-./scripts/run_shahar_inventory.sh
+dmr-surveyor targeted-decode \
+  /path/to/channel-centered.wav \
+  --frequency 164537500 \
+  --profile auto \
+  --metadata config/my_targeted_capture.yaml \
+  --run-id field_YYYYMMDD_site_a \
+  --output runs/targeted/field_YYYYMMDD_site_a \
+  --database runs/inventory/dmr_inventory.sqlite3
+```
+
+Standalone log import:
+
+```bash
+dmr-surveyor inventory-import-log \
+  /path/to/dsd-fme.log \
+  --frequency 164537500 \
+  --run-id external_YYYYMMDD_site_a \
+  --recording-id site_a \
+  --metadata config/my_targeted_capture.yaml \
+  --output runs/standalone/external_YYYYMMDD_site_a \
+  --database runs/inventory/dmr_inventory.sqlite3
 ```
 
 ## Outputs
@@ -111,44 +141,64 @@ inventory/
 ├── channels.json
 ├── import_manifest.json
 └── phase5_report.md
-
-runs/inventory/
-└── dmr_inventory.sqlite3
 ```
 
-The per-run export directory is reproducible. The shared SQLite database is the long-lived inventory.
+The report and manifest expose:
 
-## Real-data regression baseline
+```text
+sessions
+meaningful_sessions
+error_only_sessions
+session_types
+```
 
-The archived Phase 4.1 results produce:
+## Validated archived baseline
 
 ```text
 15 attempts
 8 channels
-4,811 parsed events
-146 correlated non-idle sessions with max_gap_lines=12
-voice evidence on 164.537500 MHz only
+4,811 events
+146 total sessions
+45 meaningful sessions
+101 error-only sessions
+voice evidence only on 164.537500 MHz
 no Talkgroup IDs
 no Radio IDs
 ```
 
-The absence of IDs is preserved as an empty result and is never replaced with guesses.
+## Phase 5.1 extraction profiles
 
-## Field-collection strategy after Phase 5
+| Profile | Exact input rate | Complex intermediate rate |
+|---|---:|---:|
+| `10m` | 10,000,000 S/s | 100,000 S/s |
+| `500k` | 500,000 S/s | 100,000 S/s |
+| `250k` | 250,000 S/s | 50,000 S/s |
+| `auto` | exact detected match | selected profile |
 
-Long 10 MHz IQ recordings should not be the default approach for collecting Talkgroup and Radio IDs. Signed 16-bit stereo IQ at 10 MS/s is approximately 40 MB/s, or about 2.4 GB per minute.
+Profile-rate mismatches fail before IQ processing. All profiles end at 48 kHz mono PCM16 with peak-safe normalization.
 
-For identity collection:
+Metadata can declare sample rate and center frequency; these values are validated against the recording before processing.
 
-1. select one confirmed DMR channel;
-2. center the receiver on that channel rather than leaving it near a wideband edge;
-3. record a narrower 250–500 kS/s IQ stream when the application permits;
-4. capture 5–15 minutes during known operational activity;
-5. preserve location, antenna, gain, center frequency, sample rate, and start time;
-6. run Phase 4/4.1, then import the result with a new Phase 5 `run_id`.
+## Field strategy
 
-At 250 kS/s, signed 16-bit complex IQ is roughly 60 MB per minute. At 500 kS/s, it is roughly 120 MB per minute. These captures are much more practical on the Raspberry Pi than 10 MHz wideband recordings.
+For identity collection, start with:
+
+```text
+164.537500 MHz / CC8
+500 kS/s
+5–15 minutes
+AGC off
+fixed manual gain
+```
+
+500 kS/s is preferred for the first real targeted run because it provides more tuning and filtering margin. `250k` is supported after real-data validation.
+
+For multi-location coverage work, retain the documented 10 MS/s, 15–20 second, two-repeat survey profile. See:
+
+- `docs/PHASE5-1-TARGETED-CAPTURE.md`
+- `docs/FIELD-RECORDING-GUIDE.md`
+- `docs/TRANSMITTER-LOCATION-STUDY.md`
 
 ## Passive scope
 
-Phase 5 is receive-side log analysis and inventory management. It contains no transmit, injection, impersonation, authentication bypass, brute force, or decryption capability.
+Phase 5 and Phase 5.1 are receive-side processing and inventory management. They contain no transmit, injection, impersonation, authentication bypass, brute-force or decryption capability.
