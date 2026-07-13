@@ -11,6 +11,7 @@ from dmr_iq_surveyor.inventory.sessions import (
     EventSession,
     correlate_sessions,
 )
+from dmr_iq_surveyor.inventory.standalone import import_standalone_log
 
 __all__ = [
     "EventSession",
@@ -18,6 +19,7 @@ __all__ = [
     "build_inventory",
     "build_inventory_from_config",
     "correlate_sessions",
+    "import_standalone_log",
     "parse_log_file",
     "parse_log_lines",
 ]
