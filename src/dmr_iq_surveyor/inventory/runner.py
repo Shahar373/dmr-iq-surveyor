@@ -73,10 +73,10 @@ def _load_attempt(
     parsed = parse_log_file(log_path) if log_path.is_file() else []
     sessions = correlate_sessions(parsed, max_gap_lines=max_gap_lines)
     candidate_id = str(
-        extraction.get("candidate_id") or attempt_dir.parents[2].name
+        extraction.get("candidate_id") or attempt_dir.parents[1].name
     )
     recording_id = str(
-        extraction.get("recording_id") or attempt_dir.parents[1].name
+        extraction.get("recording_id") or attempt_dir.parents[0].name
     )
     iq_order = str(
         extraction.get("iq_order") or attempt_dir.name.upper()
@@ -98,6 +98,9 @@ def _load_attempt(
             event.line_index,
             event.slot,
             event.event_type,
+            event.event_subtype,
+            event.talkgroup_id,
+            event.radio_id,
             event.raw_line,
         )
         event_rows.append(row)
@@ -166,12 +169,16 @@ def build_inventory(
     run_id: str | None = None,
     max_gap_lines: int = 12,
 ) -> dict[str, Any]:
+    if max_gap_lines < 1:
+        raise ValueError("max_gap_lines must be positive")
     source = Path(decodes_dir).expanduser().resolve()
     if not source.is_dir():
         raise FileNotFoundError(source)
     destination = Path(output_dir).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
     resolved_run_id = run_id or source.parent.name
+    if not resolved_run_id.strip():
+        raise ValueError("run_id must not be empty")
     database = (
         Path(database_path).expanduser().resolve()
         if database_path
