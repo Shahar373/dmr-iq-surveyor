@@ -76,3 +76,9 @@ phase4:
   iq_hypotheses:
     - "IQ"
   run_decoder: true
+
+phase5:
+  run_id: "20260713_163671500Hz_phase4_1"
+  max_gap_lines: 12
+  output_dir: "runs/20260713_163671500Hz/inventory"
+  database_path: "runs/inventory/dmr_inventory.sqlite3"
