@@ -1,6 +1,6 @@
 # DMR IQ Surveyor
 
-Offline Python tooling for inspecting SDRconnect wideband IQ recordings and building a reproducible frequency inventory before DMR decoding.
+Offline Python tooling for inspecting SDRconnect wideband IQ recordings, building a reproducible frequency inventory, extracting narrowband channels, and testing them with DSD-FME.
 
 Implemented stages:
 
@@ -16,8 +16,9 @@ Implemented stages:
 - Phase 3 narrowband candidate detection and ranking
 - spur, wideband, intermittent, and DMR-like preliminary classes
 - IQ-mirror frequency preservation while channel order remains assumed
-
-DSD-FME decoder confirmation is not implemented yet. Phase 3 labels are spectral hypotheses only.
+- Phase 4 streamed narrowband extraction
+- 48 kHz mono discriminator WAV generation
+- optional DSD-FME normal/inverted DMR attempts with captured evidence
 
 ## Install on Raspberry Pi OS, Debian, or Ubuntu
 
@@ -34,13 +35,17 @@ Activate the environment in future terminal sessions:
 source .venv/bin/activate
 ```
 
-## Inspect the configured recordings
+DSD-FME is optional. Without it, Phase 4 still creates discriminator WAV files and records `decoder_unavailable` instead of failing the extraction.
+
+## Run the configured workflow
+
+### Phase 1 — inspect recordings
 
 ```bash
 ./scripts/run_shahar_recordings.sh
 ```
 
-## Run Phase 2 spectrum analysis
+### Phase 2 — spectrum analysis
 
 ```bash
 ./scripts/run_shahar_spectrum.sh
@@ -62,7 +67,7 @@ Batch example:
 dmr-surveyor spectrum-batch config/shahar_recordings.yaml
 ```
 
-## Run Phase 3 candidate detection
+### Phase 3 — candidate detection
 
 ```bash
 ./scripts/run_shahar_detection.sh
@@ -83,6 +88,40 @@ dmr-surveyor detect-batch config/shahar_recordings.yaml
 ```
 
 The batch detector merges evidence from separate recordings without merging adjacent 12.5 kHz or 25 kHz channels. It keeps signals seen in only one recording and records both the assumed IQ frequency and the mirrored QI alternative.
+
+### Phase 4 — narrowband extraction and DSD-FME
+
+```bash
+chmod +x scripts/run_shahar_decode.sh
+./scripts/run_shahar_decode.sh
+```
+
+The helper runs with reduced CPU and I/O priority and limits numerical-library thread counts to one. Candidates and source recordings are processed sequentially.
+
+Extract one frequency manually:
+
+```bash
+dmr-surveyor extract-channel \
+  /full/path/to/recording.wav \
+  --frequency 165625000 \
+  --output runs/manual-165625000
+```
+
+Decode an existing discriminator WAV:
+
+```bash
+dmr-surveyor decode-channel \
+  runs/manual-165625000/discriminator.wav \
+  --output runs/manual-165625000/decoder
+```
+
+Run the configured Phase 3 candidates:
+
+```bash
+dmr-surveyor decode-batch config/shahar_recordings.yaml
+```
+
+The upstream DSD-FME examples accept 48 kHz mono WAV input with `dsd-fme -i filename.wav`. The project adds `-fs` for DMR and also tries `-xr` when configured. A candidate is marked `confirmed_dmr` only when captured decoder output contains an explicit DMR sync line; exit status alone is not protocol evidence.
 
 ## Spectrum artifacts
 
@@ -120,11 +159,34 @@ candidates/
 └── candidate_report.md
 ```
 
-The detector scores integrated average and P95 SNR, occupancy, occupied width, equivalent width, spectral fill, symmetry, persistence, and peak concentration. `dmr_like_narrowband` is not a decoder confirmation.
+The detector scores integrated average and P95 SNR, occupancy, occupied width, equivalent width, spectral fill, symmetry, persistence, and peak concentration. `dmr_like_narrowband` is a spectral hypothesis, not decoder confirmation.
+
+## Phase 4 artifacts
+
+Each candidate, recording, and IQ hypothesis receives an independent directory:
+
+```text
+decodes/CANDIDATE_ID/RECORDING_ID/iq/
+├── discriminator.wav
+├── extraction_report.json
+├── extraction_report.md
+├── baseband_preview.npz
+└── decoder/
+    ├── dsd_fme_normal_stdout.log
+    ├── dsd_fme_normal_stderr.log
+    ├── dsd_fme_inverted_stdout.log
+    ├── dsd_fme_inverted_stderr.log
+    ├── decoder_report_normal.json
+    ├── decoder_report_inverted.json
+    ├── decoder_report.json
+    └── decoder_report.md
+```
+
+The batch root also contains `decode_batch_summary.csv`, `decode_batch_summary.json`, and `decode_batch_report.md`.
 
 ## IQ order
 
-The current recordings use the conventional `IQ` assumption. Statistics alone cannot prove channel order. Before geographic conclusions are made, compare one known off-center carrier with SDRconnect. If the spectrum is mirrored, rerun inspection and spectrum analysis with `QI` or change `inspection.assumed_iq_order` in the batch YAML.
+The current recordings use the conventional `IQ` assumption. Statistics alone cannot prove channel order. Phase 3 preserves the mirrored QI frequency, and Phase 4 can process `QI` as a separate hypothesis by adding it to `phase4.iq_hypotheses` in the YAML configuration.
 
 ## Tests
 
@@ -132,4 +194,8 @@ The current recordings use the conventional `IQ` assumption. Statistics alone ca
 pytest
 ```
 
-The tests cover RIFF/RF64 parsing, center-frequency fallback, batch resilience, frequency-axis construction, overlap logic, FFT tone placement, spectrum artifacts, candidate raster calculations, IQ mirror calculations, channel-shape classification, spur rejection, and candidate merging.
+The tests cover RIFF/RF64 parsing, center-frequency fallback, batch resilience, frequency-axis construction, overlap logic, FFT tone placement, spectrum artifacts, candidate raster calculations, IQ mirror calculations, channel-shape classification, spur rejection, candidate merging, phase-continuous mixing, streamed FM discrimination, adjacent-channel rejection, 48 kHz WAV properties, DSD-FME log parsing, and missing-decoder handling.
+
+## Passive scope
+
+The project performs offline receive-side analysis only. It contains no transmit, authentication, impersonation, injection, brute-force, or decryption capability.
