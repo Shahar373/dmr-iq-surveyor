@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dmr-iq-surveyor"
-version = "0.3.0"
+version = "0.4.0"
 description = "Offline inspection and analysis pipeline for SDRconnect wideband IQ recordings"
 readme = "README.md"
 requires-python = ">=3.11"
