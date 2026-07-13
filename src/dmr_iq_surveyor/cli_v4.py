@@ -56,7 +56,7 @@ def targeted_decode(
     timeout_seconds: Annotated[
         float,
         typer.Option(help="Maximum duration of each decoder attempt"),
-    ] = 120.0,
+    ] = 1_800.0,
     try_inverted: Annotated[
         bool,
         typer.Option("--try-inverted/--normal-only"),
@@ -151,7 +151,8 @@ def inventory_import_log(
         f"Imported {result['frequency_hz'] / 1e6:.6f} MHz as "
         f"{result['status']}"
     )
-    console.print(f"Open: {Path(output).resolve() / 'inventory' / 'phase5_report.md'}")
+    report_path = Path(output).resolve() / "inventory" / "phase5_report.md"
+    console.print(f"Open: {report_path}")
 
 
 __all__ = ["app"]
