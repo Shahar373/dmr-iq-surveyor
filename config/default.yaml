@@ -3,3 +3,16 @@ inspection:
   diagnostic_plot_frames: 20000
   compute_sha256: true
   assumed_iq_order: IQ
+
+spectrum:
+  fft_size: 65536
+  window: hann
+  overlap_ratio: 0.5
+  waterfall_time_bins: 500
+  waterfall_frequency_bins: 8192
+  edge_exclusion_hz: 150000
+  dc_exclusion_hz: 10000
+  percentile: 95
+  percentile_max_frames: 256
+  local_noise_window_hz: 200000
+  occupancy_threshold_db: 8.0
