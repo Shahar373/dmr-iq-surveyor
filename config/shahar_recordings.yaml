@@ -44,3 +44,35 @@ detection:
   merge_tolerance_hz: 3000
   passband_warning_low_hz: 159490000
   passband_warning_high_hz: 167680000
+
+channel_extraction:
+  chunk_frames: 1000000
+  first_decimation: 10
+  second_decimation: 10
+  first_filter_taps: 401
+  second_filter_taps: 801
+  channel_filter_taps: 161
+  first_cutoff_hz: 400000
+  second_cutoff_hz: 40000
+  channel_lowpass_hz: 7500
+  output_rate_hz: 48000
+  trim_seconds: 0.005
+  normalization_percentile: 99.5
+  output_peak_fraction: 0.90
+  preview_samples: 100000
+
+decoder:
+  binary: "dsd-fme"
+  timeout_seconds: 120
+  inversions:
+    - "normal"
+    - "inverted"
+
+phase4:
+  max_candidates: 8
+  candidate_classes:
+    - "dmr_like_narrowband"
+  minimum_confidence: 0.0
+  iq_hypotheses:
+    - "IQ"
+  run_decoder: true
