@@ -16,6 +16,11 @@ from dmr_iq_surveyor.decode.dsd import (
 )
 from dmr_iq_surveyor.decode.extract import run_channel_extraction
 
+_CONFIRMED_STATUSES = {
+    "dmr_confirmed_clean",
+    "dmr_confirmed_degraded",
+}
+
 
 def _dataclass_from_mapping(
     cls: type,
@@ -113,6 +118,35 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _empty_row(
+    *,
+    candidate_id: str,
+    recording_id: str,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate_id,
+        "recording_id": recording_id,
+        "iq_order": "",
+        "frequency_hz": "",
+        "extraction_status": "skipped",
+        "decoder_status": "",
+        "best_inversion": "",
+        "quality_score": "",
+        "dmr_sync_count": "",
+        "dominant_color_code": "",
+        "valid_color_code_ratio": "",
+        "dominant_color_code_consistency": "",
+        "error_ratio": "",
+        "slot1_sync_count": "",
+        "slot2_sync_count": "",
+        "talkgroup_ids": "",
+        "radio_ids": "",
+        "error": error,
+        "output_dir": "",
+    }
+
+
 def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
     config = _load_phase4_config(config_path)
     output_root: Path = config["output_root"]
@@ -150,23 +184,11 @@ def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
             recording = recording_lookup.get(str(recording_id))
             if recording is None:
                 rows.append(
-                    {
-                        "candidate_id": candidate_id,
-                        "recording_id": recording_id,
-                        "iq_order": "",
-                        "frequency_hz": "",
-                        "extraction_status": "skipped",
-                        "decoder_status": "",
-                        "best_inversion": "",
-                        "dmr_sync_count": "",
-                        "color_codes": "",
-                        "talkgroup_ids": "",
-                        "radio_ids": "",
-                        "error": (
-                            "recording id not found in config"
-                        ),
-                        "output_dir": "",
-                    }
+                    _empty_row(
+                        candidate_id=candidate_id,
+                        recording_id=str(recording_id),
+                        error="recording id not found in config",
+                    )
                 )
                 continue
             for iq_order in config["phase4"]["iq_hypotheses"]:
@@ -185,8 +207,14 @@ def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
                 extraction_status = "ok"
                 decoder_status = "not_run"
                 best_inversion = ""
+                quality_score: float | str = ""
                 sync_count: int | str = ""
-                color_codes: list[int] | str = ""
+                dominant_color_code: int | str = ""
+                valid_color_code_ratio: float | str = ""
+                dominant_consistency: float | str = ""
+                error_ratio: float | str = ""
+                slot1_count: int | str = ""
+                slot2_count: int | str = ""
                 talkgroups: list[int] | str = ""
                 radio_ids: list[int] | str = ""
                 try:
@@ -209,6 +237,9 @@ def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
                         best_inversion = decoder[
                             "best_inversion"
                         ]
+                        quality_score = decoder[
+                            "best_quality_score"
+                        ]
                         best = next(
                             attempt
                             for attempt in decoder["attempts"]
@@ -219,7 +250,24 @@ def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
                         sync_count = evidence[
                             "dmr_sync_count"
                         ]
-                        color_codes = evidence["color_codes"]
+                        dominant_color_code = (
+                            evidence["dominant_color_code"]
+                            if evidence["dominant_color_code"] is not None
+                            else ""
+                        )
+                        valid_color_code_ratio = evidence[
+                            "valid_color_code_ratio"
+                        ]
+                        dominant_consistency = evidence[
+                            "dominant_color_code_consistency"
+                        ]
+                        error_ratio = evidence["error_ratio"]
+                        slot1_count = evidence[
+                            "slot1_sync_count"
+                        ]
+                        slot2_count = evidence[
+                            "slot2_sync_count"
+                        ]
                         talkgroups = evidence[
                             "talkgroup_ids"
                         ]
@@ -236,8 +284,14 @@ def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
                         "extraction_status": extraction_status,
                         "decoder_status": decoder_status,
                         "best_inversion": best_inversion,
+                        "quality_score": quality_score,
                         "dmr_sync_count": sync_count,
-                        "color_codes": color_codes,
+                        "dominant_color_code": dominant_color_code,
+                        "valid_color_code_ratio": valid_color_code_ratio,
+                        "dominant_color_code_consistency": dominant_consistency,
+                        "error_ratio": error_ratio,
+                        "slot1_sync_count": slot1_count,
+                        "slot2_sync_count": slot2_count,
                         "talkgroup_ids": talkgroups,
                         "radio_ids": radio_ids,
                         "error": error,
@@ -251,8 +305,20 @@ def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
         decodes_root / "decode_batch_summary.csv",
         rows,
     )
+    clean = sum(
+        row["decoder_status"] == "dmr_confirmed_clean"
+        for row in rows
+    )
+    degraded = sum(
+        row["decoder_status"] == "dmr_confirmed_degraded"
+        for row in rows
+    )
+    sync_only = sum(
+        row["decoder_status"] == "dmr_sync_only"
+        for row in rows
+    )
     confirmed = sum(
-        row["decoder_status"] == "confirmed_dmr"
+        row["decoder_status"] in _CONFIRMED_STATUSES
         for row in rows
     )
     unavailable = sum(
@@ -266,6 +332,9 @@ def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
         "selected_candidate_count": len(selected),
         "attempt_count": len(rows),
         "confirmed_dmr_attempts": confirmed,
+        "clean_dmr_attempts": clean,
+        "degraded_dmr_attempts": degraded,
+        "sync_only_attempts": sync_only,
         "decoder_unavailable_attempts": unavailable,
         "phase4": config["phase4"],
         "channel_extraction": config["extraction"].to_dict(),
@@ -278,10 +347,14 @@ def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
     )
     table = [
         (
-            "| Candidate | Recording | IQ | Frequency MHz | "
-            "Extraction | Decoder | Syncs | CC |"
+            "| Candidate | Recording | IQ | Frequency MHz | Extraction | "
+            "Decoder | Polarity | Score | Syncs | CC | CC valid | Errors | "
+            "S1 | S2 |"
         ),
-        "|---|---|---|---:|---|---|---:|---|",
+        (
+            "|---|---|---|---:|---|---|---|---:|---:|---:|---:|---:|"
+            "---:|---:|"
+        ),
     ]
     for row in rows:
         frequency_mhz = (
@@ -294,9 +367,19 @@ def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
             if row["dmr_sync_count"] != ""
             else "-"
         )
-        color_codes = (
-            row["color_codes"]
-            if row["color_codes"] != ""
+        score = (
+            f"{float(row['quality_score']):.3f}"
+            if row["quality_score"] != ""
+            else "-"
+        )
+        valid_cc = (
+            f"{float(row['valid_color_code_ratio']):.1%}"
+            if row["valid_color_code_ratio"] != ""
+            else "-"
+        )
+        errors = (
+            f"{float(row['error_ratio']):.1%}"
+            if row["error_ratio"] != ""
             else "-"
         )
         table.append(
@@ -306,14 +389,23 @@ def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
             f"{frequency_mhz:.6f} | "
             f"{row['extraction_status']} | "
             f"{row['decoder_status'] or '-'} | "
-            f"{syncs} | {color_codes} |"
+            f"{row['best_inversion'] or '-'} | "
+            f"{score} | {syncs} | "
+            f"{row['dominant_color_code'] or '-'} | "
+            f"{valid_cc} | {errors} | "
+            f"{row['slot1_sync_count'] or '-'} | "
+            f"{row['slot2_sync_count'] or '-'} |"
         )
     report = f"""# Phase 4 narrowband extraction and decoding
 
 - Selected candidates: **{len(selected)}**
 - Attempts: **{len(rows)}**
-- Attempts with explicit DMR sync: **{confirmed}**
+- Clean DMR attempts: **{clean}**
+- Degraded DMR attempts: **{degraded}**
+- Sync-only attempts: **{sync_only}**
 - Decoder unavailable attempts: **{unavailable}**
+- Confirmed attempts require numeric, internally consistent Color Code evidence.
+- Polarity is selected by evidence quality, not raw sync-line count.
 - Recordings and IQ hypotheses are processed independently.
 
 {chr(10).join(table)}
