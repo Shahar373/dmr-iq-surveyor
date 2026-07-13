@@ -204,32 +204,59 @@ def normalize_pcm16(
     samples: NDArray[np.float32 | np.float64],
     percentile: float,
     peak_fraction: float,
-) -> tuple[NDArray[np.int16], dict[str, float | int]]:
+) -> tuple[NDArray[np.int16], dict[str, float | int | bool]]:
+    """Center and normalize discriminator audio without PCM16 clipping.
+
+    The percentile reference keeps normal signals at a useful level, while a
+    hard peak-safe scale cap prevents any sample from exceeding the requested
+    PCM16 peak fraction. The report records whether the peak cap reduced the
+    percentile-derived scale.
+    """
+
     values = np.asarray(samples, dtype=np.float64)
     if len(values) == 0:
         return np.empty(0, dtype=np.int16), {
             "center_removed": 0.0,
             "normalization_reference": 0.0,
+            "absolute_peak_reference": 0.0,
+            "percentile_scale": 0.0,
+            "peak_safe_scale": 0.0,
             "scale": 0.0,
+            "limiter_applied": False,
+            "would_clip_without_limiter": 0,
             "clipped_samples": 0,
             "peak_pcm": 0,
         }
     center = float(np.median(values))
     centered = values - center
-    reference = float(np.percentile(np.abs(centered), percentile))
+    absolute = np.abs(centered)
+    percentile_reference = float(np.percentile(absolute, percentile))
+    peak_reference = float(np.max(absolute))
     target = 32767.0 * float(peak_fraction)
-    scale = target / reference if reference > 1e-12 else 0.0
-    scaled = centered * scale
-    clipped = int(
-        np.count_nonzero((scaled > 32767.0) | (scaled < -32768.0))
+    percentile_scale = (
+        target / percentile_reference if percentile_reference > 1e-12 else 0.0
     )
-    pcm = np.clip(np.rint(scaled), -32768, 32767).astype(np.int16)
+    peak_safe_scale = target / peak_reference if peak_reference > 1e-12 else 0.0
+    scale = min(percentile_scale, peak_safe_scale)
+    would_clip = int(
+        np.count_nonzero(
+            (centered * percentile_scale > 32767.0)
+            | (centered * percentile_scale < -32768.0)
+        )
+    )
+    scaled = centered * scale
+    pcm = np.rint(scaled).astype(np.int16)
     peak_pcm = int(np.max(np.abs(pcm.astype(np.int32)))) if len(pcm) else 0
     return pcm, {
         "center_removed": center,
-        "normalization_reference": reference,
+        "normalization_reference": percentile_reference,
+        "absolute_peak_reference": peak_reference,
+        "percentile_scale": float(percentile_scale),
+        "peak_safe_scale": float(peak_safe_scale),
         "scale": float(scale),
-        "clipped_samples": clipped,
+        "limiter_applied": bool(peak_safe_scale < percentile_scale),
+        "would_clip_without_limiter": would_clip,
+        "clipped_samples": 0,
         "peak_pcm": peak_pcm,
     }
 
