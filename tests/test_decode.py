@@ -123,7 +123,7 @@ def test_chunked_pipeline_recovers_fm_audio_and_duration() -> None:
     assert metrics["intermediate_rate_hz"] == 100_000
 
 
-def test_normalization_is_robust_and_clipped_counted() -> None:
+def test_normalization_is_peak_safe_and_records_limiter() -> None:
     samples = np.concatenate(
         [
             np.linspace(-1, 1, 10_000),
@@ -132,8 +132,10 @@ def test_normalization_is_robust_and_clipped_counted() -> None:
     ).astype(np.float32)
     pcm, metrics = normalize_pcm16(samples, 99.5, 0.9)
     assert pcm.dtype == np.int16
-    assert metrics["clipped_samples"] >= 1
-    assert metrics["peak_pcm"] == 32767
+    assert metrics["would_clip_without_limiter"] >= 1
+    assert metrics["limiter_applied"] is True
+    assert metrics["clipped_samples"] == 0
+    assert metrics["peak_pcm"] <= round(32767 * 0.9)
 
 
 def test_pcm_wav_is_mono_48k_16bit(tmp_path: Path) -> None:
@@ -147,7 +149,7 @@ def test_pcm_wav_is_mono_48k_16bit(tmp_path: Path) -> None:
         assert handle.getnframes() == len(samples)
 
 
-def test_parser_extracts_explicit_dmr_evidence() -> None:
+def test_parser_extracts_explicit_dmr_evidence_and_active_slots() -> None:
     log = """
 00:43:00 Sync: +DMR  [slot1]  slot2  | Color Code=02 | CSBK
 Talkgroup Voice Channel Grant - Target: 16777215 - Source: 64250
@@ -158,12 +160,57 @@ TG: 1234 SRC: 5678
     assert result["dmr_sync_count"] == 2
     assert result["explicit_dmr_sync"] is True
     assert result["color_codes"] == [2]
+    assert result["dominant_color_code"] == 2
+    assert result["valid_color_code_ratio"] == 1.0
     assert 1234 in result["talkgroup_ids"]
     assert 16777215 in result["talkgroup_ids"]
     assert 5678 in result["radio_ids"]
     assert 64250 in result["radio_ids"]
-    assert result["slot1_sync_count"] == 2
-    assert result["slot2_sync_count"] == 2
+    assert result["slot1_sync_count"] == 1
+    assert result["slot2_sync_count"] == 1
+    assert result["evidence_tier"] == "dmr_confirmed_degraded"
+
+
+def test_generic_dmr_error_line_is_not_counted_as_signed_sync() -> None:
+    log = """
+00:43:00 Sync: +DMR [SLOT1] slot2 | Color Code=06 | IDLE
+00:43:00 Sync: DMR | VOICE CACH/EMB ERR
+SLCO CRC ERR
+"""
+    result = parse_dsd_fme_log("", log)
+    assert result["dmr_sync_count"] == 1
+    assert result["error_counts"]["total_error_lines"] == 2
+    assert result["slot1_sync_count"] == 1
+    assert result["slot2_sync_count"] == 0
+
+
+def test_quality_scoring_prefers_coherent_normal_polarity() -> None:
+    normal = "\n".join(
+        [
+            "Sync: +DMR [SLOT1] slot2 | Color Code=06 | IDLE",
+            "Sync: +DMR slot1 [slot2] | Color Code=06 | DATA",
+            "Sync: +DMR [SLOT1] slot2 | Color Code=06 | CSBK",
+            "Sync: +DMR slot1 [slot2] | Color Code=06 | IDLE",
+            "Sync: +DMR [SLOT1] slot2 | Color Code=06 | IDLE",
+            "SLCO CRC ERR",
+        ]
+    )
+    inverted = "\n".join(
+        [
+            "Sync: -DMR [SLOT1] slot2 | Color Code=XX | VC1*",
+            "Sync: -DMR slot1 [SLOT2] | Color Code=02 | VC1",
+            "Sync: DMR | VOICE CACH/EMB ERR",
+            "SLCO CRC ERR",
+        ]
+        * 8
+    )
+    normal_result = parse_dsd_fme_log("", normal)
+    inverted_result = parse_dsd_fme_log("", inverted)
+    assert normal_result["dominant_color_code"] == 6
+    assert inverted_result["repetitive_single_stage_voice"] is True
+    assert normal_result["quality_score"] > inverted_result["quality_score"]
+    assert normal_result["evidence_tier"] == "dmr_confirmed_degraded"
+    assert inverted_result["evidence_tier"] == "dmr_sync_only"
 
 
 def test_missing_decoder_is_documented(tmp_path: Path) -> None:
