@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -169,16 +170,12 @@ def build_inventory(
     run_id: str | None = None,
     max_gap_lines: int = 12,
 ) -> dict[str, Any]:
-    if max_gap_lines < 1:
-        raise ValueError("max_gap_lines must be positive")
     source = Path(decodes_dir).expanduser().resolve()
     if not source.is_dir():
         raise FileNotFoundError(source)
     destination = Path(output_dir).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
     resolved_run_id = run_id or source.parent.name
-    if not resolved_run_id.strip():
-        raise ValueError("run_id must not be empty")
     database = (
         Path(database_path).expanduser().resolve()
         if database_path
@@ -235,6 +232,9 @@ def build_inventory(
     channels = public_tables["channels"]
     attempts_public = public_tables["attempts"]
     sessions_public = public_tables["sessions"]
+    session_types = Counter(row["session_type"] for row in sessions_public)
+    error_only_sessions = session_types["error_only"]
+    meaningful_sessions = len(sessions_public) - error_only_sessions
     voice_channels = [
         row for row in channels if row["voice_event_count"]
     ]
@@ -281,17 +281,26 @@ def build_inventory(
                 rid=row.get("radio_ids") or "-",
             )
         )
+    session_summary = ", ".join(
+        f"{name}={count}"
+        for name, count in sorted(session_types.items())
+    ) or "none"
     report = f"""# Phase 5 DMR inventory
 
 - Imported run: **{resolved_run_id}**
 - Attempts in database: **{len(attempts_public)}**
 - Channels in database: **{len(channels)}**
 - Parsed events: **{len(public_tables['events'])}**
-- Correlated non-idle sessions: **{len(sessions_public)}**
+- Correlated sessions, total: **{len(sessions_public)}**
+- Meaningful voice/data/control/mixed sessions: **{meaningful_sessions}**
+- Error-only quality sessions: **{error_only_sessions}**
+- Session types: **{session_summary}**
 - Channels with voice evidence: **{len(voice_channels)}**
 - Talkgroup IDs observed: **{talkgroup_ids or 'none'}**
 - Radio IDs observed: **{radio_ids or 'none'}**
 - Database: `{database}`
+
+Error-only sessions remain in the ledger and SQLite database for quality analysis, but they are not counted as meaningful communication activity.
 
 Decoder clock values are stored as evidence but are not treated as original RF capture timestamps. Session durations are estimates only when the decoder clock is monotonic.
 
@@ -311,6 +320,9 @@ Decoder clock values are stored as evidence but are not treated as original RF c
         "database_channels": len(channels),
         "events": len(public_tables["events"]),
         "sessions": len(sessions_public),
+        "meaningful_sessions": meaningful_sessions,
+        "error_only_sessions": error_only_sessions,
+        "session_types": dict(sorted(session_types.items())),
         "talkgroup_ids": talkgroup_ids,
         "radio_ids": radio_ids,
         "max_gap_lines": max_gap_lines,
