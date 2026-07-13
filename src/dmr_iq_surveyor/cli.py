@@ -11,6 +11,7 @@ from dmr_iq_surveyor.batch import BatchConfigError, run_batch_inspection
 from dmr_iq_surveyor.inspection import run_inspection
 from dmr_iq_surveyor.iq.metadata import WaveIQError
 from dmr_iq_surveyor.iq.reader import UnsupportedSampleFormatError
+from dmr_iq_surveyor.spectrum import SpectrumSettings, run_spectrum, run_spectrum_batch
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -122,6 +123,88 @@ def inspect_batch(
     output_root = Path(result["output_root"])
     console.print(f"[green]Batch artifacts written to:[/green] {output_root}")
     console.print(f"Open: {output_root / 'batch_report.md'}")
+
+
+@app.command()
+def spectrum(
+    recording: Annotated[Path, typer.Argument(help="Path to the SDRconnect IQ file")],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Directory for spectrum artifacts"),
+    ] = Path("runs/spectrum"),
+    iq_order: Annotated[str, typer.Option(help="Assumed channel order: IQ or QI")] = "IQ",
+    fft_size: Annotated[int, typer.Option(help="FFT size (power of two)")] = 65_536,
+    overlap_ratio: Annotated[float, typer.Option(help="FFT overlap ratio")] = 0.5,
+    waterfall_time_bins: Annotated[
+        int, typer.Option(help="Number of time rows in the saved waterfall")
+    ] = 500,
+    waterfall_frequency_bins: Annotated[
+        int, typer.Option(help="Number of frequency columns in the saved waterfall")
+    ] = 8_192,
+    occupancy_threshold_db: Annotated[
+        float, typer.Option(help="Occupancy threshold above local noise floor")
+    ] = 8.0,
+) -> None:
+    """Generate spectrum, noise-floor, occupancy, and waterfall artifacts."""
+    settings = SpectrumSettings(
+        fft_size=fft_size,
+        overlap_ratio=overlap_ratio,
+        waterfall_time_bins=waterfall_time_bins,
+        waterfall_frequency_bins=waterfall_frequency_bins,
+        occupancy_threshold_db=occupancy_threshold_db,
+    )
+    try:
+        result = run_spectrum(
+            recording,
+            output,
+            settings=settings,
+            assumed_iq_order=iq_order,
+        )
+    except (
+        FileNotFoundError,
+        WaveIQError,
+        UnsupportedSampleFormatError,
+        OSError,
+        ValueError,
+    ) as exc:
+        console.print(f"[bold red]Spectrum analysis failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    summary = result["summary"]
+    metrics = summary["metrics"]
+    table = Table(title="IQ spectrum analysis")
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+    table.add_row("FFT count", f"{metrics['fft_count']:,}")
+    table.add_row("FFT size", f"{metrics['fft_size']:,}")
+    table.add_row("Resolution", f"{metrics['frequency_resolution_hz']:.3f} Hz")
+    table.add_row("Elapsed", f"{summary['elapsed_seconds']:.3f} s")
+    table.add_row("Peak RSS", f"{summary['peak_rss_bytes'] / (1024 ** 2):.1f} MiB")
+    console.print(table)
+    console.print(f"[green]Spectrum artifacts written to:[/green] {Path(output).resolve()}")
+    console.print(f"Open: {Path(output).resolve() / 'report.md'}")
+
+
+@app.command("spectrum-batch")
+def spectrum_batch(
+    config: Annotated[
+        Path,
+        typer.Argument(help="YAML file listing SDRconnect IQ recordings"),
+    ],
+) -> None:
+    """Run spectrum analysis independently for every recording in a batch config."""
+    try:
+        result = run_spectrum_batch(config)
+    except (FileNotFoundError, BatchConfigError, OSError, ValueError) as exc:
+        console.print(f"[bold red]Batch spectrum analysis failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"Spectrum batch complete: {result['successful_recordings']} succeeded, "
+        f"{result['failed_recordings']} failed"
+    )
+    output_root = Path(result["output_root"])
+    console.print(f"[green]Batch artifacts written to:[/green] {output_root}")
+    console.print(f"Open: {output_root / 'spectrum_batch_report.md'}")
 
 
 if __name__ == "__main__":
