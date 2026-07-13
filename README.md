@@ -13,12 +13,17 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - Phase 4.1: evidence-quality polarity scoring, active-slot parsing and peak-safe PCM
 - Phase 5: persistent event, session and channel inventory in SQLite
 
-Project records:
+## Project documentation
 
 - [`docs/development-history.md`](docs/development-history.md)
 - [`docs/phase4-design.md`](docs/phase4-design.md)
 - [`docs/phase5-design.md`](docs/phase5-design.md)
+- [`docs/FIELD-RECORDING-GUIDE.md`](docs/FIELD-RECORDING-GUIDE.md)
+- [`docs/TRANSMITTER-LOCATION-STUDY.md`](docs/TRANSMITTER-LOCATION-STUDY.md)
+- [`docs/FIELD-SESSION-METADATA-TEMPLATE.csv`](docs/FIELD-SESSION-METADATA-TEMPLATE.csv)
 - [`docs/NEXT-CONVERSATION-HANDOFF.md`](docs/NEXT-CONVERSATION-HANDOFF.md)
+
+The field guide is the authoritative checklist before every future recording session.
 
 ## Install
 
@@ -67,22 +72,7 @@ dmr-surveyor spectrum \
 dmr-surveyor spectrum-batch config/shahar_recordings.yaml
 ```
 
-Spectrum artifacts include:
-
-```text
-spectrum/
-├── average_spectrum.csv
-├── average_spectrum.png
-├── max_hold_spectrum.png
-├── percentile_spectrum.csv
-├── noise_floor.csv
-├── occupancy.csv
-├── waterfall.npy
-├── waterfall_axes.npz
-├── waterfall.png
-├── spectrum_report.json
-└── report.md
-```
+Spectrum artifacts include average, max-hold and percentile spectra, local noise floor, occupancy and a reduced waterfall.
 
 Power is relative `dBFS/Hz`, not calibrated dBm. DC and passband-edge regions are flagged rather than silently removed.
 
@@ -99,19 +89,6 @@ dmr-surveyor detect-batch config/shahar_recordings.yaml
 The detector scores integrated average and P95 SNR, occupancy, occupied width, equivalent width, spectral fill, symmetry, persistence, raster proximity and peak concentration.
 
 A `dmr_like_narrowband` label is a spectral hypothesis, not decoder confirmation.
-
-Candidate artifacts:
-
-```text
-candidates/
-├── candidates.csv
-├── candidates.json
-├── candidate_evidence.json
-├── rejected_evidence.json
-├── average_spectrum_annotated.png
-├── waterfall_annotated.png
-└── candidate_report.md
-```
 
 ## Phase 4 — extraction and DSD-FME
 
@@ -152,25 +129,6 @@ wideband complex IQ
   -> DSD-FME normal and inverted profiles
 ```
 
-Each attempt produces:
-
-```text
-decodes/CANDIDATE_ID/RECORDING_ID/iq/
-├── discriminator.wav
-├── extraction_report.json
-├── extraction_report.md
-├── baseband_preview.npz
-└── decoder/
-    ├── dsd_fme_normal_stdout.log
-    ├── dsd_fme_normal_stderr.log
-    ├── dsd_fme_inverted_stdout.log
-    ├── dsd_fme_inverted_stderr.log
-    ├── decoder_report_normal.json
-    ├── decoder_report_inverted.json
-    ├── decoder_report.json
-    └── decoder_report.md
-```
-
 ## Phase 4.1 — decoder evidence quality
 
 Only signed `Sync: +DMR` or `Sync: -DMR` lines count as explicit sync evidence. Attempts are classified as:
@@ -181,20 +139,11 @@ dmr_confirmed_degraded
 dmr_confirmed_clean
 ```
 
-Polarity scoring considers:
-
-- numeric Color Code ratio
-- dominant Color Code consistency
-- clean signed-sync ratio
-- CRC/FEC/CACH/frame errors
-- coherent IDLE/CSBK/DATA activity
-- voice-stage diversity
-- repetitive single-stage artifacts
-- bounded sync-count support
+Polarity scoring considers numeric Color Code ratio, dominant-CC consistency, clean sync ratio, decoder errors, coherent activity, voice-stage diversity and false inverted-decoding patterns.
 
 Slot counts use only the bracketed active token, `[SLOT1]` or `[slot2]`.
 
-PCM normalization uses both a percentile target and a hard peak-safe scale. The smaller scale is selected, so default PCM16 output has zero clipped samples. Reports preserve whether the cap was applied and how many samples would otherwise have clipped.
+PCM normalization uses a percentile target plus a hard peak-safe scale. The default PCM16 output contains zero clipped samples.
 
 ## Phase 5 — persistent inventory
 
@@ -214,43 +163,86 @@ Configured import:
 dmr-surveyor inventory-batch config/shahar_recordings.yaml
 ```
 
-Phase 5 parses the selected best-polarity logs into:
+Phase 5 parses selected best-polarity logs into:
 
-- signed sync, Color Code and active-slot events
-- IDLE, CSBK, DATA, VOICE and VC1–VC6 events
-- Activity Update states
-- explicit Talkgroup/Target and Radio/Source IDs
-- vendor data and network-state evidence
-- decoder errors
-- correlated per-slot non-idle sessions
+- signed sync, Color Code and active-slot events;
+- IDLE, CSBK, DATA, VOICE and VC1–VC6 events;
+- Activity Update states;
+- explicit Talkgroup/Target and Radio/Source IDs;
+- vendor-data and network-state evidence;
+- decoder errors;
+- correlated per-slot non-idle sessions.
 
-Outputs:
+The SQLite database contains:
 
 ```text
-inventory/
-├── attempts.csv
-├── attempts.json
-├── events.csv
-├── events.json
-├── events.jsonl
-├── sessions.csv
-├── sessions.json
-├── channels.csv
-├── channels.json
-├── import_manifest.json
-└── phase5_report.md
-
-runs/inventory/
-└── dmr_inventory.sqlite3
+runs
+attempts
+events
+sessions
+channels
 ```
 
-The SQLite database contains `runs`, `attempts`, `events`, `sessions` and `channels` tables.
-
-Re-importing the same `run_id` replaces that run, so imports are idempotent. A different run ID is accumulated into the same persistent channel inventory.
+Re-importing the same `run_id` replaces that run. A different run ID accumulates into the same persistent channel inventory.
 
 DSD-FME clock strings are preserved as decoder-clock evidence. They are not treated as guaranteed original RF capture timestamps.
 
-## Validated short-capture inventory
+## Does Phase 5 require another field recording?
+
+No. Phase 5 can be run and validated using the existing Phase 4.1 outputs.
+
+New recordings are needed only to add new evidence, such as:
+
+- longer voice/control activity for Talkgroup and Radio IDs;
+- measurements from additional locations;
+- transmitter coverage and location studies;
+- cleaner recordings of degraded or edge-of-passband channels.
+
+## Field recording modes
+
+### Multi-location survey
+
+Use short, identical wideband captures at multiple sites to compare all confirmed channels.
+
+Recommended first campaign:
+
+```text
+center frequency: 164.831250 MHz
+sample rate:      10.000 MS/s
+capture length:   15–20 seconds
+repeats:          2 per site
+sites:            8–12
+AGC:              off
+manual gain:      identical at all sites
+```
+
+One recording covers all eight confirmed channels simultaneously. See [`docs/FIELD-RECORDING-GUIDE.md`](docs/FIELD-RECORDING-GUIDE.md).
+
+### Targeted identity capture
+
+The first targeted channel is:
+
+```text
+164.537500 MHz
+Color Code 8
+```
+
+Long 250–500 kS/s captures require the validated adaptive presets planned in Issue #13. Do not reuse the 10 MS/s extraction profile unchanged at those lower rates.
+
+### Transmitter location study
+
+Sequential recordings from one receiver can build a coverage heatmap and reduce the probable search area. RSSI alone normally cannot produce a precise coordinate.
+
+Preferred progression:
+
+1. multi-location RSSI heatmap;
+2. closer repeat measurements;
+3. directional bearings from at least three sites;
+4. simultaneous synchronized TDOA or coherent AoA only when higher precision is required.
+
+See [`docs/TRANSMITTER-LOCATION-STUDY.md`](docs/TRANSMITTER-LOCATION-STUDY.md).
+
+## Confirmed short-capture inventory
 
 | Frequency | Color Code | Activity |
 |---:|---:|---|
@@ -277,14 +269,6 @@ ruff check .
 ```
 
 The suite covers metadata parsing, spectrum processing, candidate detection, streamed DSP, peak-safe WAV output, DSD-FME quality parsing, polarity selection, active slots, event parsing, session correlation, idempotent SQLite import and cross-run aggregation.
-
-## Field collection after Phase 5
-
-For TG and Radio ID collection, prefer a targeted 250–500 kS/s recording centered on one confirmed channel for 5–15 minutes during activity. A 10 MS/s signed int16 complex recording is approximately 2.4 GB/minute and should not be the default long-capture mode.
-
-Start with 164.537500 MHz because complete voice-stage activity was already observed. Preserve date/time, location, antenna, gain, center frequency, sample rate and power condition for every new run.
-
-See [`docs/phase5-design.md`](docs/phase5-design.md) and [`docs/NEXT-CONVERSATION-HANDOFF.md`](docs/NEXT-CONVERSATION-HANDOFF.md).
 
 ## Passive scope
 
