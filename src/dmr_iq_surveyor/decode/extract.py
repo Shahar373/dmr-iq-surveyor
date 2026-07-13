@@ -16,6 +16,7 @@ from dmr_iq_surveyor.decode.core import (
     normalize_pcm16,
     process_complex_chunks,
 )
+from dmr_iq_surveyor.decode.profiles import extraction_profile
 from dmr_iq_surveyor.iq.metadata import inspect_wave_iq
 from dmr_iq_surveyor.iq.reader import IQMemmapReader
 
@@ -55,15 +56,18 @@ def run_channel_extraction(
     *,
     candidate_frequency_hz: float,
     settings: ExtractionSettings | None = None,
+    profile_name: str | None = None,
     assumed_iq_order: str = "IQ",
     candidate_id: str | None = None,
     recording_id: str | None = None,
+    capture_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     source = Path(input_path).expanduser().resolve()
     destination = Path(output_dir).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
-    resolved = settings or ExtractionSettings()
+    if settings is not None and profile_name is not None:
+        raise ValueError("Use either explicit extraction settings or profile_name, not both")
     info = inspect_wave_iq(
         source,
         assumed_iq_order=assumed_iq_order,
@@ -73,6 +77,8 @@ def run_channel_extraction(
             "Center frequency is required for channel extraction"
         )
     input_rate = int(info.fmt.sample_rate_hz)
+    resolved_profile = profile_name or ("custom" if settings is not None else "10m")
+    resolved = settings or extraction_profile(resolved_profile, input_rate)
     resolved.validate(input_rate)
     offset_hz = (
         float(candidate_frequency_hz)
@@ -113,6 +119,7 @@ def run_channel_extraction(
     )
     elapsed = time.time() - started
     output_duration = len(pcm) / resolved.output_rate_hz
+    metadata = dict(capture_metadata or {})
     report = {
         "tool": "dmr-iq-surveyor",
         "input_path": str(source),
@@ -128,12 +135,14 @@ def run_channel_extraction(
         "iq_order_confidence": info.iq_order_confidence,
         "input_sample_rate_hz": input_rate,
         "input_duration_seconds": info.duration_seconds,
+        "extraction_profile": resolved_profile,
         "output_sample_rate_hz": resolved.output_rate_hz,
         "output_duration_seconds": output_duration,
         "wav_path": str(wav_path),
         "settings": resolved.to_dict(),
         "metrics": metrics,
         "normalization": normalization,
+        "capture_metadata": metadata,
         "warnings": list(info.warnings),
         "elapsed_seconds": elapsed,
         "peak_rss_bytes": _peak_rss_bytes(),
@@ -149,6 +158,10 @@ def run_channel_extraction(
         )
         or "- None"
     )
+    metadata_lines = (
+        "\n".join(f"- {key}: **{value}**" for key, value in sorted(metadata.items()))
+        or "- None"
+    )
     markdown = f"""# Narrowband channel extraction
 
 - Candidate: **{candidate_id or '-'}**
@@ -158,6 +171,7 @@ def run_channel_extraction(
 - Mixer offset: **{offset_hz:,.3f} Hz**
 - IQ order: **{assumed_iq_order}** ({info.iq_order_confidence})
 - Input: **{input_rate:,} complex samples/s**, **{info.duration_seconds:.6f} s**
+- Extraction profile: **{resolved_profile}**
 - Output: **{resolved.output_rate_hz:,} Hz mono PCM16**, **{output_duration:.6f} s**
 - Peak-safe limiter applied: **{normalization['limiter_applied']}**
 - Samples that would clip without peak cap: **{normalization['would_clip_without_limiter']}**
@@ -165,6 +179,10 @@ def run_channel_extraction(
 - Output peak: **{normalization['peak_pcm']} / 32767**
 - Elapsed: **{elapsed:.3f} s**
 - Peak RSS: **{_peak_rss_bytes() / (1024 ** 2):.1f} MiB**
+
+## Capture metadata
+
+{metadata_lines}
 
 ## Warnings
 
