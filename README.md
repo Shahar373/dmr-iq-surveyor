@@ -1,171 +1,73 @@
 # DMR IQ Surveyor
 
-Offline Python tooling for inspecting SDRconnect wideband IQ recordings, building a reproducible frequency inventory, extracting narrowband channels, and testing them with DSD-FME.
+Offline Python tooling for inspecting SDRconnect wideband IQ recordings, producing spectrum products, detecting DMR-like channels, extracting decoder-ready audio, running DSD-FME, and maintaining a persistent channel inventory.
 
-Implemented stages:
+The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ files remain memory mapped and heavy stages run sequentially.
 
-- RIFF/RF64 and SDRplay metadata inspection
-- memory-mapped IQ reading
-- bounded integrity and clipping checks
-- streamed FFT analysis
-- average, max-hold, and deterministic percentile spectra
-- adaptive local noise-floor estimation
-- per-frequency occupancy
-- reduced, time-binned waterfall output
-- independent batch processing for multiple recordings
-- Phase 3 narrowband candidate detection and ranking
-- spur, wideband, intermittent, and DMR-like preliminary classes
-- IQ-mirror frequency preservation while channel order remains assumed
-- Phase 4 streamed narrowband extraction
-- 48 kHz mono discriminator WAV generation
-- optional DSD-FME normal/inverted DMR attempts with captured evidence
-- Phase 4.1 evidence-quality polarity scoring and active-slot parsing
-- peak-safe PCM16 normalization with zero clipped output samples by default
+## Implemented stages
 
-The chronological project record is in [`docs/development-history.md`](docs/development-history.md).
+- Phase 1: RIFF/RF64 and SDRplay metadata inspection
+- Phase 2: streamed FFT, noise floor, occupancy and waterfall
+- Phase 3: narrowband candidate detection and ranking
+- Phase 4: streamed channel extraction and DSD-FME attempts
+- Phase 4.1: evidence-quality polarity scoring, active-slot parsing and peak-safe PCM
+- Phase 5: persistent event, session and channel inventory in SQLite
 
-## Install on Raspberry Pi OS, Debian, or Ubuntu
+Project records:
+
+- [`docs/development-history.md`](docs/development-history.md)
+- [`docs/phase4-design.md`](docs/phase4-design.md)
+- [`docs/phase5-design.md`](docs/phase5-design.md)
+- [`docs/NEXT-CONVERSATION-HANDOFF.md`](docs/NEXT-CONVERSATION-HANDOFF.md)
+
+## Install
 
 ```bash
 sudo apt update
 sudo apt install -y git python3 python3-venv python3-pip
 cd dmr-iq-surveyor
 ./scripts/bootstrap.sh
-```
-
-Activate the environment in future terminal sessions:
-
-```bash
 source .venv/bin/activate
 ```
 
-DSD-FME is optional. Without it, Phase 4 still creates discriminator WAV files and records `decoder_unavailable` instead of failing the extraction.
+DSD-FME is optional for extraction. When it is missing, Phase 4 still creates discriminator WAV files and records `decoder_unavailable`.
 
-## Run the configured workflow
-
-### Phase 1 — inspect recordings
+## Configured Shahar workflow
 
 ```bash
+cd ~/Projects/dmr-iq-surveyor
+source .venv/bin/activate
+
 ./scripts/run_shahar_recordings.sh
+./scripts/run_shahar_spectrum.sh
+./scripts/run_shahar_detection.sh
+./scripts/run_shahar_decode.sh
+chmod +x scripts/run_shahar_inventory.sh
+./scripts/run_shahar_inventory.sh
 ```
 
-### Phase 2 — spectrum analysis
+The two original SDRconnect recordings are analyzed independently and are never concatenated across their gap.
+
+## Phase 1 — inspection
 
 ```bash
-./scripts/run_shahar_spectrum.sh
+dmr-surveyor inspect /path/to/recording.wav --output runs/my-run/inspect
+dmr-surveyor inspect-batch config/shahar_recordings.yaml
 ```
 
-The two recordings are analyzed independently. They are not concatenated across the gap between files.
+Phase 1 validates container metadata, sample encoding, center frequency, frame counts, clipping, zero regions and bounded IQ statistics.
 
-Single-recording example:
+## Phase 2 — spectrum
 
 ```bash
 dmr-surveyor spectrum \
-  /full/path/to/recording.wav \
-  --output runs/my-recording/spectrum
-```
+  /path/to/recording.wav \
+  --output runs/my-run/spectrum
 
-Batch example:
-
-```bash
 dmr-surveyor spectrum-batch config/shahar_recordings.yaml
 ```
 
-### Phase 3 — candidate detection
-
-```bash
-./scripts/run_shahar_detection.sh
-```
-
-Single-spectrum example:
-
-```bash
-dmr-surveyor detect \
-  runs/my-recording/spectrum \
-  --output runs/my-recording/candidates
-```
-
-Batch example:
-
-```bash
-dmr-surveyor detect-batch config/shahar_recordings.yaml
-```
-
-The batch detector merges evidence from separate recordings without merging adjacent 12.5 kHz or 25 kHz channels. It keeps signals seen in only one recording and records both the assumed IQ frequency and the mirrored QI alternative.
-
-### Phase 4 — narrowband extraction and DSD-FME
-
-```bash
-chmod +x scripts/run_shahar_decode.sh
-./scripts/run_shahar_decode.sh
-```
-
-The helper runs with reduced CPU and I/O priority and limits numerical-library thread counts to one. Candidates and source recordings are processed sequentially.
-
-Extract one frequency manually:
-
-```bash
-dmr-surveyor extract-channel \
-  /full/path/to/recording.wav \
-  --frequency 165625000 \
-  --output runs/manual-165625000
-```
-
-Decode an existing discriminator WAV:
-
-```bash
-dmr-surveyor decode-channel \
-  runs/manual-165625000/discriminator.wav \
-  --output runs/manual-165625000/decoder
-```
-
-Run the configured Phase 3 candidates:
-
-```bash
-dmr-surveyor decode-batch config/shahar_recordings.yaml
-```
-
-The upstream DSD-FME examples accept 48 kHz mono WAV input with `dsd-fme -i filename.wav`. The project adds `-fs` for DMR and also tries `-xr` when configured.
-
-## Decoder evidence quality
-
-Phase 4.1 does not treat a process exit code or a single generic DMR-looking line as confirmation. Only signed `Sync: +DMR` or `Sync: -DMR` lines count as explicit sync evidence, and attempts are classified as:
-
-```text
-dmr_sync_only
-dmr_confirmed_degraded
-dmr_confirmed_clean
-```
-
-Quality scoring considers:
-
-- numeric Color Code ratio;
-- dominant Color Code consistency;
-- clean signed-sync ratio;
-- CRC/FEC/CACH/frame error ratio;
-- coherent IDLE/CSBK/DATA activity;
-- voice-stage diversity;
-- repetitive single-stage `VC1` artifacts;
-- bounded sync-count support.
-
-Normal and inverted profiles are selected by this quality score, not by raw sync-line count. Every component is retained in the JSON report.
-
-DSD-FME prints both slot labels on each status line. Slot counts use only the bracketed active token, such as `[SLOT1]` or `[slot2]`.
-
-## PCM normalization
-
-Discriminator audio is median-centered and given a percentile-derived target level. A second peak-safe scale caps the absolute peak at `output_peak_fraction`, preventing PCM16 clipping. Extraction reports record:
-
-- whether the peak cap was applied;
-- samples that would have clipped without it;
-- actual clipped samples;
-- selected scale and final PCM peak.
-
-The default output has zero clipped samples.
-
-## Spectrum artifacts
-
-Each recording produces:
+Spectrum artifacts include:
 
 ```text
 spectrum/
@@ -182,11 +84,23 @@ spectrum/
 └── report.md
 ```
 
-Power is reported as relative `dBFS/Hz`; it is not calibrated dBm. DC and receiver-edge regions are flagged in every CSV and shaded in plots rather than silently removed.
+Power is relative `dBFS/Hz`, not calibrated dBm. DC and passband-edge regions are flagged rather than silently removed.
 
-## Candidate artifacts
+## Phase 3 — candidate detection
 
-Phase 3 produces:
+```bash
+dmr-surveyor detect \
+  runs/my-run/spectrum \
+  --output runs/my-run/candidates
+
+dmr-surveyor detect-batch config/shahar_recordings.yaml
+```
+
+The detector scores integrated average and P95 SNR, occupancy, occupied width, equivalent width, spectral fill, symmetry, persistence, raster proximity and peak concentration.
+
+A `dmr_like_narrowband` label is a spectral hypothesis, not decoder confirmation.
+
+Candidate artifacts:
 
 ```text
 candidates/
@@ -199,11 +113,46 @@ candidates/
 └── candidate_report.md
 ```
 
-The detector scores integrated average and P95 SNR, occupancy, occupied width, equivalent width, spectral fill, symmetry, persistence, and peak concentration. `dmr_like_narrowband` is a spectral hypothesis, not decoder confirmation.
+## Phase 4 — extraction and DSD-FME
 
-## Phase 4 artifacts
+Extract one channel:
 
-Each candidate, recording, and IQ hypothesis receives an independent directory:
+```bash
+dmr-surveyor extract-channel \
+  /path/to/recording.wav \
+  --frequency 165625000 \
+  --output runs/manual-165625000
+```
+
+Decode an existing discriminator WAV:
+
+```bash
+dmr-surveyor decode-channel \
+  runs/manual-165625000/discriminator.wav \
+  --output runs/manual-165625000/decoder
+```
+
+Run ranked candidates:
+
+```bash
+dmr-surveyor decode-batch config/shahar_recordings.yaml
+```
+
+DSP path:
+
+```text
+wideband complex IQ
+  -> phase-continuous mixer
+  -> two FIR decimation stages
+  -> 100 kHz complex baseband
+  -> channel low-pass
+  -> FM phase discriminator
+  -> rational resampling
+  -> 48 kHz mono PCM16
+  -> DSD-FME normal and inverted profiles
+```
+
+Each attempt produces:
 
 ```text
 decodes/CANDIDATE_ID/RECORDING_ID/iq/
@@ -222,23 +171,121 @@ decodes/CANDIDATE_ID/RECORDING_ID/iq/
     └── decoder_report.md
 ```
 
-The batch root also contains `decode_batch_summary.csv`, `decode_batch_summary.json`, and `decode_batch_report.md`. Phase 4.1 reports add quality score, dominant Color Code, valid-CC ratio, dominant-CC consistency, error ratio, and active-slot counts.
+## Phase 4.1 — decoder evidence quality
 
-## IQ order
+Only signed `Sync: +DMR` or `Sync: -DMR` lines count as explicit sync evidence. Attempts are classified as:
 
-The current recordings use the conventional `IQ` assumption. Statistics alone cannot prove channel order. Phase 3 preserves the mirrored QI frequency, and Phase 4 can process `QI` as a separate hypothesis by adding it to `phase4.iq_hypotheses` in the YAML configuration.
+```text
+dmr_sync_only
+dmr_confirmed_degraded
+dmr_confirmed_clean
+```
 
-DSD-FME `-xr` symbol inversion is separate from the IQ/QI frequency-orientation question.
+Polarity scoring considers:
+
+- numeric Color Code ratio
+- dominant Color Code consistency
+- clean signed-sync ratio
+- CRC/FEC/CACH/frame errors
+- coherent IDLE/CSBK/DATA activity
+- voice-stage diversity
+- repetitive single-stage artifacts
+- bounded sync-count support
+
+Slot counts use only the bracketed active token, `[SLOT1]` or `[slot2]`.
+
+PCM normalization uses both a percentile target and a hard peak-safe scale. The smaller scale is selected, so default PCM16 output has zero clipped samples. Reports preserve whether the cap was applied and how many samples would otherwise have clipped.
+
+## Phase 5 — persistent inventory
+
+Import one Phase 4/4.1 decode tree:
+
+```bash
+dmr-surveyor inventory-build \
+  runs/20260713_163671500Hz/decodes \
+  --output runs/20260713_163671500Hz/inventory \
+  --database runs/inventory/dmr_inventory.sqlite3 \
+  --run-id 20260713_163671500Hz_phase4_1
+```
+
+Configured import:
+
+```bash
+dmr-surveyor inventory-batch config/shahar_recordings.yaml
+```
+
+Phase 5 parses the selected best-polarity logs into:
+
+- signed sync, Color Code and active-slot events
+- IDLE, CSBK, DATA, VOICE and VC1–VC6 events
+- Activity Update states
+- explicit Talkgroup/Target and Radio/Source IDs
+- vendor data and network-state evidence
+- decoder errors
+- correlated per-slot non-idle sessions
+
+Outputs:
+
+```text
+inventory/
+├── attempts.csv
+├── attempts.json
+├── events.csv
+├── events.json
+├── events.jsonl
+├── sessions.csv
+├── sessions.json
+├── channels.csv
+├── channels.json
+├── import_manifest.json
+└── phase5_report.md
+
+runs/inventory/
+└── dmr_inventory.sqlite3
+```
+
+The SQLite database contains `runs`, `attempts`, `events`, `sessions` and `channels` tables.
+
+Re-importing the same `run_id` replaces that run, so imports are idempotent. A different run ID is accumulated into the same persistent channel inventory.
+
+DSD-FME clock strings are preserved as decoder-clock evidence. They are not treated as guaranteed original RF capture timestamps.
+
+## Validated short-capture inventory
+
+| Frequency | Color Code | Activity |
+|---:|---:|---|
+| 162.525000 MHz | 8 | CSBK/data |
+| 162.587500 MHz | 5 | CSBK/data |
+| 164.300000 MHz | 7 | mostly idle |
+| 164.325000 MHz | 6 | mostly idle |
+| 164.537500 MHz | 8 | idle and Group Voice |
+| 164.725000 MHz | 7 | idle/data |
+| 165.625000 MHz | 6 | idle/data, degraded |
+| 167.137500 MHz | 7 | idle/data |
+
+The short source captures did not contain reliable Talkgroup or Radio IDs. Empty ID lists are retained and are not replaced by guesses.
+
+## IQ orientation
+
+The original recordings use the conventional `IQ` assumption, but statistics alone cannot prove orientation. Phase 3 preserves the mirrored `QI` alternative. DSD-FME `-xr` symbol inversion is a separate question from IQ/QI frequency orientation.
 
 ## Tests
 
 ```bash
-pytest
+pytest -q
 ruff check .
 ```
 
-The tests cover RIFF/RF64 parsing, center-frequency fallback, batch resilience, frequency-axis construction, overlap logic, FFT tone placement, spectrum artifacts, candidate raster calculations, IQ mirror calculations, channel-shape classification, spur rejection, candidate merging, phase-continuous mixing, streamed FM discrimination, adjacent-channel rejection, peak-safe 48 kHz WAV generation, DSD-FME quality parsing, polarity scoring, active-slot parsing, and missing-decoder handling.
+The suite covers metadata parsing, spectrum processing, candidate detection, streamed DSP, peak-safe WAV output, DSD-FME quality parsing, polarity selection, active slots, event parsing, session correlation, idempotent SQLite import and cross-run aggregation.
+
+## Field collection after Phase 5
+
+For TG and Radio ID collection, prefer a targeted 250–500 kS/s recording centered on one confirmed channel for 5–15 minutes during activity. A 10 MS/s signed int16 complex recording is approximately 2.4 GB/minute and should not be the default long-capture mode.
+
+Start with 164.537500 MHz because complete voice-stage activity was already observed. Preserve date/time, location, antenna, gain, center frequency, sample rate and power condition for every new run.
+
+See [`docs/phase5-design.md`](docs/phase5-design.md) and [`docs/NEXT-CONVERSATION-HANDOFF.md`](docs/NEXT-CONVERSATION-HANDOFF.md).
 
 ## Passive scope
 
-The project performs offline receive-side analysis only. It contains no transmit, authentication, impersonation, injection, brute-force, or decryption capability.
+The project performs receive-side offline analysis only. It contains no transmit, injection, impersonation, authentication bypass, brute-force or decryption capability.
