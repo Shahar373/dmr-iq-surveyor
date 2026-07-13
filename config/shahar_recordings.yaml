@@ -1,0 +1,18 @@
+project:
+  name: "Shahar SDRconnect IQ pair — 163.671500 MHz"
+  output_root: "runs/20260713_163671500Hz"
+
+inspection:
+  assumed_iq_order: "IQ"
+  statistics_window_frames: 250000
+  diagnostic_plot_frames: 20000
+  compute_sha256: false
+
+recordings:
+  - id: "20260713_150242"
+    label: "First IQ recording"
+    path: "/home/shahar/Documents/SDRconnect_IQ_20260713_150242_163671500HZ.wav"
+
+  - id: "20260713_150256"
+    label: "Second IQ recording"
+    path: "/home/shahar/Documents/SDRconnect_IQ_20260713_150256_163671500HZ.wav"
