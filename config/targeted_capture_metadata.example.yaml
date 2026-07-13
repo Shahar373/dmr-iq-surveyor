@@ -1,0 +1,20 @@
+source_started_at: "2026-07-20T18:30:00+03:00"
+location_name: "site-a"
+latitude: 32.000000
+longitude: 34.900000
+altitude_m: 50
+antenna: "VHF vertical"
+antenna_height_m: 2.0
+polarization: "vertical"
+coax: "type and length"
+sdr_model: "SDRplay RSP1B"
+center_frequency_hz: 164537500
+sample_rate_hz: 500000
+gain_mode: "manual"
+gain_db: 28
+agc: false
+rf_bandwidth_hz: 200000
+power_source: "USB-C PD power bank"
+undervoltage_before: "0x0"
+weather: "clear"
+notes: "Targeted CC8 identity capture"
