@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS attempts (
     slot2_sync_count INTEGER NOT NULL DEFAULT 0,
     talkgroup_ids_json TEXT NOT NULL,
     radio_ids_json TEXT NOT NULL,
+    capture_metadata_json TEXT NOT NULL DEFAULT '{}',
     output_dir TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
@@ -90,12 +91,34 @@ CREATE TABLE IF NOT EXISTS channels (
 """
 
 
+def _ensure_column(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    declaration: str,
+) -> None:
+    existing = {
+        row[1]
+        for row in connection.execute(f"PRAGMA table_info({table})")
+    }
+    if column not in existing:
+        connection.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+        )
+
+
 def connect_database(path: str | Path) -> sqlite3.Connection:
     destination = Path(path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(destination)
     connection.row_factory = sqlite3.Row
     connection.executescript(SCHEMA)
+    _ensure_column(
+        connection,
+        "attempts",
+        "capture_metadata_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )
     return connection
 
 
@@ -119,8 +142,8 @@ def replace_run(
                 iq_order, best_inversion, status, quality_score,
                 dominant_color_code, valid_color_code_ratio, error_ratio,
                 slot1_sync_count, slot2_sync_count, talkgroup_ids_json,
-                radio_ids_json, output_dir
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                radio_ids_json, capture_metadata_json, output_dir
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 attempt["attempt_key"],
@@ -139,6 +162,7 @@ def replace_run(
                 attempt.get("slot2_sync_count", 0),
                 json.dumps(attempt.get("talkgroup_ids", [])),
                 json.dumps(attempt.get("radio_ids", [])),
+                json.dumps(attempt.get("capture_metadata", {})),
                 attempt["output_dir"],
             ),
         )
