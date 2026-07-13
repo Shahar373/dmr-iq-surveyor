@@ -88,9 +88,18 @@ def extract_channel(
             f"{result['output_duration_seconds']:.6f} s"
         ),
     )
+    normalization = result["normalization"]
+    table.add_row(
+        "Peak-safe limiter",
+        str(normalization["limiter_applied"]),
+    )
+    table.add_row(
+        "Would clip without cap",
+        str(normalization["would_clip_without_limiter"]),
+    )
     table.add_row(
         "Clipped samples",
-        str(result["normalization"]["clipped_samples"]),
+        str(normalization["clipped_samples"]),
     )
     table.add_row(
         "Elapsed",
@@ -158,6 +167,10 @@ def decode_channel(
     table.add_row("Status", str(result["status"]))
     table.add_row("Best inversion", str(result["best_inversion"]))
     table.add_row(
+        "Quality score",
+        f"{float(result['best_quality_score']):.3f}",
+    )
+    table.add_row(
         "Decoder available",
         str(result["probe"]["available"]),
     )
@@ -168,7 +181,25 @@ def decode_channel(
     )
     evidence = best["evidence"]
     table.add_row("DMR syncs", str(evidence["dmr_sync_count"]))
-    table.add_row("Color Codes", str(evidence["color_codes"]))
+    table.add_row(
+        "Dominant Color Code",
+        str(evidence["dominant_color_code"]),
+    )
+    table.add_row(
+        "Valid Color Code ratio",
+        f"{float(evidence['valid_color_code_ratio']):.1%}",
+    )
+    table.add_row(
+        "Decoder error ratio",
+        f"{float(evidence['error_ratio']):.1%}",
+    )
+    table.add_row(
+        "Active slots",
+        (
+            f"S1={evidence['slot1_sync_count']}, "
+            f"S2={evidence['slot2_sync_count']}"
+        ),
+    )
     table.add_row("Talkgroups", str(evidence["talkgroup_ids"]))
     table.add_row("Radio IDs", str(evidence["radio_ids"]))
     console.print(table)
@@ -198,7 +229,9 @@ def decode_batch(
 
     console.print(
         f"Phase 4 complete: {result['attempt_count']} attempts, "
-        f"{result['confirmed_dmr_attempts']} with explicit DMR sync"
+        f"{result['clean_dmr_attempts']} clean, "
+        f"{result['degraded_dmr_attempts']} degraded, "
+        f"{result['sync_only_attempts']} sync-only"
     )
     console.print(
         f"[green]Phase 4 artifacts written to:[/green] "
