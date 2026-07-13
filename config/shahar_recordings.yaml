@@ -29,3 +29,18 @@ spectrum:
   percentile_max_frames: 256
   local_noise_window_hz: 200000
   occupancy_threshold_db: 8.0
+
+detection:
+  scan_step_hz: 6250
+  integration_width_hz: 10000
+  min_p95_channel_snr_db: 9.0
+  min_average_channel_snr_db: 4.0
+  min_equivalent_width_hz: 1500
+  min_width_90_hz: 3000
+  max_width_90_hz: 12000
+  max_peak_to_channel_mean_db: 13.0
+  min_fill_ratio: 0.20
+  fill_threshold_db: 6.0
+  merge_tolerance_hz: 3000
+  passband_warning_low_hz: 159490000
+  passband_warning_high_hz: 167680000
