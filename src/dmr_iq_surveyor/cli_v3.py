@@ -86,7 +86,15 @@ def _print_inventory_result(result: dict[str, object]) -> None:
     table.add_row("Database attempts", str(result["database_attempts"]))
     table.add_row("Channels", str(result["database_channels"]))
     table.add_row("Events", str(result["events"]))
-    table.add_row("Sessions", str(result["sessions"]))
+    table.add_row("Sessions, total", str(result["sessions"]))
+    table.add_row(
+        "Meaningful sessions",
+        str(result["meaningful_sessions"]),
+    )
+    table.add_row(
+        "Error-only sessions",
+        str(result["error_only_sessions"]),
+    )
     table.add_row("Talkgroup IDs", str(result["talkgroup_ids"]))
     table.add_row("Radio IDs", str(result["radio_ids"]))
     console.print(table)
