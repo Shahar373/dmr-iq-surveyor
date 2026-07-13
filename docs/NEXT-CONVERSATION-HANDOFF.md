@@ -12,13 +12,25 @@ https://github.com/Shahar373/dmr-iq-surveyor
 
 The project began from a clean repository and now implements Phases 1–5 of an offline, receive-only DMR survey pipeline.
 
-Current release after Phase 5:
+Current release:
 
 ```text
 0.6.0
 ```
 
-Do not restart the project or replace the established pipeline without evidence. Continue from the existing commands, data formats, tests, and documentation.
+Do not restart the project or replace the established pipeline without evidence. Continue from the existing commands, data formats, tests and documentation.
+
+All future field instructions must be written into the repository, not left only in chat messages.
+
+Primary documents:
+
+- `docs/development-history.md`
+- `docs/phase4-design.md`
+- `docs/phase5-design.md`
+- `docs/FIELD-RECORDING-GUIDE.md`
+- `docs/TRANSMITTER-LOCATION-STUDY.md`
+- `docs/FIELD-SESSION-METADATA-TEMPLATE.csv`
+- this handoff document
 
 ## 2. User and hardware context
 
@@ -30,7 +42,7 @@ Primary execution platform:
 - Raspberry Pi OS / Debian-family environment;
 - SDRplay RSP1B-class receiver;
 - DSD-FME installed at `/usr/local/bin/dsd-fme` in the validated run;
-- portable use is sometimes powered from a battery bank, so CPU, memory, I/O, and undervoltage risk matter.
+- portable use is sometimes powered from a battery bank, so CPU, memory, I/O and undervoltage risk matter.
 
 Repository on the Pi:
 
@@ -118,12 +130,6 @@ The source remains memory mapped. The Pi helper processes attempts sequentially 
 
 ### Phase 4.1 — quality corrections
 
-The first real run exposed three bugs that are already fixed:
-
-1. noisy inverted decoding was selected by raw sync count;
-2. both slots were counted because DSD-FME prints both slot labels;
-3. percentile normalization allowed PCM16 outliers to clip.
-
 Current behavior:
 
 - polarity is selected by an evidence-quality score;
@@ -143,9 +149,9 @@ The corrected real run produced 15 attempts:
 
 Phase 5 imports the selected DSD-FME logs into:
 
-- event ledger;
+- an event ledger;
 - per-slot correlated sessions/bursts;
-- persistent SQLite database;
+- a persistent SQLite database;
 - cumulative per-frequency channel aggregates.
 
 It is idempotent by `run_id`: re-importing the same run replaces that run, while new run IDs accumulate in the shared database.
@@ -170,14 +176,26 @@ no Radio IDs
 | 162.587500 MHz | 5 | CSBK/data | clean in both |
 | 164.300000 MHz | 7 | mostly idle | clean in both |
 | 164.325000 MHz | 6 | mostly idle | one degraded, one clean |
-| 164.537500 MHz | 8 | idle and Group Voice | voice evidence with VC1–VC6 |
+| 164.537500 MHz | 8 | idle and Group Voice | complete VC1–VC6 evidence |
 | 164.725000 MHz | 7 | idle/data | clean in both |
 | 165.625000 MHz | 6 | idle/data | degraded despite strong RF |
 | 167.137500 MHz | 7 | idle/data | one degraded, one clean |
 
-Do not claim TG or Radio IDs for these recordings. None were recovered reliably.
+Do not claim TG or Radio IDs for the original recordings. None were recovered reliably.
 
-## 6. Reproducible commands on the Pi
+## 6. Does Phase 5 require another recording?
+
+No.
+
+Phase 5 can be run and validated entirely from the existing Phase 4.1 output tree. A new field recording is required only to add new evidence, including:
+
+- Talkgroup and Radio IDs;
+- longer voice/control activity;
+- strength measurements from new locations;
+- transmitter coverage/location work;
+- cleaner evidence for degraded or passband-edge channels.
+
+## 7. Reproducible commands on the Pi
 
 ```bash
 cd ~/Projects/dmr-iq-surveyor
@@ -189,7 +207,7 @@ pytest -q
 ruff check .
 ```
 
-Full archived workflow:
+Archived workflow:
 
 ```bash
 ./scripts/run_shahar_recordings.sh
@@ -210,13 +228,7 @@ dmr-surveyor inventory-build \
   --run-id 20260713_163671500Hz_phase4_1
 ```
 
-Configured command:
-
-```bash
-dmr-surveyor inventory-batch config/shahar_recordings.yaml
-```
-
-## 7. Phase 5 outputs
+## 8. Phase 5 outputs
 
 Per-run export:
 
@@ -251,62 +263,96 @@ sessions
 channels
 ```
 
-## 8. Important interpretation rules
+## 9. Important interpretation rules
 
 - DSD-FME clock strings are decoder-run evidence, not guaranteed original RF capture timestamps.
 - Session durations are estimates only when decoder clock values are monotonic.
 - DSD-FME `-xr` symbol inversion is not the same as IQ/QI orientation.
 - PSD is relative dBFS/Hz, not calibrated dBm.
 - A strong carrier may decode poorly because of overload, distortion, offset or transient timing.
-- Candidates near the original 10 MHz passband edge should be re-recorded nearer the receiver center.
 - Empty TG/Radio lists must remain empty; never infer IDs from payload bytes without a documented protocol decoder.
+- Color Code is not a unique transmitter or site identifier.
 
-## 9. Recommended next field collection
+## 10. Future field recording protocol
 
-The next objective is to capture real voice/control headers long enough to recover Talkgroup and Radio IDs.
+The repository guide is authoritative:
 
-Do not make long 10 MHz IQ recordings the default. At signed 16-bit complex IQ, 10 MS/s is approximately 40 MB/s or 2.4 GB/minute.
-
-Recommended targeted workflow:
-
-1. choose one confirmed frequency, starting with 164.537500 MHz because voice was already observed;
-2. center the receiver exactly on that channel;
-3. use 250–500 kS/s IQ when SDRconnect permits;
-4. record 5–15 minutes during an active operational period;
-5. record metadata: date/time, location, antenna, gain, center frequency, sample rate and power condition;
-6. create a new config and output root for the capture;
-7. run Phase 1, Phase 2 if useful, Phase 4/4.1 and then Phase 5 with a new run ID;
-8. inspect `channels.json`, `sessions.json` and the SQLite database for new TG/Radio IDs.
-
-Approximate storage:
-
-- 250 kS/s complex int16: ~60 MB/minute;
-- 500 kS/s complex int16: ~120 MB/minute;
-- 10 MS/s complex int16: ~2.4 GB/minute.
-
-For a battery-powered Pi, check before a long run:
-
-```bash
-vcgencmd get_throttled
-free -h
-df -h .
+```text
+docs/FIELD-RECORDING-GUIDE.md
 ```
 
-Prefer stable USB-C PD power or a UPS HAT. Do not run long RF processing while undervoltage flags are active.
+For the first multi-location campaign, the documented starting profile is:
 
-## 10. Best next engineering work
+```text
+center frequency: 164.831250 MHz
+sample rate:      10.000 MS/s
+capture length:   15–20 seconds
+repeats:          2 per site
+sites:            8–12
+AGC:              off
+manual gain:      fixed for the campaign
+```
 
-After the first targeted longer capture, the recommended Phase 5.1 work is:
+One capture covers all eight confirmed channels simultaneously.
 
-1. validate Phase 5 outputs against the new run;
-2. add direct import of standalone DSD-FME logs that were not produced by Phase 4;
-3. add capture metadata tables and real source timestamps;
-4. improve session boundaries using protocol-aware call start/end messages;
-5. add optional HTML dashboard views over the SQLite inventory;
-6. verify IQ/QI orientation using a known off-center carrier;
-7. consider a targeted live receiver mode only after the offline pipeline remains stable.
+Every campaign must use:
 
-## 11. Git workflow expectations
+```text
+docs/FIELD-SESSION-METADATA-TEMPLATE.csv
+```
+
+Do not process long recordings in the field while the Pi is on unstable power. Capture first and analyze later.
+
+## 11. Transmitter-location study
+
+The repository methodology is:
+
+```text
+docs/TRANSMITTER-LOCATION-STUDY.md
+```
+
+Key conclusion:
+
+- sequential recordings from one portable receiver can build a coverage heatmap and reduce the likely search area;
+- RSSI alone normally cannot provide a precise transmitter coordinate;
+- directional bearings from at least three sites are the recommended refinement;
+- precise TDOA requires simultaneous time-synchronized receivers;
+- coherent AoA requires phase-coherent multi-channel hardware, which a single RSP1B is not.
+
+Recommended progression:
+
+1. 8–12-site wideband survey;
+2. closer 200–500 m refinement around the strongest region;
+3. directional bearings from at least three sites;
+4. TDOA or coherent AoA only when justified.
+
+## 12. Open engineering work
+
+### Issue #13 — Phase 5.1
+
+Add adaptive extraction presets for:
+
+- 10 MS/s wideband input;
+- 500 kS/s targeted input;
+- 250 kS/s targeted input.
+
+Also add:
+
+- known-frequency targeted processing without Phase 3;
+- capture metadata persistence;
+- standalone DSD-FME log import;
+- validation tests and documentation.
+
+Important: do not reuse the current 10 MS/s decimation/filter profile unchanged on a 250 or 500 kS/s file.
+
+First targeted channel after Phase 5.1:
+
+```text
+164.537500 MHz
+Color Code 8
+```
+
+## 13. Git workflow expectations
 
 For each change:
 
@@ -318,18 +364,28 @@ For each change:
 6. merge only after CI succeeds;
 7. update this handoff when state changes materially.
 
-## 12. Prompt for the next chat
-
-Use this as the opening prompt in a new conversation:
+## 14. Prompt for the next chat
 
 ```text
 Continue the DMR IQ Surveyor project in https://github.com/Shahar373/dmr-iq-surveyor.
-Read docs/NEXT-CONVERSATION-HANDOFF.md and docs/development-history.md first.
+
+Read first:
+- docs/NEXT-CONVERSATION-HANDOFF.md
+- docs/development-history.md
+- docs/FIELD-RECORDING-GUIDE.md
+- docs/TRANSMITTER-LOCATION-STUDY.md
+- GitHub Issue #13
+
 Do not restart Phases 1–5.
-Help me run and validate Phase 5 on the Raspberry Pi, analyze the uploaded inventory results, and then plan the first targeted 164.537500 MHz capture for recovering Talkgroup and Radio IDs.
-Use issue -> branch -> tests/docs -> PR -> CI -> merge.
+
+First help me run and validate Phase 5 on the Raspberry Pi. Then implement Phase 5.1 from Issue #13 so targeted 250/500 kS/s captures are safe and supported.
+
+After that, help me plan and analyze a multi-location recording campaign for all eight confirmed channels, using the repository field guide. Treat RSSI results as a coverage/probability study, not an exact transmitter coordinate.
+
+Use issue -> branch -> implementation/tests/docs -> PR -> CI -> merge.
+Keep the project passive and receive-only.
 ```
 
-## 13. Safety and scope
+## 15. Safety and scope
 
 This project is passive receive-side RF analysis. Do not add transmit, injection, impersonation, authentication bypass, brute force or decryption features.
