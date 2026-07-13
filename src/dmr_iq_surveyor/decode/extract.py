@@ -159,7 +159,10 @@ def run_channel_extraction(
 - IQ order: **{assumed_iq_order}** ({info.iq_order_confidence})
 - Input: **{input_rate:,} complex samples/s**, **{info.duration_seconds:.6f} s**
 - Output: **{resolved.output_rate_hz:,} Hz mono PCM16**, **{output_duration:.6f} s**
+- Peak-safe limiter applied: **{normalization['limiter_applied']}**
+- Samples that would clip without peak cap: **{normalization['would_clip_without_limiter']}**
 - Clipped output samples: **{normalization['clipped_samples']}**
+- Output peak: **{normalization['peak_pcm']} / 32767**
 - Elapsed: **{elapsed:.3f} s**
 - Peak RSS: **{_peak_rss_bytes() / (1024 ** 2):.1f} MiB**
 
