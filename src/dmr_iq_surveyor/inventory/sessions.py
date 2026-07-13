@@ -38,6 +38,8 @@ def _clock_seconds(value: str | None) -> int | None:
 
 
 def _session_type(events: list[ParsedEvent]) -> str:
+    if events and all(item.is_error for item in events):
+        return "error_only"
     types = {item.event_type for item in events}
     if "voice" in types:
         return "voice"
