@@ -8,10 +8,12 @@ import yaml
 
 from dmr_iq_surveyor.decode import (
     DecoderSettings,
+    extraction_profile,
     run_channel_extraction,
     run_decoder_profiles,
 )
 from dmr_iq_surveyor.inventory import build_inventory
+from dmr_iq_surveyor.iq.metadata import inspect_wave_iq
 
 
 def load_capture_metadata(path: str | Path | None) -> dict[str, Any]:
@@ -29,6 +31,36 @@ def load_capture_metadata(path: str | Path | None) -> dict[str, Any]:
     return dict(payload)
 
 
+def _validate_capture_contract(
+    source: Path,
+    profile_name: str,
+    metadata: dict[str, Any],
+    iq_order: str,
+) -> None:
+    info = inspect_wave_iq(source, assumed_iq_order=iq_order)
+    actual_rate = int(info.fmt.sample_rate_hz)
+    extraction_profile(profile_name, actual_rate)
+    declared_rate = metadata.get("sample_rate_hz")
+    if declared_rate is not None and int(declared_rate) != actual_rate:
+        raise ValueError(
+            f"Capture metadata sample_rate_hz={int(declared_rate):,} does not "
+            f"match the recording rate {actual_rate:,}"
+        )
+    declared_center = metadata.get("center_frequency_hz")
+    actual_center = info.center_frequency_hz
+    if declared_center is not None:
+        if actual_center is None:
+            raise ValueError(
+                "Capture metadata declares a center frequency, but the recording "
+                "center could not be determined"
+            )
+        if int(round(float(declared_center))) != int(round(float(actual_center))):
+            raise ValueError(
+                f"Capture metadata center_frequency_hz={float(declared_center):.0f} "
+                f"does not match the recording center {float(actual_center):.0f}"
+            )
+
+
 def run_targeted_capture(
     input_path: str | Path,
     output_root: str | Path,
@@ -43,6 +75,13 @@ def run_targeted_capture(
     iq_order: str = "IQ",
 ) -> dict[str, Any]:
     source = Path(input_path).expanduser().resolve()
+    resolved_metadata = dict(metadata or {})
+    _validate_capture_contract(
+        source,
+        profile_name,
+        resolved_metadata,
+        iq_order,
+    )
     root = Path(output_root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     resolved_recording_id = recording_id or source.stem
@@ -63,7 +102,7 @@ def run_targeted_capture(
         assumed_iq_order=iq_order,
         candidate_id=candidate_id,
         recording_id=resolved_recording_id,
-        capture_metadata=metadata,
+        capture_metadata=resolved_metadata,
     )
     decoder = run_decoder_profiles(
         extraction["wav_path"],
