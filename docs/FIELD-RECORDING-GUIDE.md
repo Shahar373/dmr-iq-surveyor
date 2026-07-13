@@ -4,28 +4,24 @@ This document is the operational checklist for future field sessions. Read it be
 
 ## 1. Does Phase 5 require a new recording?
 
-No. Phase 5 can be run and validated entirely from the existing Phase 4.1 decode tree. It converts the selected DSD-FME logs into persistent events, sessions and channel inventory.
+No. Phase 5 can be run and validated entirely from the existing Phase 4.1 decode tree.
 
-A new recording is needed only when the objective is one of the following:
+A new recording is needed only to add evidence:
 
-- recover Talkgroup or Radio IDs that were absent from the short source captures;
-- observe more voice, data or control activity;
-- compare channel strength at different locations;
-- estimate a transmitter coverage area or location;
-- verify IQ/QI orientation against a known carrier;
-- improve a degraded channel by recording it nearer the receiver passband center.
+- recover Talkgroup or Radio IDs;
+- observe longer voice, data or control activity;
+- compare strength at additional locations;
+- estimate transmitter coverage or probable location;
+- verify IQ/QI orientation;
+- replace degraded or edge-of-passband captures.
 
-## 2. Separate the session objective before recording
+## 2. Choose one session objective
 
-Do not mix all objectives into one uncontrolled capture. Choose one of these modes.
+Do not mix objectives into an uncontrolled capture.
 
 ### Mode A — multi-location survey
 
-Purpose: compare all eight confirmed DMR carriers between sites and build a coverage/geolocation dataset.
-
-Use short, repeatable wideband recordings with identical receiver and antenna settings at every site.
-
-Recommended initial profile:
+Purpose: compare all eight confirmed carriers and build a coverage/geolocation dataset.
 
 ```text
 center frequency: 164.831250 MHz
@@ -33,12 +29,11 @@ sample rate:      10.000 MS/s
 format:           signed 16-bit complex IQ
 capture length:   15–20 seconds
 repeats:          2 per site
-sites:            8–12 for the first campaign
+sites:            8–12
+profile later:    10m
 ```
 
-The center frequency is approximately the midpoint of the confirmed range, 162.525000–167.137500 MHz. It keeps all confirmed channels well inside a 10 MHz recording and away from DC.
-
-At 10 MS/s signed complex int16, storage is approximately 40 MB/s:
+One recording covers all eight confirmed channels. Approximate storage:
 
 ```text
 15 seconds ≈ 600 MB
@@ -47,31 +42,29 @@ At 10 MS/s signed complex int16, storage is approximately 40 MB/s:
 10 sites ≈ 16 GB
 ```
 
-This profile remains compatible with the existing 10 MS/s Phase 4 extraction design.
-
 ### Mode B — targeted identity capture
 
-Purpose: recover Talkgroup and Radio IDs from one known channel during active traffic.
+Purpose: recover TG and Radio IDs from one known channel.
 
 Start with:
 
 ```text
-164.537500 MHz
-Color Code 8
+frequency:        164.537500 MHz
+Color Code:       8
+center frequency: 164.537500 MHz
+sample rate:      500 kS/s preferred
+capture length:   5–15 minutes
+profile later:    500k or auto
 ```
 
-This channel already showed coherent Group Voice and complete VC1–VC6 activity.
-
-Do not use the existing 10 MS/s extraction profile unchanged on a 250 or 500 kS/s file. Phase 5.1 / Issue #13 must provide a validated targeted-rate preset first.
-
-After Phase 5.1 is implemented, the intended profile is:
+The `500k` and `250k` extraction profiles are implemented in Phase 5.1. Use 500 kS/s for the first real targeted capture because it provides more tuning margin. Approximate storage:
 
 ```text
-center exactly on the channel
-sample rate: 250 or 500 kS/s
-capture length: 5–15 minutes
-record during known activity
+500 kS/s complex int16 ≈ 120 MB/minute
+250 kS/s complex int16 ≈ 60 MB/minute
 ```
+
+See `docs/PHASE5-1-TARGETED-CAPTURE.md`.
 
 ### Mode C — directional bearing survey
 
@@ -83,50 +76,41 @@ Use a directional VHF antenna, fixed manual gain and a reproducible rotation pro
 
 Required:
 
-- Raspberry Pi 5 and storage with sufficient free space;
+- Raspberry Pi 5 and sufficient storage;
 - SDRplay RSP1B-class receiver;
-- the same VHF antenna for the entire campaign;
-- the same coax cable and adapters for every site;
+- the same VHF antenna and coax for the full campaign;
 - stable USB-C PD power or UPS HAT;
 - phone with GPS and camera;
-- tripod or repeatable vehicle-roof mount;
-- measuring tape or marked mast for repeatable antenna height;
-- notebook or the metadata template below.
+- repeatable antenna mount and height;
+- metadata template or notebook.
 
 Recommended:
 
-- second power bank reserved only for the Pi/SDR;
-- 50-ohm terminator for receiver-noise checks at the beginning or end of the campaign;
-- external USB storage for immediate backup;
+- second power bank reserved for the Pi/SDR;
+- external storage for backup;
 - compass;
-- weatherproof cover that does not enclose or overheat the Pi;
-- for later bearing work: 3-element Yagi or log-periodic antenna and a step attenuator.
+- 50-ohm terminator for receiver-noise checks;
+- for bearing work: VHF Yagi/log-periodic and step attenuator.
 
 ## 4. Receiver settings that must stay fixed
 
-For strength comparison, changing gain between sites invalidates the simple comparison.
+For comparisons between sites, keep constant:
 
-Record and keep constant:
-
-- AGC: off;
+- AGC off;
 - LNA state;
-- IF gain reduction;
+- IF gain reduction/manual gain;
 - RF bandwidth;
-- sample rate;
-- center frequency;
-- antenna;
-- coax and adapters;
-- antenna height;
-- antenna orientation;
-- IQ format;
-- SDRconnect version;
-- any notch filters, preamplifiers or bias-T state.
+- sample rate and center frequency;
+- antenna, coax and adapters;
+- antenna height, orientation and polarization;
+- IQ format and SDRconnect version;
+- filters, preamplifiers and bias-T state.
 
-Choose manual gain at the first site so the strongest confirmed carrier has comfortable headroom and does not overload or clip. Do not optimize gain independently at every location.
+Choose gain at the first site with headroom for the strongest carrier. Do not optimize gain separately at each location. If overload occurs, preserve the standard capture and add a clearly labelled lower-gain repeat.
 
-If overload occurs at a later site, make a separate clearly labelled low-gain repeat. Do not silently replace the standard-gain capture.
+## 5. Raspberry Pi checks
 
-## 5. Raspberry Pi checks before leaving
+Before leaving:
 
 ```bash
 cd ~/Projects/dmr-iq-surveyor
@@ -142,180 +126,164 @@ df -h .
 timedatectl status
 ```
 
-Interpret `vcgencmd get_throttled`:
+Desired power result:
 
 ```text
 throttled=0x0
 ```
 
-is the desired result. Any current undervoltage or throttling flag means the power problem should be corrected before recording.
+Correct any current undervoltage before recording. Capture first and process later on stable power.
 
-Do not run spectrum analysis or decoding in the field while the Pi is on unstable power. Capture first; process later on stable power.
+## 6. Site selection for geolocation campaigns
 
-## 6. Site selection for the first multi-location campaign
-
-Use 8–12 sites that surround the suspected coverage area instead of following one road or one straight line.
+Use 8–12 sites around the suspected region, not along one line.
 
 Include:
 
-- at least one high-elevation open site;
+- north, south, east and west geometry;
+- at least one high open site;
 - at least one low urban site;
-- sites north, south, east and west of the suspected area;
-- at least two sites expected to be weak;
-- at least two sites expected to be strong;
-- no two sites with nearly identical geometry unless they are deliberate repeats.
+- expected strong and weak sites;
+- initial spacing of roughly 1–3 km.
 
-Initial spacing can be 1–3 km. After a first heatmap identifies a likely high-strength region, use a second campaign with 200–500 m spacing around that region.
+After the first heatmap, add 6–10 refinement sites with 200–500 m spacing around the strongest plausible region.
 
-Avoid:
+Avoid recording inside a vehicle, beside large metal structures, or where antenna geometry cannot be repeated. Use only safe and legal locations.
 
-- recording inside a vehicle;
-- standing next to large metal structures;
-- placing the antenna directly beside the Pi, screen, power bank or USB cable bundle;
-- sites where the antenna height or mount cannot be reproduced;
-- private or restricted property without permission.
+## 7. Per-site procedure for Mode A
 
-## 7. Per-site procedure
-
-Use the same sequence at every site.
-
-1. Park or stand in a safe, legal position.
+1. Stop in a safe, legal location.
 2. Record GPS latitude, longitude, altitude and reported accuracy.
-3. Photograph the antenna placement and surrounding horizon.
-4. Install the antenna at the standard height.
-5. Keep antenna polarization and orientation identical to previous sites.
-6. Start the Pi and SDR, then allow at least 60 seconds for thermal and gain stabilization.
-7. Confirm manual gain and all receiver settings.
-8. Check power and storage:
+3. Photograph the antenna placement and horizon.
+4. Install the antenna at the standard height and orientation.
+5. Allow at least 60 seconds for receiver stabilization.
+6. Confirm all fixed settings and AGC off.
+7. Run:
 
    ```bash
    vcgencmd get_throttled
    df -h .
    ```
 
-9. Record the first 15–20 second wideband IQ file.
-10. Wait approximately 30–60 seconds.
-11. Record an identical second file.
-12. Verify that both files exist and have plausible size.
-13. Record any local interference, nearby transmitters, buildings, terrain or moving vehicles.
-14. Recheck `vcgencmd get_throttled` before leaving the site.
+8. Record the first 15–20 second 10 MS/s IQ file.
+9. Wait 30–60 seconds.
+10. Record an identical second file.
+11. Verify file size and metadata.
+12. Record obstacles, interference, terrain and weather.
+13. Recheck undervoltage before leaving.
 
-Two captures are important. They reveal whether one measurement was distorted by fading, temporary traffic or a local interferer.
+## 8. Procedure for Mode B
 
-## 8. File and directory naming
+1. Center SDRconnect exactly at 164.537500 MHz.
+2. Select 500 kS/s for the first targeted run.
+3. Use signed 16-bit complex IQ WAV.
+4. Disable AGC and record manual gain.
+5. Start during a period where voice activity is likely.
+6. Record 5–15 minutes.
+7. Preserve the original filename and center-frequency metadata.
+8. Fill a metadata YAML based on:
 
-Recommended structure:
+   ```bash
+   cp config/targeted_capture_metadata.example.yaml \
+     config/my_targeted_capture.yaml
+   ```
+
+9. Process later:
+
+   ```bash
+   chmod +x scripts/run_targeted_164537500.sh
+   ./scripts/run_targeted_164537500.sh \
+     /full/path/to/recording.wav \
+     config/my_targeted_capture.yaml \
+     field_YYYYMMDD_site_a \
+     auto
+   ```
+
+## 9. File naming
+
+Multi-location campaign example:
 
 ```text
-field-data/
-└── 202607XX_geolocation_campaign_01/
-    ├── session.md
-    ├── sites.csv
-    ├── site_01/
-    │   ├── site_01_repeat_01_164831250HZ_10000000SPS.wav
-    │   ├── site_01_repeat_02_164831250HZ_10000000SPS.wav
-    │   └── photos/
-    ├── site_02/
-    └── ...
+field-data/YYYYMMDD_geolocation_campaign_01/
+├── sites.csv
+├── site_01/
+│   ├── site_01_repeat_01_164831250HZ_10000000SPS.wav
+│   └── site_01_repeat_02_164831250HZ_10000000SPS.wav
+└── site_02/
 ```
 
-Do not rename away the center-frequency suffix expected by the existing filename fallback unless the container metadata reliably contains the center frequency.
-
-Use one run ID per campaign, for example:
+Targeted capture example:
 
 ```text
-202607XX_geolocation_campaign_01
+field-data/YYYYMMDD_targeted_164537500/
+├── site_a_164537500HZ_500000SPS.wav
+└── site_a_metadata.yaml
 ```
 
-Use a new run ID for every later campaign so Phase 5 can accumulate observations rather than replace the previous run.
+Use a new run ID for every campaign or targeted recording so Phase 5 accumulates observations rather than replacing a prior run.
 
-## 9. Metadata required for every site
+## 10. Metadata required
 
 Record at minimum:
 
 ```text
-campaign_id
-site_id
-repeat_id
-local_datetime
-utc_datetime
-latitude
-longitude
-altitude_m
-gps_accuracy_m
+campaign_id / run_id
+site_id / recording_id
+local and UTC datetime
+latitude, longitude, altitude, GPS accuracy
 center_frequency_hz
 sample_rate_hz
 capture_duration_s
-receiver_model
-receiver_serial
-sdrconnect_version
-agc_enabled
-lna_state
-if_gain_reduction_db
-rf_bandwidth_hz
-antenna_model
-antenna_height_m
-antenna_orientation_deg
-polarization
-coax_type
-coax_length_m
-filters_or_lna
-power_source
-vcgencmd_before
-vcgencmd_after
-weather
-terrain
-nearby_obstacles
+receiver model and serial
+SDRconnect version
+AGC, LNA and manual gain
+RF bandwidth
+antenna, height, orientation and polarization
+coax and filters/LNA
+power source
+vcgencmd before and after
+weather, terrain and obstacles
+file path and SHA-256
 notes
-file_path
-sha256
 ```
 
-A CSV template is provided in `docs/FIELD-SESSION-METADATA-TEMPLATE.csv`.
+Templates:
 
-## 10. End-of-day validation
+- `docs/FIELD-SESSION-METADATA-TEMPLATE.csv`
+- `config/targeted_capture_metadata.example.yaml`
 
-Before deleting or moving anything:
+## 11. End-of-day validation
 
 ```bash
-find field-data/202607XX_geolocation_campaign_01 -type f -name '*.wav' -ls
-sha256sum field-data/202607XX_geolocation_campaign_01/site_*/*.wav \
-  > field-data/202607XX_geolocation_campaign_01/SHA256SUMS.txt
+find field-data -type f -name '*.wav' -ls
+sha256sum field-data/**/*.wav > SHA256SUMS.txt
 vcgencmd get_throttled
 df -h .
 ```
 
-Copy the campaign to a second storage device before processing.
+Before processing, copy the campaign to a second storage device and verify:
 
-Check:
-
-- two recordings exist per site;
-- durations and file sizes are consistent;
-- center frequency and sample rate are identical;
-- metadata rows match the file names;
-- gain and antenna settings did not change;
+- expected files and durations exist;
+- center frequency and sample rate match the plan;
+- gain and antenna settings stayed fixed;
 - GPS coordinates are plausible;
 - no undervoltage occurred.
 
-## 11. Analysis principles for location work
+## 12. Analysis principles for location work
 
-Do not compare raw peak dBFS alone.
-
-For each confirmed frequency and site, retain:
+Do not compare raw peak dBFS alone. Retain per site and frequency:
 
 - average channel SNR;
 - P95 channel SNR;
 - local noise floor;
 - occupancy;
 - both repeat values;
-- median of repeats;
-- difference between repeats as an uncertainty indicator.
+- repeat median and difference;
+- overload/passband warnings.
 
-The primary comparison should be channel power relative to the local noise floor under fixed manual gain.
+Use channel power relative to the local noise floor under fixed manual gain. Report a probable region, not an exact coordinate, unless directional or synchronized methods justify it.
 
-A strong value at one site is not proof that the transmitter is physically close. Terrain, antenna pattern, multipath, buildings and line of sight can dominate the result.
-
-## 12. Confirmed frequencies for the first campaign
+## 13. Confirmed frequencies
 
 ```text
 162.525000 MHz  CC8
@@ -328,15 +296,12 @@ A strong value at one site is not proof that the transmitter is physically close
 167.137500 MHz  CC7
 ```
 
-One 10 MHz recording centered at 164.831250 MHz can capture all eight simultaneously.
-
-## 13. Field safety and project scope
+## 14. Safety and scope
 
 This project is passive and receive-only.
 
-- do not transmit;
-- do not attempt to join or impersonate a network;
+- do not transmit or impersonate a network;
 - do not trespass;
-- do not obstruct roads or operate equipment while driving;
+- do not operate equipment while driving;
 - do not publish exact locations of sensitive infrastructure without careful validation and a legitimate reason;
-- preserve uncertainty in all location estimates.
+- preserve uncertainty in every location estimate.
