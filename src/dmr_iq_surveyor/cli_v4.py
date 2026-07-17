@@ -31,7 +31,11 @@ def targeted_decode(
     ] = Path("runs/targeted"),
     profile: Annotated[
         str,
-        typer.Option(help="Extraction profile: auto, 10m, 500k, or 250k"),
+        typer.Option(
+            help=(
+                "Extraction profile: auto, 10m, 5m, 500k, 250k, or 62k5"
+            )
+        ),
     ] = "auto",
     recording_id: Annotated[
         str | None,
