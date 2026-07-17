@@ -17,8 +17,10 @@ from dmr_iq_surveyor.inventory.store import connect_database
 @pytest.mark.parametrize(
     ("profile", "rate", "intermediate_rate"),
     [
+        ("62k5", 62_500, 62_500),
         ("250k", 250_000, 50_000),
         ("500k", 500_000, 100_000),
+        ("5m", 5_000_000, 100_000),
         ("10m", 10_000_000, 100_000),
     ],
 )
@@ -35,24 +37,34 @@ def test_profiles_validate_expected_rates(
 def test_profile_rate_mismatch_fails_before_processing() -> None:
     with pytest.raises(ValueError, match="requires 500,000 S/s"):
         extraction_profile("500k", 250_000)
+    with pytest.raises(ValueError, match="requires 5,000,000 S/s"):
+        extraction_profile("5m", 10_000_000)
     with pytest.raises(ValueError, match="No automatic extraction profile"):
         extraction_profile("auto", 1_000_000)
 
 
-@pytest.mark.parametrize(("profile", "rate"), [("250k", 250_000), ("500k", 500_000)])
-def test_targeted_profiles_recover_fm_and_remain_peak_safe(
+def _recover_fm(
     profile: str,
     rate: int,
+    intermediate_rate: int,
+    frequency_offset_hz: float,
 ) -> None:
-    duration = 0.20
+    duration = 0.08
     count = int(rate * duration)
     time = np.arange(count) / rate
     audio_hz = 1_000.0
     deviation_hz = 1_800.0
-    instantaneous = deviation_hz * np.sin(2 * np.pi * audio_hz * time)
+    instantaneous = (
+        frequency_offset_hz
+        + deviation_hz * np.sin(2 * np.pi * audio_hz * time)
+    )
     phase = 2 * np.pi * np.cumsum(instantaneous) / rate
     iq = np.exp(1j * phase).astype(np.complex64)
-    settings = extraction_profile(profile, rate, chunk_frames=count // 3)
+    settings = extraction_profile(
+        profile,
+        rate,
+        chunk_frames=max(1, count // 3),
+    )
     chunks = [
         iq[start : start + settings.chunk_frames]
         for start in range(0, len(iq), settings.chunk_frames)
@@ -60,7 +72,7 @@ def test_targeted_profiles_recover_fm_and_remain_peak_safe(
     output, metrics, _preview = process_complex_chunks(
         chunks,
         input_sample_rate_hz=rate,
-        frequency_offset_hz=0.0,
+        frequency_offset_hz=frequency_offset_hz,
         settings=settings,
     )
     expected_duration = duration - 2 * settings.trim_seconds
@@ -74,9 +86,32 @@ def test_targeted_profiles_recover_fm_and_remain_peak_safe(
         settings.normalization_percentile,
         settings.output_peak_fraction,
     )
-    assert metrics["intermediate_rate_hz"] in {50_000, 100_000}
+    assert metrics["intermediate_rate_hz"] == intermediate_rate
     assert normalization["clipped_samples"] == 0
     assert np.max(np.abs(pcm.astype(np.int32))) <= round(32767 * 0.9)
+
+
+@pytest.mark.parametrize(
+    ("profile", "rate", "intermediate_rate", "frequency_offset_hz"),
+    [
+        ("62k5", 62_500, 62_500, -18_500.0),
+        ("250k", 250_000, 50_000, 0.0),
+        ("500k", 500_000, 100_000, 0.0),
+        ("5m", 5_000_000, 100_000, 1_069_000.0),
+    ],
+)
+def test_profiles_recover_fm_and_remain_peak_safe(
+    profile: str,
+    rate: int,
+    intermediate_rate: int,
+    frequency_offset_hz: float,
+) -> None:
+    _recover_fm(
+        profile,
+        rate,
+        intermediate_rate,
+        frequency_offset_hz,
+    )
 
 
 def test_existing_inventory_database_is_migrated_for_metadata(

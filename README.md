@@ -13,6 +13,7 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - Phase 4.1: evidence-quality polarity scoring, active-slot parsing and peak-safe PCM
 - Phase 5: persistent event, session and channel inventory in SQLite
 - Phase 5.1: validated 10m/500k/250k targeted-capture profiles, metadata and standalone-log import
+- Phase 5.2: exact 5m and 62k5 profiles for additional SDRconnect recording modes
 
 ## Project documentation
 
@@ -21,6 +22,7 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - [`docs/phase5-design.md`](docs/phase5-design.md)
 - [`docs/phase5-session-semantics.md`](docs/phase5-session-semantics.md)
 - [`docs/PHASE5-1-TARGETED-CAPTURE.md`](docs/PHASE5-1-TARGETED-CAPTURE.md)
+- [`docs/PHASE5-2-ADDITIONAL-RATES.md`](docs/PHASE5-2-ADDITIONAL-RATES.md)
 - [`docs/FIELD-RECORDING-GUIDE.md`](docs/FIELD-RECORDING-GUIDE.md)
 - [`docs/TRANSMITTER-LOCATION-STUDY.md`](docs/TRANSMITTER-LOCATION-STUDY.md)
 - [`docs/FIELD-SESSION-METADATA-TEMPLATE.csv`](docs/FIELD-SESSION-METADATA-TEMPLATE.csv)
@@ -124,7 +126,7 @@ DSP path:
 wideband complex IQ
   -> phase-continuous mixer
   -> validated FIR decimation profile
-  -> 50 or 100 kHz complex baseband
+  -> 50, 62.5 or 100 kHz complex baseband
   -> channel low-pass
   -> FM phase discriminator
   -> rational resampling
@@ -192,15 +194,17 @@ Sessions made entirely of decoder errors are retained as `error_only`. Reports d
 
 DSD-FME clock strings are preserved as decoder-clock evidence. They are not treated as guaranteed original RF capture timestamps.
 
-## Phase 5.1 — targeted known-frequency capture
+## Phase 5.1 and 5.2 — targeted known-frequency capture
 
 Supported exact-rate profiles:
 
 | Profile | Input rate | Intermediate rate |
 |---|---:|---:|
 | `10m` | 10,000,000 S/s | 100,000 S/s |
+| `5m` | 5,000,000 S/s | 100,000 S/s |
 | `500k` | 500,000 S/s | 100,000 S/s |
 | `250k` | 250,000 S/s | 50,000 S/s |
+| `62k5` | 62,500 S/s | 62,500 S/s |
 | `auto` | detected | detected |
 
 A rate/profile mismatch fails before IQ processing.
@@ -244,7 +248,7 @@ dmr-surveyor inventory-import-log \
   --database runs/inventory/dmr_inventory.sqlite3
 ```
 
-See [`docs/PHASE5-1-TARGETED-CAPTURE.md`](docs/PHASE5-1-TARGETED-CAPTURE.md).
+See [`docs/PHASE5-1-TARGETED-CAPTURE.md`](docs/PHASE5-1-TARGETED-CAPTURE.md) and [`docs/PHASE5-2-ADDITIONAL-RATES.md`](docs/PHASE5-2-ADDITIONAL-RATES.md).
 
 ## Does Phase 5 require another field recording?
 
@@ -296,7 +300,7 @@ AGC:              off
 manual gain:      fixed and recorded
 ```
 
-The `500k` profile is now implemented. `250k` is also supported, but 500 kS/s provides more margin for the first real targeted run.
+The `500k` profile remains the preferred first long capture. `250k` is supported, while `62k5` is intended for already-created narrow SDRconnect IQ files with limited tuning margin. `5m` supports short wideband candidate extraction.
 
 ### Transmitter location study
 
@@ -330,6 +334,18 @@ The short source captures did not contain reliable Talkgroup or Radio IDs. Empty
 
 The original recordings use the conventional `IQ` assumption, but statistics alone cannot prove orientation. Phase 3 preserves the mirrored `QI` alternative. DSD-FME `-xr` symbol inversion is a separate question from IQ/QI frequency orientation.
 
+## Result packaging
+
+Generated runs, reports, metadata and the persistent SQLite database can be archived without including raw IQ files:
+
+```bash
+python3 scripts/package_results.py \
+  --output decoded_results.zip \
+  runs/targeted/my_run \
+  runs/inventory/dmr_inventory.sqlite3 \
+  config/my_capture.yaml
+```
+
 ## Tests
 
 ```bash
@@ -337,7 +353,7 @@ pytest -q
 ruff check .
 ```
 
-The suite covers metadata parsing, spectrum processing, candidate detection, streamed DSP, 10m/500k/250k profiles, peak-safe WAV output, DSD-FME quality parsing, polarity selection, active slots, event parsing, session semantics, capture metadata migration, standalone-log import, idempotent SQLite import and cross-run aggregation.
+The suite covers metadata parsing, spectrum processing, candidate detection, streamed DSP, 10m/5m/500k/250k/62k5 profiles, off-center frequency mixing, peak-safe WAV output, DSD-FME quality parsing, polarity selection, active slots, event parsing, session semantics, capture metadata migration, standalone-log import, idempotent SQLite import and cross-run aggregation.
 
 ## Passive scope
 
