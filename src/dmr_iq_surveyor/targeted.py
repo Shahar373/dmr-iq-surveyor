@@ -26,8 +26,11 @@ def load_capture_metadata(path: str | Path | None) -> dict[str, Any]:
         payload = json.loads(source.read_text(encoding="utf-8"))
     else:
         payload = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    # ValueError (not TypeError) is intentional: this validates parsed
+    # YAML/JSON content shape, and the CLI's except clauses catch ValueError
+    # for a clean error message rather than an unhandled traceback.
     if not isinstance(payload, dict):
-        raise ValueError("Capture metadata must be a YAML or JSON mapping")
+        raise ValueError("Capture metadata must be a YAML or JSON mapping")  # noqa: TRY004
     return dict(payload)
 
 
@@ -54,7 +57,7 @@ def _validate_capture_contract(
                 "Capture metadata declares a center frequency, but the recording "
                 "center could not be determined"
             )
-        if int(round(float(declared_center))) != int(round(float(actual_center))):
+        if round(float(declared_center)) != round(float(actual_center)):
             raise ValueError(
                 f"Capture metadata center_frequency_hz={float(declared_center):.0f} "
                 f"does not match the recording center {float(actual_center):.0f}"
@@ -86,7 +89,7 @@ def run_targeted_capture(
     root.mkdir(parents=True, exist_ok=True)
     resolved_recording_id = recording_id or source.stem
     resolved_run_id = run_id or root.name
-    candidate_id = f"T{int(round(frequency_hz))}"
+    candidate_id = f"T{round(frequency_hz)}"
     attempt_dir = (
         root
         / "decodes"

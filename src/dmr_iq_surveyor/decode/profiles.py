@@ -4,7 +4,6 @@ from dataclasses import replace
 
 from dmr_iq_surveyor.decode.core import ExtractionSettings
 
-
 _PROFILE_RATES = {
     "10m": 10_000_000,
     "5m": 5_000_000,

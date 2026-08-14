@@ -132,7 +132,7 @@ def merge_recordings(
             )
         )
 
-        def values(key: str) -> list[float]:
+        def values(key: str, cluster: list[dict[str, Any]] = cluster) -> list[float]:
             return [float(row[key]) for row in cluster]
 
         nearest_6k25 = nearest_raster_hz(measured, 6250.0)

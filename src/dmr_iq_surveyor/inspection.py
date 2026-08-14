@@ -99,7 +99,7 @@ def calculate_sample_statistics(reader: IQMemmapReader, window_frames: int) -> d
             {
                 "name": name,
                 "start_frame": start,
-                "frame_count": int(len(channels)),
+                "frame_count": len(channels),
                 "start_seconds": start / reader.info.fmt.sample_rate_hz,
                 "i": _channel_stats(i_values),
                 "q": _channel_stats(q_values),
@@ -185,7 +185,7 @@ def write_chunk_map(info: RecordingInfo, path: Path) -> None:
             writer.writerow(asdict(chunk))
 
 
-def _format_hz(value: float | int | None) -> str:
+def _format_hz(value: float | None) -> str:
     if value is None:
         return "Unknown"
     return f"{value:,.0f} Hz ({value / 1e6:.6f} MHz)"

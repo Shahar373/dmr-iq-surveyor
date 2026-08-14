@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import struct
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dmr_iq_surveyor.models import AuxiInfo, ChunkInfo, Ds64Info, FmtInfo, RecordingInfo
@@ -32,7 +32,7 @@ def _safe_system_time(values: tuple[int, ...]) -> str | None:
             minute,
             second,
             milliseconds * 1000,
-            tzinfo=timezone.utc,
+            tzinfo=UTC,
         )
         return value.isoformat()
     except (TypeError, ValueError, OverflowError):

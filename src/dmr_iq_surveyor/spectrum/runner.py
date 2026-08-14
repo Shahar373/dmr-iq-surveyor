@@ -196,7 +196,7 @@ def _analyze(
     waterfall_frequency_hz: np.ndarray | None = None
 
     bins_per_noise_window = max(
-        1, int(round(settings.local_noise_window_hz / resolution_hz))
+        1, round(settings.local_noise_window_hz / resolution_hz)
     )
     starts = iter_fft_starts(info.frame_count, settings.fft_size, settings.overlap_ratio)
 
@@ -524,7 +524,7 @@ def run_spectrum_batch(config_path: str | Path) -> dict[str, Any]:
                 settings=settings,
                 assumed_iq_order=iq_order,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 (one recording's failure must not abort the batch)
             rows.append(
                 {
                     "recording_id": recording.recording_id,

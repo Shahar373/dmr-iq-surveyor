@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter
-from datetime import datetime, timezone
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -132,7 +133,7 @@ def replace_run(
     connection.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
     connection.execute(
         "INSERT INTO runs(run_id, source_dir, imported_at) VALUES (?, ?, ?)",
-        (run_id, source_dir, datetime.now(timezone.utc).isoformat()),
+        (run_id, source_dir, datetime.now(UTC).isoformat()),
     )
     for attempt in attempts:
         connection.execute(
