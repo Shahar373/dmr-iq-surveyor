@@ -51,7 +51,10 @@ def run_detect_batch(config_path: str | Path) -> dict[str, Any]:
     config_file = Path(config_path).expanduser().resolve()
     raw = yaml.safe_load(config_file.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
-        raise ValueError("Batch configuration must be a mapping")
+        # ValueError (not TypeError) is intentional: this validates parsed
+        # YAML content shape, and the CLI's except clauses catch ValueError
+        # for a clean error message rather than an unhandled traceback.
+        raise ValueError("Batch configuration must be a mapping")  # noqa: TRY004
     project = (
         raw.get("project")
         if isinstance(raw.get("project"), dict)
@@ -83,7 +86,7 @@ def run_detect_batch(config_path: str | Path) -> dict[str, Any]:
         )
         try:
             result = detect_spectrum(spectrum_dir, settings)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 (one recording's failure must not abort the batch)
             failures.append(
                 {
                     "recording_id": recording_id,

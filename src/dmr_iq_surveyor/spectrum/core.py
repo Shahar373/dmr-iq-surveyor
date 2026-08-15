@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
-from typing import Iterator
 
 import numpy as np
 from numpy.typing import NDArray
@@ -42,7 +42,7 @@ class SpectrumSettings:
 
 
 def fft_step(fft_size: int, overlap_ratio: float) -> int:
-    step = int(round(fft_size * (1.0 - overlap_ratio)))
+    step = round(fft_size * (1.0 - overlap_ratio))
     if step < 1:
         raise ValueError("overlap leaves an FFT step smaller than one sample")
     return step

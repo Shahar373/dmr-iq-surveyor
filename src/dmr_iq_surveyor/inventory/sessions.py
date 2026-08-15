@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from datetime import datetime
-from typing import Iterable
 
 from dmr_iq_surveyor.inventory.parser import ParsedEvent
 
@@ -31,10 +30,13 @@ class EventSession:
 
 
 def _clock_seconds(value: str | None) -> int | None:
+    # Decoder clock strings ("HH:MM:SS") are elapsed decoder time, not a real
+    # calendar timestamp, so there is no timezone to attach; parse the fields
+    # directly rather than routing through a naive datetime.
     if not value:
         return None
-    parsed = datetime.strptime(value, "%H:%M:%S")
-    return parsed.hour * 3600 + parsed.minute * 60 + parsed.second
+    hours, minutes, seconds = value.split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
 
 
 def _session_type(events: list[ParsedEvent]) -> str:

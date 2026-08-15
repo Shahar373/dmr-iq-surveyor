@@ -14,6 +14,7 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - Phase 5: persistent event, session and channel inventory in SQLite
 - Phase 5.1: validated 10m/500k/250k targeted-capture profiles, metadata and standalone-log import
 - Phase 5.2: exact 5m and 62k5 profiles for additional SDRconnect recording modes
+- Phase 6A: protocol-agnostic RF survey (discovery, persistent inventory, run comparison), the first step toward multi-protocol support (P25 in 866-870 MHz)
 
 ## Project documentation
 
@@ -23,6 +24,9 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - [`docs/phase5-session-semantics.md`](docs/phase5-session-semantics.md)
 - [`docs/PHASE5-1-TARGETED-CAPTURE.md`](docs/PHASE5-1-TARGETED-CAPTURE.md)
 - [`docs/PHASE5-2-ADDITIONAL-RATES.md`](docs/PHASE5-2-ADDITIONAL-RATES.md)
+- [`docs/phase6-design.md`](docs/phase6-design.md)
+- [`docs/phase6a-survey.md`](docs/phase6a-survey.md)
+- [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md)
 - [`docs/FIELD-RECORDING-GUIDE.md`](docs/FIELD-RECORDING-GUIDE.md)
 - [`docs/TRANSMITTER-LOCATION-STUDY.md`](docs/TRANSMITTER-LOCATION-STUDY.md)
 - [`docs/FIELD-SESSION-METADATA-TEMPLATE.csv`](docs/FIELD-SESSION-METADATA-TEMPLATE.csv)
@@ -334,6 +338,21 @@ The short source captures did not contain reliable Talkgroup or Radio IDs. Empty
 
 The original recordings use the conventional `IQ` assumption, but statistics alone cannot prove orientation. Phase 3 preserves the mirrored `QI` alternative. DSD-FME `-xr` symbol inversion is a separate question from IQ/QI frequency orientation.
 
+## Phase 6A — protocol-agnostic RF survey
+
+```bash
+dmr-surveyor survey run recording.wav --band central_800 --site home
+dmr-surveyor survey list
+dmr-surveyor survey show RUN_ID
+dmr-surveyor survey compare RUN_A RUN_B --band central_800
+```
+
+Given one wideband IQ recording, Phase 6A discovers active RF signals with no prior frequency list, using bounded time-segmented analysis so runtime and memory stay predictable on long captures. Every observation stores relative `dBFS/Hz` power (never dBm without calibration), an honestly separated `occupancy_pct` (fraction of analyzed time busy) and `persistence` (fraction of segments independently detected), and a measured usable passband rather than an assumed Nyquist width. No protocol decoder runs in Phase 6A: `classification` is always `unknown`; `spectral_class` is a spectral-shape hypothesis, never a protocol confirmation.
+
+Runs and observations persist in the same SQLite database as the DMR inventory (`runs/inventory/dmr_inventory.sqlite3` by default), extended additively — existing tables are untouched. `survey compare` works with no protocol decoder installed and reports `NEW`, `MISSING_THIS_RUN`, `STABLE`, `SNR_CHANGE`, `OCCUPANCY_CHANGE`, `PERSISTENCE_CHANGE`, or `NOT_COMPARABLE` between two runs.
+
+Band profiles (`config/bands/*.yaml`, e.g. `central_800.yaml` for 866-870 MHz, `central_800_recon.yaml` for a short first-look capture) describe where to look; site profiles (`config/sites/*.yaml`, copy `home.example.yaml`) record the fixed measurement context. See [`docs/phase6a-survey.md`](docs/phase6a-survey.md) for the full design, schema and acceptance criteria, [`docs/phase6-design.md`](docs/phase6-design.md) for the overall Phase 6 roadmap toward P25, and [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md) for a field-ready capture procedure at a new site.
+
 ## Result packaging
 
 Generated runs, reports, metadata and the persistent SQLite database can be archived without including raw IQ files:
@@ -353,7 +372,7 @@ pytest -q
 ruff check .
 ```
 
-The suite covers metadata parsing, spectrum processing, candidate detection, streamed DSP, 10m/5m/500k/250k/62k5 profiles, off-center frequency mixing, peak-safe WAV output, DSD-FME quality parsing, polarity selection, active slots, event parsing, session semantics, capture metadata migration, standalone-log import, idempotent SQLite import and cross-run aggregation.
+The suite covers metadata parsing, spectrum processing, candidate detection, streamed DSP, 10m/5m/500k/250k/62k5 profiles, off-center frequency mixing, peak-safe WAV output, DSD-FME quality parsing, polarity selection, active slots, event parsing, session semantics, capture metadata migration, standalone-log import, idempotent SQLite import and cross-run aggregation, plus Phase 6A band/site profiles, segmented discovery, occupancy vs. persistence, usable-passband measurement, idempotent survey import with capture-time-based history, and protocol-agnostic run comparison — all against synthetic fixtures generated at test time, no real IQ data is committed. An optional real-recording integration test is documented in [`docs/phase6a-survey.md`](docs/phase6a-survey.md).
 
 ## Passive scope
 

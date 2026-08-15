@@ -11,6 +11,7 @@ from dmr_iq_surveyor.detect.core import (
     confidence_components,
     confidence_score,
     nearest_raster_hz,
+    spectral_class_for,
     weighted_quantile,
 )
 from dmr_iq_surveyor.detect.io import load_spectrum
@@ -103,6 +104,7 @@ def feature_at(
         features,
         settings,
     )
+    features["spectral_class"] = spectral_class_for(features["preliminary_class"])
     components = confidence_components(features, settings)
     features["confidence_components"] = components
     features["confidence"] = confidence_score(components)
@@ -179,23 +181,49 @@ def _primary_candidate(
     return False
 
 
-def detect_spectrum(
-    spectrum_dir: str | Path,
-    settings: DetectionSettings | None = None,
+def detect_from_data(
+    data: dict[str, Any],
+    settings: DetectionSettings,
+    *,
+    recording: dict[str, Any],
+    source_label: str,
+    scan_low_hz: float | None = None,
+    scan_high_hz: float | None = None,
 ) -> dict[str, Any]:
-    source = Path(spectrum_dir).expanduser().resolve()
-    resolved = settings or DetectionSettings()
+    """Core candidate-detection scan over an in-memory spectrum `data` dict.
+
+    `data` must provide the same keys `detect.io.load_spectrum` produces:
+    `frequency_hz`, `average_db`, `percentile_db`, `noise_db`,
+    `occupancy_pct`, `edge_mask`, `dc_mask`. `waterfall_db`/
+    `waterfall_frequency_hz`/`waterfall_time_s` are optional and, when
+    absent, are returned as empty arrays (annotated-plot callers should
+    check before using them).
+
+    `scan_low_hz`/`scan_high_hz` restrict which scan centers are tried,
+    without touching `data` itself (still needed at full width for
+    usable-passband measurement, DC/edge masking, etc.). Default to the
+    full extent of `frequency_hz` -- Phase 3's file-based `detect_spectrum`
+    has no notion of a requested sub-band and must keep scanning the whole
+    recording exactly as before.
+
+    This is the shared engine behind both `detect_spectrum` (Phase 3,
+    file-based, one full-recording window) and the Phase 6 survey discovery
+    path (in-memory, one time segment at a time) -- extracted so both reuse
+    identical candidate-selection logic rather than diverging over time.
+    """
+    resolved = settings
     resolved.validate()
-    data = load_spectrum(source)
     frequency = data["frequency_hz"]
+    window_low = float(frequency[0]) if scan_low_hz is None else max(float(frequency[0]), scan_low_hz)
+    window_high = float(frequency[-1]) if scan_high_hz is None else min(float(frequency[-1]), scan_high_hz)
     low = nearest_raster_hz(
-        float(frequency[0]),
+        window_low,
         resolved.scan_step_hz,
     )
-    if low < frequency[0]:
+    if low < window_low:
         low += resolved.scan_step_hz
     high = (
-        np.floor(float(frequency[-1]) / resolved.scan_step_hz)
+        np.floor(window_high / resolved.scan_step_hz)
         * resolved.scan_step_hz
     )
 
@@ -223,10 +251,10 @@ def detect_spectrum(
     ]
     candidates.sort(key=lambda row: row["frequency_hz_assuming_iq"])
     rejected.sort(key=lambda row: row["frequency_hz_assuming_iq"])
-    report = data["report"]
+    empty = np.empty(0, dtype=np.float64)
     return {
-        "spectrum_dir": str(source),
-        "recording": report["recording"],
+        "spectrum_dir": source_label,
+        "recording": recording,
         "settings": resolved.to_dict(),
         "scanned_center_count": len(scan_centers),
         "strong_window_count": len(strong_rows),
@@ -236,7 +264,23 @@ def detect_spectrum(
         "frequency_hz": frequency,
         "average_db": data["average_db"],
         "percentile_db": data["percentile_db"],
-        "waterfall_db": data["waterfall_db"],
-        "waterfall_frequency_hz": data["waterfall_frequency_hz"],
-        "waterfall_time_s": data["waterfall_time_s"],
+        "waterfall_db": data.get("waterfall_db", empty),
+        "waterfall_frequency_hz": data.get("waterfall_frequency_hz", empty),
+        "waterfall_time_s": data.get("waterfall_time_s", empty),
     }
+
+
+def detect_spectrum(
+    spectrum_dir: str | Path,
+    settings: DetectionSettings | None = None,
+) -> dict[str, Any]:
+    source = Path(spectrum_dir).expanduser().resolve()
+    resolved = settings or DetectionSettings()
+    data = load_spectrum(source)
+    report = data["report"]
+    return detect_from_data(
+        data,
+        resolved,
+        recording=report["recording"],
+        source_label=str(source),
+    )

@@ -272,7 +272,7 @@ def run_decode_batch(config_path: str | Path) -> dict[str, Any]:
                             "talkgroup_ids"
                         ]
                         radio_ids = evidence["radio_ids"]
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 (one candidate's failure must not abort the batch)
                     extraction_status = "failed"
                     error = f"{type(exc).__name__}: {exc}"
                 rows.append(

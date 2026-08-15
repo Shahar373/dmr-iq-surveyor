@@ -231,7 +231,7 @@ def run_batch_inspection(config_path: str | Path) -> dict[str, Any]:
         destination = output_root / "recordings" / recording.recording_id
         try:
             result = run_inspection(recording.path, destination, **config["inspection"])
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 (one recording's failure must not abort the batch)
             rows.append(_summary_row(recording, "failed", error=f"{type(exc).__name__}: {exc}"))
             results.append(
                 {

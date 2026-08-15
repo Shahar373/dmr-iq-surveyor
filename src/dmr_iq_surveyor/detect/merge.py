@@ -8,6 +8,7 @@ from dmr_iq_surveyor.detect.core import (
     DetectionSettings,
     mirrored_frequency_hz,
     nearest_raster_hz,
+    spectral_class_for,
 )
 
 
@@ -132,7 +133,7 @@ def merge_recordings(
             )
         )
 
-        def values(key: str) -> list[float]:
+        def values(key: str, cluster: list[dict[str, Any]] = cluster) -> list[float]:
             return [float(row[key]) for row in cluster]
 
         nearest_6k25 = nearest_raster_hz(measured, 6250.0)
@@ -180,6 +181,7 @@ def merge_recordings(
                     bool(row["edge_warning"]) for row in cluster
                 ),
                 "preliminary_class": _merged_class(classes),
+                "spectral_class": spectral_class_for(_merged_class(classes)),
                 "confidence": confidence,
                 "confidence_components": components,
                 "evidence": cluster,

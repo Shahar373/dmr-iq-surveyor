@@ -24,7 +24,7 @@ def import_standalone_log(
     if not source.is_file():
         raise FileNotFoundError(source)
     root = Path(output_root).expanduser().resolve()
-    candidate_id = f"L{int(round(frequency_hz))}"
+    candidate_id = f"L{round(frequency_hz)}"
     attempt_dir = (
         root
         / "standalone_decodes"

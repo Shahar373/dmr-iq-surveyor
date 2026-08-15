@@ -1,0 +1,49 @@
+# Reconnaissance variant of central_800.yaml for short (1-2 minute) first-look
+# captures at a new site, where the full profile's 2s/10s segmentation would
+# only yield a handful of segments and give a coarse persistence signal.
+#
+# Detection thresholds, rasters and comparison tolerances are identical to
+# central_800.yaml so results stay measured on the same terms; only the
+# segmentation is tuned for a short capture. A run made with this profile
+# and a run made with central_800.yaml will still compare with
+# `survey compare` (same detection settings), but will usually land on
+# NOT_COMPARABLE by analyzed-duration ratio unless durations are close --
+# which is the correct behaviour for comparing a 90s recon against a
+# 30-minute survey.
+name: central_800_recon
+label: "800 MHz public safety (866-870 MHz) - short recon capture"
+
+start_frequency_hz: 866000000
+stop_frequency_hz: 870000000
+
+raster_spacings_hz:
+  - 12500
+  - 6250
+
+detection:
+  scan_step_hz: 6250
+  integration_width_hz: 12500
+  min_p95_channel_snr_db: 9.0
+  min_average_channel_snr_db: 4.0
+  min_equivalent_width_hz: 3000
+  min_width_90_hz: 5000
+  max_width_90_hz: 13000
+  max_peak_to_channel_mean_db: 13.0
+  min_fill_ratio: 0.20
+  fill_threshold_db: 6.0
+  merge_tolerance_hz: 4000
+
+# 1s segments every 5s -> up to 30 segments across 150s of capture, enough
+# to see persistence vary meaningfully within a 60-120s recording.
+segment_seconds: 1.0
+segment_stride_seconds: 5.0
+max_segments: 30
+
+usable_passband_rolloff_db: 3.0
+
+comparison:
+  frequency_tolerance_hz: 6250
+  snr_delta_db: 3.0
+  occupancy_delta_pct: 10.0
+  persistence_delta: 0.25
+  analyzed_seconds_ratio_limit: 4.0

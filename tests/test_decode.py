@@ -185,7 +185,7 @@ SLCO CRC ERR
 
 
 def test_quality_scoring_prefers_coherent_normal_polarity() -> None:
-    normal = "\n".join(
+    normal = "\n".join(  # noqa: FLY002 (list-of-lines is clearer than one long f-string)
         [
             "Sync: +DMR [SLOT1] slot2 | Color Code=06 | IDLE",
             "Sync: +DMR slot1 [slot2] | Color Code=06 | DATA",

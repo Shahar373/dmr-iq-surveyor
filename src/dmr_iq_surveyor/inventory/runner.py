@@ -256,8 +256,10 @@ def build_inventory(
         }
     )
     report_rows = [
-        "| Frequency MHz | CC | Attempts | Clean | Degraded | "
-        "S1 | S2 | Voice | Data | TG IDs | Radio IDs |",
+        (
+            "| Frequency MHz | CC | Attempts | Clean | Degraded | "
+            "S1 | S2 | Voice | Data | TG IDs | Radio IDs |"
+        ),
         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
     ]
     for row in sorted(

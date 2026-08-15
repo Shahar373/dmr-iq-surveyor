@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from math import gcd
-from typing import Iterable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -307,7 +307,7 @@ def process_complex_chunks(
         if discriminator_parts
         else np.empty(0, dtype=np.float32)
     )
-    trim = int(round(settings.trim_seconds * intermediate_rate))
+    trim = round(settings.trim_seconds * intermediate_rate)
     if trim > 0 and len(discriminator_100k) > 2 * trim:
         discriminator_100k = discriminator_100k[trim:-trim]
     output = resample_discriminator(

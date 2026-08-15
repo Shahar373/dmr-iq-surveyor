@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dmr-iq-surveyor"
-version = "0.8.0"
+version = "0.9.0"
 description = "Offline inspection and analysis pipeline for SDRconnect wideband IQ recordings"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,11 +23,11 @@ dependencies = [
 dev = [
   "pytest>=8.0",
   "pytest-cov>=5.0",
-  "ruff>=0.5",
+  "ruff==0.16.3",
 ]
 
 [project.scripts]
-dmr-surveyor = "dmr_iq_surveyor.cli_v4:app"
+dmr-surveyor = "dmr_iq_surveyor.cli_app:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dmr_iq_surveyor"]
@@ -39,3 +39,26 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+# Explicit selection so CI stays reproducible as ruff's own default rule set
+# changes across releases. This freezes the rule set actually effective on
+# the ruff version pinned above (verified empirically, not the full letter
+# category, since e.g. "E" would also pull in E501 and "TRY" would also pull
+# in TRY003 that this codebase was never checked against). Extend
+# deliberately, not by upgrading ruff.
+select = [
+  "E4", "E7", "E9",  # pycodestyle error subset (ruff's long-standing default)
+  "F",               # pyflakes
+  "I",               # isort (import sorting)
+  "UP035", "UP017",  # pyupgrade: collections.abc imports, datetime.UTC alias
+  "B023",            # flake8-bugbear: function uses loop variable
+  "BLE001",          # flake8-blind-except: bare `except Exception`
+  "DTZ007",          # flake8-datetimez: naive strptime() datetime
+  "EXE001",          # flake8-executable: shebang without exec bit
+  "FLY002",          # flynt: str.join -> f-string
+  "ISC004",          # flake8-implicit-str-concat: unparenthesized concat
+  "PYI041",          # flake8-pyi: redundant int | float union
+  "RUF046",          # ruff: unnecessary int() cast
+  "TRY004",          # tryceratops: prefer TypeError for type checks
+]

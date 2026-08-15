@@ -55,7 +55,7 @@ def _write_attempt(root: Path) -> None:
         encoding="utf-8",
     )
     (decoder_dir / "dsd_fme_normal_stderr.log").write_text(
-        "\n".join(
+        "\n".join(  # noqa: FLY002 (list-of-lines is clearer than one long f-string)
             [
                 (
                     "20:00:00 Sync: +DMR [slot1] slot2 "

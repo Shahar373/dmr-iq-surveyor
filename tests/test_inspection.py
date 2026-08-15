@@ -1,7 +1,8 @@
 from pathlib import Path
 
-from dmr_iq_surveyor.inspection import run_inspection
 from test_metadata import create_riff
+
+from dmr_iq_surveyor.inspection import run_inspection
 
 
 def test_full_inspection_outputs(tmp_path: Path):

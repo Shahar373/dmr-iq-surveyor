@@ -4,9 +4,9 @@ import csv
 from pathlib import Path
 
 import yaml
+from test_metadata import create_riff
 
 from dmr_iq_surveyor.batch import run_batch_inspection
-from test_metadata import create_riff
 
 
 def test_batch_inspection_creates_shared_summary(tmp_path: Path):
