@@ -7,6 +7,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from dmr_iq_surveyor.capture.core import CaptureSettings, run_capture_and_survey
+from dmr_iq_surveyor.capture.device import probe_soapysdr
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_comparison, run_survey
 from dmr_iq_surveyor.survey.profiles import ProfileError, resolve_band_profile
 from dmr_iq_surveyor.survey.store import (
@@ -102,6 +104,140 @@ def survey_run(
     console.print(table)
     console.print(f"[green]Artifacts written to:[/green] {result['output_dir']}")
     console.print(f"Open: {Path(result['output_dir']) / 'reports' / 'report.md'}")
+
+
+@survey_app.command("capture")
+def survey_capture(
+    output: Annotated[
+        Path,
+        typer.Argument(help="Directory to write the captured WAV recording into"),
+    ],
+    band: Annotated[
+        str,
+        typer.Option(help="Band profile name (config/bands/<name>.yaml) or a path to one"),
+    ],
+    site: Annotated[
+        str,
+        typer.Option(help="Site profile name (config/sites/<name>.yaml) or a path to one"),
+    ],
+    center_frequency: Annotated[
+        float,
+        typer.Option("--center-frequency", help="Tuner center frequency in Hz"),
+    ],
+    sample_rate: Annotated[
+        float,
+        typer.Option("--sample-rate", help="IQ sample rate in samples/s"),
+    ],
+    duration: Annotated[
+        float,
+        typer.Option(help="Capture duration in seconds"),
+    ] = 90.0,
+    gain: Annotated[
+        float | None,
+        typer.Option(help="Manual gain reduction in dB; required unless --agc"),
+    ] = None,
+    agc: Annotated[
+        bool,
+        typer.Option("--agc/--no-agc", help="Enable SDR AGC (mutually exclusive with --gain)"),
+    ] = False,
+    antenna: Annotated[
+        str | None,
+        typer.Option(help="SoapySDR antenna name, only needed if the device exposes more than one"),
+    ] = None,
+    driver: Annotated[
+        str,
+        typer.Option(help="SoapySDR driver name"),
+    ] = "sdrplay",
+    survey_output: Annotated[
+        Path | None,
+        typer.Option(help="Survey run output directory; defaults to <output>/survey"),
+    ] = None,
+    run_id: Annotated[
+        str | None,
+        typer.Option(help="Stable survey run identifier; defaults to a timestamp + site id"),
+    ] = None,
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Persistent inventory SQLite path"),
+    ] = None,
+    iq_order: Annotated[
+        str,
+        typer.Option(help="Assumed channel order: IQ or QI"),
+    ] = "IQ",
+    hash_source: Annotated[
+        bool,
+        typer.Option(
+            "--hash-source/--no-hash-source",
+            help="Compute a SHA-256 of the captured recording (slow on large files)",
+        ),
+    ] = False,
+    write_auxi: Annotated[
+        bool,
+        typer.Option(
+            "--write-auxi/--no-write-auxi",
+            help="Write an SDRplay-style auxi metadata chunk (else rely on the SDRconnect filename fallback)",
+        ),
+    ] = True,
+) -> None:
+    """Capture live IQ from an SDRplay device via SoapySDR and immediately
+    survey it -- one command instead of a separate recorder plus `survey run`.
+
+    Authorized as a one-off, explicit exception to this project's "no
+    premature live acquisition" principle (see CLAUDE.md) for field-capture
+    friction with existing tools; it changes nothing else about the pipeline.
+    """
+    probe = probe_soapysdr(driver)
+    if not probe.available:
+        console.print(f"[bold red]SoapySDR device unavailable:[/bold red] {probe.probe_error}")
+        raise typer.Exit(code=1)
+
+    try:
+        capture_settings = CaptureSettings(
+            center_frequency_hz=center_frequency,
+            sample_rate_hz=sample_rate,
+            duration_seconds=duration,
+            gain_db=gain,
+            agc=agc,
+            antenna=antenna,
+            driver=driver,
+            write_auxi=write_auxi,
+        )
+    except ValueError as exc:
+        console.print(f"[bold red]Invalid capture settings:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    resolved_survey_output = survey_output or (output / "survey")
+    try:
+        result = run_capture_and_survey(
+            output,
+            resolved_survey_output,
+            capture=capture_settings,
+            band=band,
+            site=site,
+            run_id=run_id,
+            database_path=database,
+            assumed_iq_order=iq_order,
+            compute_source_hash=hash_source,
+        )
+    except (FileNotFoundError, OSError, ValueError, ProfileError, RuntimeError) as exc:
+        console.print(f"[bold red]Capture/survey failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    table = Table(title="Live capture + RF survey")
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+    table.add_row("Recording", str(result["capture"]["wav_path"]))
+    table.add_row(
+        "Actual duration",
+        f"{result['capture']['actual_duration_seconds']:.3f} s "
+        f"(requested {result['capture']['requested_duration_seconds']:.3f} s)",
+    )
+    table.add_row("Survey run ID", str(result["survey"]["run_id"]))
+    table.add_row("Observations", str(result["survey"]["observation_count"]))
+    console.print(table)
+    console.print(f"[green]Recording written to:[/green] {result['capture']['wav_path']}")
+    console.print(f"[green]Survey artifacts written to:[/green] {result['survey']['output_dir']}")
+    console.print(f"Open: {Path(result['survey']['output_dir']) / 'reports' / 'report.md'}")
 
 
 @survey_app.command("list")

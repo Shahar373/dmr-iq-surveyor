@@ -1,0 +1,256 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from dmr_iq_surveyor.capture.core import (
+    CaptureSettings,
+    run_capture,
+    run_capture_and_survey,
+    sdrconnect_style_filename,
+)
+from dmr_iq_surveyor.capture.device import DeviceSettings
+from dmr_iq_surveyor.iq.metadata import inspect_wave_iq
+from dmr_iq_surveyor.iq.reader import IQMemmapReader
+from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
+
+SAMPLE_RATE_HZ = 200_000.0
+CENTER_HZ = 868_000_000.0
+
+
+class FakeIqDevice:
+    """Deterministic `IqDevice` stub: yields a tone plus noise in caller-sized
+    chunks, with no SoapySDR import and no hardware. Records the settings it
+    was opened with so tests can assert AGC/gain/rate/frequency passthrough."""
+
+    def __init__(
+        self,
+        *,
+        tone_offset_hz: float = 0.0,
+        amplitude: float = 0.3,
+        noise_std: float = 0.01,
+        seed: int = 0,
+    ) -> None:
+        self.opened_with: DeviceSettings | None = None
+        self.closed = False
+        self.read_calls: list[int] = []
+        self._tone_offset_hz = tone_offset_hz
+        self._amplitude = amplitude
+        self._noise_std = noise_std
+        self._rng = np.random.default_rng(seed)
+        self._sample_rate_hz = 0.0
+        self._samples_emitted = 0
+
+    def open(self, settings: DeviceSettings) -> None:
+        settings.validate()
+        self.opened_with = settings
+        self._sample_rate_hz = settings.sample_rate_hz
+
+    def read_stream_chunk(self, max_frames: int) -> np.ndarray:
+        self.read_calls.append(max_frames)
+        n = max_frames
+        t = (np.arange(n, dtype=np.float64) + self._samples_emitted) / self._sample_rate_hz
+        carrier = self._amplitude * np.exp(1j * 2.0 * np.pi * self._tone_offset_hz * t)
+        noise = self._rng.normal(scale=self._noise_std, size=n) + 1j * self._rng.normal(
+            scale=self._noise_std, size=n
+        )
+        self._samples_emitted += n
+        return (carrier + noise).astype(np.complex64)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _band_profile() -> BandProfile:
+    return BandProfile(
+        name="test_band",
+        label="test",
+        start_frequency_hz=867_800_000.0,
+        stop_frequency_hz=868_200_000.0,
+        raster_spacings_hz=[12500.0, 6250.0],
+        detection_overrides={
+            "scan_step_hz": 6250.0,
+            "integration_width_hz": 12500.0,
+            "min_p95_channel_snr_db": 9.0,
+            "min_average_channel_snr_db": 4.0,
+            "min_equivalent_width_hz": 1500.0,
+            "min_width_90_hz": 1000.0,
+            "max_width_90_hz": 13000.0,
+            "merge_tolerance_hz": 4000.0,
+            "passband_warning_low_hz": 866_000_000.0,
+            "passband_warning_high_hz": 870_000_000.0,
+        },
+        segment_seconds=1.0,
+        segment_stride_seconds=1.0,
+        max_segments=6,
+    )
+
+
+def test_sdrconnect_style_filename_matches_discovery_fallback_pattern(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from dmr_iq_surveyor.survey.discovery import resolve_capture_time
+
+    name = sdrconnect_style_filename(868_000_000.0, moment=datetime(2026, 8, 15, 12, 0, 0, tzinfo=UTC))
+    assert name == "SDRconnect_IQ_20260815_120000_868000000HZ.wav"
+
+    # Round-trip through the same fallback survey/discovery.py uses when a
+    # recording has no (or an unreadable) auxi chunk.
+    device = FakeIqDevice()
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=0.05,
+        gain_db=20.0,
+        write_auxi=False,
+    )
+    manifest = run_capture(tmp_path, settings=settings, device=device, filename=name)
+    info = inspect_wave_iq(manifest["wav_path"])
+    capture_time, source = resolve_capture_time(info)
+    assert source == "filename"
+    assert capture_time == "2026-08-15T12:00:00+00:00"
+
+
+def test_capture_settings_rejects_agc_and_gain_together() -> None:
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=1.0,
+        agc=True,
+        gain_db=10.0,
+    )
+    with pytest.raises(ValueError):
+        settings.validate()
+
+
+def test_capture_settings_requires_gain_when_agc_off() -> None:
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=1.0,
+        agc=False,
+        gain_db=None,
+    )
+    with pytest.raises(ValueError):
+        settings.validate()
+
+
+def test_run_capture_writes_wav_that_round_trips(tmp_path: Path) -> None:
+    device = FakeIqDevice(tone_offset_hz=20_000.0, amplitude=0.4)
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=0.5,
+        gain_db=30.0,
+        agc=False,
+        chunk_frames=8192,
+    )
+    manifest = run_capture(tmp_path, settings=settings, device=device)
+
+    wav_path = Path(manifest["wav_path"])
+    assert wav_path.is_file()
+    assert wav_path.parent == tmp_path.resolve()
+    assert wav_path.name.startswith("SDRconnect_IQ_")
+    assert wav_path.name.endswith("_868000000HZ.wav")
+
+    expected_frames = round(0.5 * SAMPLE_RATE_HZ)
+    assert manifest["frame_count"] == expected_frames
+    assert manifest["requested_frame_count"] == expected_frames
+    assert manifest["actual_duration_seconds"] == pytest.approx(0.5, abs=1e-6)
+    assert manifest["peak_rss_bytes"] > 0
+
+    # AGC-off / gain / rate / frequency passthrough to the (mocked) device.
+    assert device.closed is True
+    assert device.opened_with is not None
+    assert device.opened_with.agc is False
+    assert device.opened_with.gain_db == 30.0
+    assert device.opened_with.sample_rate_hz == SAMPLE_RATE_HZ
+    assert device.opened_with.center_frequency_hz == CENTER_HZ
+    assert device.opened_with.driver == "sdrplay"
+
+    report_path = tmp_path / f"{wav_path.stem}_capture_report.json"
+    assert report_path.is_file()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["frame_count"] == expected_frames
+    assert report["settings"]["gain_db"] == 30.0
+    assert report["settings"]["agc"] is False
+
+    info = inspect_wave_iq(wav_path)
+    assert info.frame_count == expected_frames
+    assert info.fmt.sample_rate_hz == SAMPLE_RATE_HZ
+    assert info.center_frequency_hz == CENTER_HZ
+    assert info.center_frequency_source == "auxi"
+    assert info.auxi is not None
+    assert info.auxi.center_frequency_hz == CENTER_HZ
+
+    reader = IQMemmapReader(info)
+    samples = reader.read_complex(0, info.frame_count)
+    assert samples.shape[0] == expected_frames
+
+
+def test_run_capture_passes_agc_through_to_device(tmp_path: Path) -> None:
+    device = FakeIqDevice()
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=0.1,
+        agc=True,
+        gain_db=None,
+    )
+    run_capture(tmp_path, settings=settings, device=device)
+    assert device.opened_with is not None
+    assert device.opened_with.agc is True
+    assert device.opened_with.gain_db is None
+
+
+def test_run_capture_trims_overshoot_to_requested_duration(tmp_path: Path) -> None:
+    """The fake device's chunk size is larger than the remaining frame
+    budget for the final read; run_capture must trim to exactly the
+    requested duration rather than overshoot it."""
+    device = FakeIqDevice()
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=0.05,
+        gain_db=20.0,
+        chunk_frames=100_000,  # far larger than the ~10k frames requested
+    )
+    manifest = run_capture(tmp_path, settings=settings, device=device)
+    expected_frames = round(0.05 * SAMPLE_RATE_HZ)
+    assert manifest["frame_count"] == expected_frames
+    info = inspect_wave_iq(manifest["wav_path"])
+    assert info.frame_count == expected_frames
+
+
+def test_run_capture_and_survey_detects_injected_tone(tmp_path: Path) -> None:
+    """The full 'one command' path: capture via a fake device, then
+    immediately run the existing, unmodified survey pipeline on the result."""
+    device = FakeIqDevice(tone_offset_hz=50_000.0, amplitude=0.5, noise_std=0.02)
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=6.0,
+        gain_db=30.0,
+        agc=False,
+    )
+    result = run_capture_and_survey(
+        tmp_path / "recording",
+        tmp_path / "survey",
+        capture=settings,
+        band=_band_profile(),
+        site=SiteProfile(site_id="fake_site", label="Fake site"),
+        device=device,
+        run_id="capture_test",
+        database_path=tmp_path / "db.sqlite3",
+        spectrum_fft_size=4096,
+    )
+    assert result["capture"]["frame_count"] == round(6.0 * SAMPLE_RATE_HZ)
+    assert result["survey"]["run_id"] == "capture_test"
+    assert result["survey"]["observation_count"] >= 1
+
+    output_dir = Path(result["survey"]["output_dir"])
+    assert (output_dir / "reports" / "report.md").is_file()
+    assert (output_dir / "run.json").is_file()
