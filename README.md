@@ -26,6 +26,7 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - [`docs/PHASE5-2-ADDITIONAL-RATES.md`](docs/PHASE5-2-ADDITIONAL-RATES.md)
 - [`docs/phase6-design.md`](docs/phase6-design.md)
 - [`docs/phase6a-survey.md`](docs/phase6a-survey.md)
+- [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md)
 - [`docs/FIELD-RECORDING-GUIDE.md`](docs/FIELD-RECORDING-GUIDE.md)
 - [`docs/TRANSMITTER-LOCATION-STUDY.md`](docs/TRANSMITTER-LOCATION-STUDY.md)
 - [`docs/FIELD-SESSION-METADATA-TEMPLATE.csv`](docs/FIELD-SESSION-METADATA-TEMPLATE.csv)
@@ -350,7 +351,7 @@ Given one wideband IQ recording, Phase 6A discovers active RF signals with no pr
 
 Runs and observations persist in the same SQLite database as the DMR inventory (`runs/inventory/dmr_inventory.sqlite3` by default), extended additively — existing tables are untouched. `survey compare` works with no protocol decoder installed and reports `NEW`, `MISSING_THIS_RUN`, `STABLE`, `SNR_CHANGE`, `OCCUPANCY_CHANGE`, `PERSISTENCE_CHANGE`, or `NOT_COMPARABLE` between two runs.
 
-Band profiles (`config/bands/*.yaml`, e.g. `central_800.yaml` for 866-870 MHz) describe where to look; site profiles (`config/sites/*.yaml`, copy `home.example.yaml`) record the fixed measurement context. See [`docs/phase6a-survey.md`](docs/phase6a-survey.md) for the full design, schema and acceptance criteria, and [`docs/phase6-design.md`](docs/phase6-design.md) for the overall Phase 6 roadmap toward P25.
+Band profiles (`config/bands/*.yaml`, e.g. `central_800.yaml` for 866-870 MHz, `central_800_recon.yaml` for a short first-look capture) describe where to look; site profiles (`config/sites/*.yaml`, copy `home.example.yaml`) record the fixed measurement context. See [`docs/phase6a-survey.md`](docs/phase6a-survey.md) for the full design, schema and acceptance criteria, [`docs/phase6-design.md`](docs/phase6-design.md) for the overall Phase 6 roadmap toward P25, and [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md) for a field-ready capture procedure at a new site.
 
 ## Result packaging
 
