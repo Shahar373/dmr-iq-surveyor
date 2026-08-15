@@ -158,6 +158,41 @@ def test_usable_passband_never_exceeds_nyquist(tmp_path: Path) -> None:
     assert passband.uncovered_ranges_hz
 
 
+def test_candidates_outside_requested_band_are_not_reported(tmp_path: Path) -> None:
+    """A wideband recording (Nyquist wider than the requested band -- exactly
+    the real-world case of a 10 MS/s capture with a 4 MHz band profile) must
+    not leak candidates from outside the requested range. The band profile
+    describes where to look; it has to actually bound the scan, not just
+    label the usable-passband comparison."""
+    wav = tmp_path / "wide.wav"
+    write_synthetic_iq_wav(
+        wav,
+        sample_rate_hz=1_000_000,
+        center_frequency_hz=CENTER_HZ,
+        duration_seconds=3.0,
+        tones=[
+            SyntheticTone(offset_hz=50_000.0, amplitude=0.35),  # inside the requested band
+            SyntheticTone(offset_hz=-450_000.0, amplitude=0.35),  # outside it, inside Nyquist
+            SyntheticTone(offset_hz=490_000.0, amplitude=0.6),  # outside it, inside Nyquist
+        ],
+        capture_start_utc=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    band = _tuned_band_profile(
+        start_frequency_hz=CENTER_HZ - 100_000.0,
+        stop_frequency_hz=CENTER_HZ + 100_000.0,
+        segment_seconds=1.0,
+        segment_stride_seconds=1.0,
+        max_segments=3,
+    )
+    result = discover_observations(
+        wav, band_profile=band, spectrum_fft_size=4096, spectrum_overlap_ratio=0.5
+    )
+    observations = result["observations"]
+    assert observations, "expected the in-band tone to be detected"
+    for observation in observations:
+        assert band.start_frequency_hz <= observation.measured_center_hz <= band.stop_frequency_hz
+
+
 def test_resolve_capture_time_prefers_auxi_then_filename_then_unknown(tmp_path: Path) -> None:
     wav = tmp_path / "SDRconnect_IQ_20260713_150242_868000000HZ.wav"
     write_synthetic_iq_wav(

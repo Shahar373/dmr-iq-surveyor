@@ -187,6 +187,8 @@ def detect_from_data(
     *,
     recording: dict[str, Any],
     source_label: str,
+    scan_low_hz: float | None = None,
+    scan_high_hz: float | None = None,
 ) -> dict[str, Any]:
     """Core candidate-detection scan over an in-memory spectrum `data` dict.
 
@@ -197,6 +199,13 @@ def detect_from_data(
     absent, are returned as empty arrays (annotated-plot callers should
     check before using them).
 
+    `scan_low_hz`/`scan_high_hz` restrict which scan centers are tried,
+    without touching `data` itself (still needed at full width for
+    usable-passband measurement, DC/edge masking, etc.). Default to the
+    full extent of `frequency_hz` -- Phase 3's file-based `detect_spectrum`
+    has no notion of a requested sub-band and must keep scanning the whole
+    recording exactly as before.
+
     This is the shared engine behind both `detect_spectrum` (Phase 3,
     file-based, one full-recording window) and the Phase 6 survey discovery
     path (in-memory, one time segment at a time) -- extracted so both reuse
@@ -205,14 +214,16 @@ def detect_from_data(
     resolved = settings
     resolved.validate()
     frequency = data["frequency_hz"]
+    window_low = float(frequency[0]) if scan_low_hz is None else max(float(frequency[0]), scan_low_hz)
+    window_high = float(frequency[-1]) if scan_high_hz is None else min(float(frequency[-1]), scan_high_hz)
     low = nearest_raster_hz(
-        float(frequency[0]),
+        window_low,
         resolved.scan_step_hz,
     )
-    if low < frequency[0]:
+    if low < window_low:
         low += resolved.scan_step_hz
     high = (
-        np.floor(float(frequency[-1]) / resolved.scan_step_hz)
+        np.floor(window_high / resolved.scan_step_hz)
         * resolved.scan_step_hz
     )
 

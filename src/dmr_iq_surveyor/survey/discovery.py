@@ -514,6 +514,8 @@ def discover_observations(
             detection_settings,
             recording=recording_dict,
             source_label=f"segment_{segment_index:04d}",
+            scan_low_hz=band_profile.start_frequency_hz,
+            scan_high_hz=band_profile.stop_frequency_hz,
         )
         segment_results.append((f"segment_{segment_index:04d}", result))
 
