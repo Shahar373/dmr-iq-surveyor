@@ -108,21 +108,24 @@ storage measurably sustains with margin.
 
 ### 8.1 Phone-side GPS server (one-time setup, Android + Termux)
 
-```bash
-pkg install python termux-api   # + install the separate "Termux:API" app from F-Droid
-```
+1. Install the **Termux** and **Termux:API** apps from F-Droid (not the Play Store — those builds
+   are outdated and can't install packages reliably).
+2. Open Termux and run `termux-setup-storage` (grants access to your Downloads folder; tap "Allow").
+3. Download `scripts/dmr_gps_setup.sh` to the phone (e.g. from this chat, or `git clone` the repo)
+   so it lands in Downloads, then in Termux:
 
-Copy `scripts/phone_gps_server.py` from this repo onto the phone (e.g. `git clone` the repo in
-Termux, or copy the file by any means), then before each capture:
+   ```bash
+   bash storage/downloads/dmr_gps_setup.sh
+   ```
 
-```bash
-python phone_gps_server.py
-```
+   This installs `python` + `termux-api`, writes `phone_gps_server.py` to the Termux home directory,
+   adds a one-tap "GPS Server" launcher (visible as a home-screen widget if the separate
+   **Termux:Widget** app is installed), and prints the phone's IP addresses.
 
-It serves a fresh GPS fix (via `termux-location`) on every request — leaving it running for a whole
+From then on, before each capture: tap the widget, or run `python phone_gps_server.py` in Termux. It
+serves a fresh GPS fix (via `termux-location`) on every request — leaving it running for a whole
 field session or restarting it before each capture both work identically, since nothing is cached.
-Find the phone's hotspot IP (Android Settings -> Hotspot, or `ip addr` in Termux) to build the URL
-below.
+Use the phone's hotspot IP it prints (or check Android Settings -> Hotspot) to build the URL below.
 
 ### 8.2 Capture command
 
