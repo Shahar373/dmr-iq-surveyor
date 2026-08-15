@@ -42,6 +42,7 @@ def _write_csv(
         "dc_warning",
         "edge_warning",
         "preliminary_class",
+        "spectral_class",
         "confidence",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:

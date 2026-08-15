@@ -99,6 +99,26 @@ def classify_features(
     return "intermittent_narrowband"
 
 
+# `preliminary_class` above is kept exactly as-is: Phase 4/4.1 batch configs
+# select candidates by that literal string (e.g. `dmr_like_narrowband` in
+# config/*.yaml), so it must never be renamed. `spectral_class` is an
+# additive, protocol-neutral label carrying the same spectral-shape verdict
+# for callers (Phase 6) that should not have to know DMR-specific naming.
+# It is a hypothesis about spectral shape only -- never a protocol
+# confirmation, regardless of which set of names is read.
+_SPECTRAL_CLASS_BY_PRELIMINARY_CLASS = {
+    "dmr_like_narrowband": "narrowband_digital_candidate",
+    "intermittent_narrowband": "intermittent_digital_candidate",
+    "narrow_carrier_or_spur": "narrow_carrier_or_spur",
+    "wideband_unknown": "wideband_unknown",
+    "noise_or_artifact": "noise_or_artifact",
+}
+
+
+def spectral_class_for(preliminary_class: str) -> str:
+    return _SPECTRAL_CLASS_BY_PRELIMINARY_CLASS.get(preliminary_class, preliminary_class)
+
+
 def confidence_components(
     features: dict[str, float],
     settings: DetectionSettings,

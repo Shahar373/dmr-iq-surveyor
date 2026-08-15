@@ -1,0 +1,19 @@
+# Example site profile. Copy to a name of your choosing (e.g. home.yaml) and
+# fill in real values; site profiles are not required to be checked in.
+site_id: home
+label: "Home station"
+
+# Optional. Leave both null if you would rather not record location.
+latitude: null
+longitude: null
+
+antenna: null
+receiver: "SDRplay RSP1B"
+
+# manual gain is required for cross-run SNR comparisons to be meaningful.
+# Leave gain null until you have picked and recorded a fixed baseline value;
+# runs without a recorded gain are flagged in reports as not gain-comparable.
+gain_mode: manual
+gain: null
+
+notes: ""

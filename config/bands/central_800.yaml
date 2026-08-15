@@ -1,0 +1,53 @@
+# Band profile for the 800 MHz public-safety segment around 866-870 MHz.
+#
+# This profile only describes *where to look* and *how to threshold what is
+# found*. It never encodes an expected frequency list or protocol -- Phase 6
+# discovers RF first and only compares to reference data afterwards.
+name: central_800
+label: "800 MHz public safety (866-870 MHz)"
+
+start_frequency_hz: 866000000
+stop_frequency_hz: 870000000
+
+# Channel rasters checked as evidence after a candidate's center has already
+# been measured from the spectrum. Neither is used to snap the measurement.
+raster_spacings_hz:
+  - 12500
+  - 6250
+
+# Overrides applied on top of DetectionSettings defaults (detect/core.py).
+# Left unset fields keep the module defaults.
+detection:
+  scan_step_hz: 6250
+  integration_width_hz: 12500
+  min_p95_channel_snr_db: 9.0
+  min_average_channel_snr_db: 4.0
+  min_equivalent_width_hz: 3000
+  min_width_90_hz: 5000
+  max_width_90_hz: 13000
+  max_peak_to_channel_mean_db: 13.0
+  min_fill_ratio: 0.20
+  fill_threshold_db: 6.0
+  merge_tolerance_hz: 4000
+
+# Segmented spectrum analysis: analyze `segment_seconds` every
+# `segment_stride_seconds`, bounded to `max_segments`, instead of one
+# unbounded full-file pass. This is what makes `persistence` meaningful and
+# keeps runtime bounded on long captures.
+segment_seconds: 2.0
+segment_stride_seconds: 10.0
+max_segments: 200
+
+# How far below the passband median PSD counts as "rolled off" when
+# measuring the usable passband (see survey/discovery.py). Not assumed to
+# equal the recording's Nyquist width.
+usable_passband_rolloff_db: 3.0
+
+# Tolerances used by `survey compare` when deciding whether a delta between
+# two runs is worth reporting.
+comparison:
+  frequency_tolerance_hz: 6250
+  snr_delta_db: 3.0
+  occupancy_delta_pct: 10.0
+  persistence_delta: 0.25
+  analyzed_seconds_ratio_limit: 4.0
