@@ -178,6 +178,28 @@ def survey_capture(
             help="Write an SDRplay-style auxi metadata chunk (else rely on the SDRconnect filename fallback)",
         ),
     ] = True,
+    gps_url: Annotated[
+        str | None,
+        typer.Option(
+            "--gps-url",
+            help=(
+                "HTTP URL of a phone-hosted GPS JSON endpoint (e.g. "
+                "scripts/phone_gps_server.py on Termux), fetched once at capture start"
+            ),
+        ),
+    ] = None,
+    gps_timeout: Annotated[
+        float,
+        typer.Option("--gps-timeout", help="Seconds to wait for the GPS server before giving up"),
+    ] = 10.0,
+    latitude: Annotated[
+        float | None,
+        typer.Option("--latitude", help="Manual latitude override; takes precedence over --gps-url"),
+    ] = None,
+    longitude: Annotated[
+        float | None,
+        typer.Option("--longitude", help="Manual longitude override; takes precedence over --gps-url"),
+    ] = None,
 ) -> None:
     """Capture live IQ from an SDRplay device via SoapySDR and immediately
     survey it -- one command instead of a separate recorder plus `survey run`.
@@ -189,6 +211,10 @@ def survey_capture(
     probe = probe_soapysdr(driver)
     if not probe.available:
         console.print(f"[bold red]SoapySDR device unavailable:[/bold red] {probe.probe_error}")
+        raise typer.Exit(code=1)
+
+    if (latitude is None) != (longitude is None):
+        console.print("[bold red]--latitude and --longitude must be given together[/bold red]")
         raise typer.Exit(code=1)
 
     try:
@@ -218,6 +244,10 @@ def survey_capture(
             database_path=database,
             assumed_iq_order=iq_order,
             compute_source_hash=hash_source,
+            gps_url=gps_url,
+            gps_timeout_seconds=gps_timeout,
+            gps_latitude=latitude,
+            gps_longitude=longitude,
         )
     except (FileNotFoundError, OSError, ValueError, ProfileError, RuntimeError) as exc:
         console.print(f"[bold red]Capture/survey failed:[/bold red] {exc}")
@@ -234,6 +264,13 @@ def survey_capture(
     )
     table.add_row("Survey run ID", str(result["survey"]["run_id"]))
     table.add_row("Observations", str(result["survey"]["observation_count"]))
+    gps = result["gps"]
+    if gps["latitude"] is not None:
+        table.add_row("GPS", f"{gps['latitude']:.6f}, {gps['longitude']:.6f} (source: {gps['source']})")
+    elif gps["source"] == "fetch_failed":
+        table.add_row("GPS", f"[yellow]fetch failed:[/yellow] {gps['error']}")
+    else:
+        table.add_row("GPS", "not configured")
     console.print(table)
     console.print(f"[green]Recording written to:[/green] {result['capture']['wav_path']}")
     console.print(f"[green]Survey artifacts written to:[/green] {result['survey']['output_dir']}")

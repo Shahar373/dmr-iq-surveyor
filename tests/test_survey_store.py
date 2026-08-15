@@ -217,6 +217,90 @@ def test_existing_dmr_database_opens_and_extends_cleanly(tmp_path: Path) -> None
     survey_connection.close()
 
 
+def test_survey_runs_gps_columns_added_to_pre_existing_table(tmp_path: Path) -> None:
+    """A `survey_runs` table created before GPS support existed must upgrade
+    in place -- the same backward-compatibility contract already proven for
+    the DMR tables, applied to this addition."""
+    db_path = tmp_path / "db.sqlite3"
+    connection = connect_database(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS survey_runs (
+            survey_run_id TEXT PRIMARY KEY,
+            site_id TEXT,
+            band_profile TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            source_sha256 TEXT,
+            source_basename TEXT NOT NULL,
+            center_frequency_hz REAL NOT NULL,
+            sample_rate_hz REAL NOT NULL,
+            capture_start_utc TEXT,
+            capture_time_source TEXT NOT NULL,
+            requested_start_hz REAL NOT NULL,
+            requested_stop_hz REAL NOT NULL,
+            usable_low_hz REAL,
+            usable_high_hz REAL,
+            coverage_status TEXT NOT NULL,
+            duration_seconds REAL NOT NULL,
+            analyzed_seconds REAL NOT NULL,
+            segment_count INTEGER NOT NULL,
+            occupancy_threshold_db REAL NOT NULL,
+            detection_settings_json TEXT NOT NULL,
+            tool_version TEXT NOT NULL,
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            imported_at TEXT NOT NULL,
+            status TEXT NOT NULL
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    survey_connection = connect_survey_database(db_path)
+    columns = {row[1] for row in survey_connection.execute("PRAGMA table_info(survey_runs)")}
+    assert {
+        "gps_latitude",
+        "gps_longitude",
+        "gps_altitude_m",
+        "gps_accuracy_m",
+        "gps_source",
+        "gps_fetched_at_utc",
+    } <= columns
+
+    upsert_site(survey_connection, SITE)
+    run = _run_record("r1", capture_start_utc="2026-08-01T00:00:00+00:00", capture_time_source="auxi")
+    import_survey_run(survey_connection, run=run, observations=[], raster_tolerance_hz=6250.0)
+    row = get_run(survey_connection, "r1")
+    assert row is not None
+    assert row["gps_source"] == "unknown"
+    assert row["gps_latitude"] is None
+    survey_connection.close()
+
+
+def test_gps_fields_round_trip_through_survey_run_record(tmp_path: Path) -> None:
+    connection = connect_survey_database(tmp_path / "db.sqlite3")
+    upsert_site(connection, SITE)
+    run = replace(
+        _run_record("r1", capture_start_utc="2026-08-01T00:00:00+00:00", capture_time_source="auxi"),
+        gps_latitude=32.0853,
+        gps_longitude=34.7818,
+        gps_altitude_m=12.5,
+        gps_accuracy_m=8.0,
+        gps_source="phone_gps",
+        gps_fetched_at_utc="2026-08-01T00:00:05+00:00",
+    )
+    import_survey_run(connection, run=run, observations=[], raster_tolerance_hz=6250.0)
+    row = get_run(connection, "r1")
+    assert row is not None
+    assert row["gps_latitude"] == 32.0853
+    assert row["gps_longitude"] == 34.7818
+    assert row["gps_altitude_m"] == 12.5
+    assert row["gps_accuracy_m"] == 8.0
+    assert row["gps_source"] == "phone_gps"
+    assert row["gps_fetched_at_utc"] == "2026-08-01T00:00:05+00:00"
+    connection.close()
+
+
 def test_get_run_and_get_run_observations(tmp_path: Path) -> None:
     connection = connect_survey_database(tmp_path / "db.sqlite3")
     upsert_site(connection, SITE)

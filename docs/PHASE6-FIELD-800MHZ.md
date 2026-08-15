@@ -90,3 +90,57 @@ This assistant runs in a remote environment with no access to the Pi or the reco
 - the gain value and any field notes from §4.5.
 
 That is enough to review the candidates found, decide on follow-up capture parameters, and plan Phase 6B (P25 decoder evidence) work against the strongest candidate.
+
+## 8. One-command capture with automatic GPS (`dmr-surveyor survey capture`)
+
+The steps above assume SDRconnect recorded the file and `survey run` processes it afterwards.
+`dmr-surveyor survey capture` collapses recording + survey into one command, driving the RSP1B
+directly via SoapySDR, and can fetch the capture-site coordinates from a phone automatically instead
+of you typing them into a site profile.
+
+**Storage speed matters more than anything else here.** 10 MS/s IQ needs 40 MB/s of sustained write
+throughput; a slow SD card cannot keep up (confirmed on this project's Pi 5: an SD card measured at
+~10 MB/s truncated a 15-second capture to ~13.5s even with an enlarged buffer). Before relying on
+this command for a real capture, retest write speed at the actual output path
+(`dd if=/dev/zero of=<output_dir>/writetest.bin bs=4M count=500 oflag=direct status=progress`) and
+either use faster storage (a USB3 drive on the Pi 5) or drop `--sample-rate` to something the
+storage measurably sustains with margin.
+
+### 8.1 Phone-side GPS server (one-time setup, Android + Termux)
+
+```bash
+pkg install python termux-api   # + install the separate "Termux:API" app from F-Droid
+```
+
+Copy `scripts/phone_gps_server.py` from this repo onto the phone (e.g. `git clone` the repo in
+Termux, or copy the file by any means), then before each capture:
+
+```bash
+python phone_gps_server.py
+```
+
+It serves a fresh GPS fix (via `termux-location`) on every request — leaving it running for a whole
+field session or restarting it before each capture both work identically, since nothing is cached.
+Find the phone's hotspot IP (Android Settings -> Hotspot, or `ip addr` in Termux) to build the URL
+below.
+
+### 8.2 Capture command
+
+```bash
+dmr-surveyor survey capture \
+  ~/Projects/dmr-iq-surveyor/runs/recordings \
+  --band central_800_recon \
+  --site config/sites/home.example.yaml \
+  --center-frequency 868000000 \
+  --sample-rate 10000000 \
+  --duration 90 \
+  --gain 40 \
+  --no-agc \
+  --gps-url http://<phone-hotspot-ip>:8765/location
+```
+
+If the phone server is unreachable, the capture and survey still complete — the run is stored with
+`gps_source=fetch_failed` and the reason recorded (never a silent gap). `--latitude`/`--longitude`
+are available as a manual override (e.g. to reuse a known fixed position) and take precedence over
+`--gps-url` when both are given. `dmr-surveyor survey show <run_id>` and `reports/report.md` show the
+resolved GPS coordinates and their source alongside the RF observations.

@@ -17,6 +17,17 @@ def render_survey_report_markdown(
         "",
         f"- Run ID: **{run['survey_run_id']}**",
         f"- Site: **{run['site_id']}**",
+    ]
+    if run.get("gps_latitude") is not None and run.get("gps_longitude") is not None:
+        accuracy = run.get("gps_accuracy_m")
+        accuracy_note = f", accuracy ~{accuracy:.0f} m" if accuracy is not None else ""
+        lines.append(
+            f"- GPS: **{run['gps_latitude']:.6f}, {run['gps_longitude']:.6f}** "
+            f"(source: {run.get('gps_source', 'unknown')}{accuracy_note})"
+        )
+    else:
+        lines.append(f"- GPS: not available (source: {run.get('gps_source', 'unknown')})")
+    lines += [
         f"- Band profile: **{run['band_profile']}**",
         f"- Source: `{run['source_path']}`",
         (

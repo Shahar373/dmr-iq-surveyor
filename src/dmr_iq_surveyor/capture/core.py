@@ -24,6 +24,7 @@ import numpy as np
 
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.device import DeviceSettings, IqDevice, SoapyIqDevice
+from dmr_iq_surveyor.capture.gps import GPS_SOURCE_PHONE, GpsFixError, fetch_gps_fix
 from dmr_iq_surveyor.capture.wav_writer import WaveIQWriter, WaveIQWriterSettings
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_survey
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
@@ -177,10 +178,50 @@ def run_capture_and_survey(
     compute_source_hash: bool = False,
     spectrum_fft_size: int = 65_536,
     spectrum_overlap_ratio: float = 0.5,
+    gps_url: str | None = None,
+    gps_timeout_seconds: float = 10.0,
+    gps_latitude: float | None = None,
+    gps_longitude: float | None = None,
 ) -> dict[str, Any]:
     """Capture live IQ and immediately run the existing `survey run` pipeline
     on the result -- the single command this module was built for. Reuses
-    `survey.pipeline.run_survey()` unchanged."""
+    `survey.pipeline.run_survey()` unchanged.
+
+    GPS is optional and never blocks the capture. `gps_latitude`/
+    `gps_longitude` (a manual override) take precedence over `gps_url` (a
+    live fetch from a phone-hosted HTTP server, see `capture/gps.py`); if
+    neither is given, or the fetch fails, the run is still stored with
+    `gps_source` recording exactly why coordinates are absent rather than
+    silently omitting them.
+    """
+    gps_info: dict[str, Any] = {
+        "source": "unknown",
+        "latitude": None,
+        "longitude": None,
+        "altitude_m": None,
+        "accuracy_m": None,
+        "fetched_at_utc": None,
+        "error": None,
+    }
+    if gps_latitude is not None and gps_longitude is not None:
+        gps_info.update(source="user", latitude=gps_latitude, longitude=gps_longitude)
+    elif gps_url:
+        try:
+            fix = fetch_gps_fix(gps_url, timeout_seconds=gps_timeout_seconds)
+        except GpsFixError as exc:
+            gps_info.update(source="fetch_failed", error=str(exc))
+        else:
+            gps_info.update(
+                source=GPS_SOURCE_PHONE,
+                latitude=fix.latitude,
+                longitude=fix.longitude,
+                altitude_m=fix.altitude_m,
+                accuracy_m=fix.accuracy_m,
+                fetched_at_utc=fix.fetched_at_utc,
+            )
+    else:
+        gps_info["source"] = "not_configured"
+
     capture_manifest = run_capture(
         recording_output_dir,
         settings=capture,
@@ -198,8 +239,14 @@ def run_capture_and_survey(
         compute_source_hash=compute_source_hash,
         spectrum_fft_size=spectrum_fft_size,
         spectrum_overlap_ratio=spectrum_overlap_ratio,
+        gps_latitude=gps_info["latitude"],
+        gps_longitude=gps_info["longitude"],
+        gps_altitude_m=gps_info["altitude_m"],
+        gps_accuracy_m=gps_info["accuracy_m"],
+        gps_source=gps_info["source"],
+        gps_fetched_at_utc=gps_info["fetched_at_utc"],
     )
-    return {"capture": capture_manifest, "survey": survey_result}
+    return {"capture": capture_manifest, "survey": survey_result, "gps": gps_info}
 
 
 __all__ = [

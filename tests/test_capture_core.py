@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +19,7 @@ from dmr_iq_surveyor.capture.device import DeviceSettings
 from dmr_iq_surveyor.iq.metadata import inspect_wave_iq
 from dmr_iq_surveyor.iq.reader import IQMemmapReader
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
+from dmr_iq_surveyor.survey.store import connect_survey_database, get_run
 
 SAMPLE_RATE_HZ = 200_000.0
 CENTER_HZ = 868_000_000.0
@@ -254,3 +258,106 @@ def test_run_capture_and_survey_detects_injected_tone(tmp_path: Path) -> None:
     output_dir = Path(result["survey"]["output_dir"])
     assert (output_dir / "reports" / "report.md").is_file()
     assert (output_dir / "run.json").is_file()
+    assert result["gps"]["source"] == "not_configured"
+
+
+class _FixedGpsResponseHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"latitude": 32.0853, "longitude": 34.7818}).encode("utf-8"))
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        pass
+
+
+@pytest.fixture
+def gps_server() -> Iterator[str]:
+    server = HTTPServer(("127.0.0.1", 0), _FixedGpsResponseHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/location"
+    finally:
+        server.shutdown()
+        thread.join()
+
+
+def test_run_capture_and_survey_fetches_gps_from_url(tmp_path: Path, gps_server: str) -> None:
+    device = FakeIqDevice()
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ, sample_rate_hz=SAMPLE_RATE_HZ, duration_seconds=0.2, gain_db=20.0
+    )
+    result = run_capture_and_survey(
+        tmp_path / "recording",
+        tmp_path / "survey",
+        capture=settings,
+        band=_band_profile(),
+        site=SiteProfile(site_id="fake_site", label="Fake site"),
+        device=device,
+        run_id="gps_test",
+        database_path=tmp_path / "db.sqlite3",
+        spectrum_fft_size=4096,
+        gps_url=gps_server,
+    )
+    assert result["gps"]["source"] == "phone_gps"
+    assert result["gps"]["latitude"] == 32.0853
+    assert result["gps"]["longitude"] == 34.7818
+
+    connection = connect_survey_database(tmp_path / "db.sqlite3")
+    row = get_run(connection, "gps_test")
+    connection.close()
+    assert row is not None
+    assert row["gps_source"] == "phone_gps"
+    assert row["gps_latitude"] == 32.0853
+
+
+def test_run_capture_and_survey_manual_gps_override_skips_fetch(tmp_path: Path, gps_server: str) -> None:
+    device = FakeIqDevice()
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ, sample_rate_hz=SAMPLE_RATE_HZ, duration_seconds=0.2, gain_db=20.0
+    )
+    result = run_capture_and_survey(
+        tmp_path / "recording",
+        tmp_path / "survey",
+        capture=settings,
+        band=_band_profile(),
+        site=SiteProfile(site_id="fake_site", label="Fake site"),
+        device=device,
+        run_id="gps_override_test",
+        database_path=tmp_path / "db.sqlite3",
+        spectrum_fft_size=4096,
+        gps_url=gps_server,
+        gps_latitude=1.0,
+        gps_longitude=2.0,
+    )
+    assert result["gps"]["source"] == "user"
+    assert result["gps"]["latitude"] == 1.0
+    assert result["gps"]["longitude"] == 2.0
+
+
+def test_run_capture_and_survey_gps_fetch_failure_does_not_block_capture(tmp_path: Path) -> None:
+    """GPS is supplementary: an unreachable phone server must never prevent
+    the RF capture and survey from completing."""
+    device = FakeIqDevice()
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ, sample_rate_hz=SAMPLE_RATE_HZ, duration_seconds=0.2, gain_db=20.0
+    )
+    result = run_capture_and_survey(
+        tmp_path / "recording",
+        tmp_path / "survey",
+        capture=settings,
+        band=_band_profile(),
+        site=SiteProfile(site_id="fake_site", label="Fake site"),
+        device=device,
+        run_id="gps_fail_test",
+        database_path=tmp_path / "db.sqlite3",
+        spectrum_fft_size=4096,
+        gps_url="http://127.0.0.1:1/location",
+        gps_timeout_seconds=1.0,
+    )
+    assert result["gps"]["source"] == "fetch_failed"
+    assert result["gps"]["error"]
+    assert result["survey"]["observation_count"] >= 0
+    assert Path(result["capture"]["wav_path"]).is_file()

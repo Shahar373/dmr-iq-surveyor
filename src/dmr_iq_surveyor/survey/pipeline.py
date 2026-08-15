@@ -86,6 +86,12 @@ def run_survey(
     spectrum_overlap_ratio: float = 0.5,
     profile_base_dir: str | Path = ".",
     raster_tolerance_hz: float | None = None,
+    gps_latitude: float | None = None,
+    gps_longitude: float | None = None,
+    gps_altitude_m: float | None = None,
+    gps_accuracy_m: float | None = None,
+    gps_source: str = "unknown",
+    gps_fetched_at_utc: str | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     log = SurveyLog()
@@ -191,8 +197,19 @@ def run_survey(
             tool_version=__version__,
             status="ok",
             settings=band_profile.to_dict(),
+            gps_latitude=gps_latitude,
+            gps_longitude=gps_longitude,
+            gps_altitude_m=gps_altitude_m,
+            gps_accuracy_m=gps_accuracy_m,
+            gps_source=gps_source,
+            gps_fetched_at_utc=gps_fetched_at_utc,
         )
         log.info(f"capture time resolved as {run_record.capture_start_utc!r} (source={run_record.capture_time_source})")
+        if gps_source not in ("unknown", "not_configured"):
+            log.info(
+                f"GPS: source={gps_source} latitude={gps_latitude} longitude={gps_longitude} "
+                f"accuracy_m={gps_accuracy_m}"
+            )
         import_summary = import_survey_run(
             connection,
             run=run_record,
