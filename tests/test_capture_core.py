@@ -436,3 +436,46 @@ def test_run_capture_and_survey_gps_fetch_failure_does_not_block_capture(tmp_pat
     assert result["gps"]["error"]
     assert result["survey"]["observation_count"] >= 0
     assert Path(result["capture"]["wav_path"]).is_file()
+
+
+def test_capture_time_reaches_the_database_from_the_auxi_chunk(tmp_path: Path) -> None:
+    """Capture time is how a run is later matched to where it was made, so
+    it has to be the real wall-clock time of the recording and it has to be
+    sourced from the auxi chunk this writer produces -- not from import
+    time, and not from a filename guess."""
+    from datetime import UTC, datetime
+
+    from dmr_iq_surveyor.survey.store import connect_survey_database, get_run
+
+    before = datetime.now(UTC)
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=0.2,
+        if_gain_reduction_db=25.0,
+        lna_state=2,
+    )
+    run_capture_and_survey(
+        tmp_path / "recording",
+        tmp_path / "survey",
+        capture=settings,
+        band=_band_profile(),
+        site=SiteProfile(site_id="kit", label="Kit"),
+        device=FakeIqDevice(),
+        run_id="timed",
+        database_path=tmp_path / "db.sqlite3",
+        spectrum_fft_size=4096,
+        site_id_override="park1",
+    )
+    after = datetime.now(UTC)
+
+    connection = connect_survey_database(tmp_path / "db.sqlite3")
+    row = get_run(connection, "timed")
+    connection.close()
+    assert row is not None
+    assert row["capture_time_source"] == "auxi"
+    stored = datetime.fromisoformat(row["capture_start_utc"])
+    assert before <= stored <= after
+    # The site id is the other half of the join key for a location table
+    # assembled after the fact.
+    assert row["site_id"] == "park1"
