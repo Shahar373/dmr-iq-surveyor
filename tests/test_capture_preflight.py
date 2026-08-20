@@ -11,6 +11,8 @@ from dmr_iq_surveyor.capture.preflight import (
     measure_write_throughput,
     required_bytes_per_second,
     run_preflight,
+    sdrplay_if_bandwidth_hz,
+    usable_span_hz,
 )
 from dmr_iq_surveyor.survey.profiles import BandProfile
 
@@ -68,7 +70,11 @@ def test_preflight_fails_when_band_is_not_covered_at_all(tmp_path: Path) -> None
 
 def test_preflight_warns_on_partial_band_coverage(tmp_path: Path) -> None:
     """2 MS/s cannot cover a 4 MHz band -- the operator must be told before
-    the capture, not left to discover it in the report afterwards."""
+    the capture, not left to discover it in the report afterwards.
+
+    38%, not the 50% a Nyquist-only calculation suggests: the analog IF
+    filter at this rate is 1.536 MHz, so a quarter of the Nyquist width is
+    really in the roll-off."""
     result = run_preflight(
         tmp_path,
         band=_band(),
@@ -79,10 +85,10 @@ def test_preflight_warns_on_partial_band_coverage(tmp_path: Path) -> None:
     )
     coverage = next(c for c in result["checks"] if c["name"] == "Band coverage")
     assert coverage["status"] == "warn"
-    assert "50%" in coverage["detail"]
+    assert "38%" in coverage["detail"]
 
 
-def test_preflight_passes_band_coverage_when_nyquist_spans_the_band(tmp_path: Path) -> None:
+def test_preflight_passes_band_coverage_when_the_filter_spans_the_band(tmp_path: Path) -> None:
     result = run_preflight(
         tmp_path,
         band=_band(),
@@ -139,3 +145,51 @@ def test_preflight_gps_failure_never_escalates_to_no_go(tmp_path: Path) -> None:
     gps = next(c for c in result["checks"] if c["name"] == "GPS")
     assert gps["status"] == "warn"
     assert "captures still work" in gps["detail"]
+
+
+def test_if_bandwidth_matches_the_driver_selection_rule() -> None:
+    """Transcribed from SoapySDRPlay3's getBwEnumForRate. The step that
+    matters: every rate from 1.536 up to 5 MS/s gets the same 1.536 MHz
+    filter, so 4 MS/s buys no more spectrum than 2 MS/s."""
+    assert sdrplay_if_bandwidth_hz(250_000.0) == 200_000.0
+    assert sdrplay_if_bandwidth_hz(2_000_000.0) == 1_536_000.0
+    assert sdrplay_if_bandwidth_hz(4_000_000.0) == 1_536_000.0
+    assert sdrplay_if_bandwidth_hz(5_000_000.0) == 5_000_000.0
+    assert sdrplay_if_bandwidth_hz(6_000_000.0) == 6_000_000.0
+    assert sdrplay_if_bandwidth_hz(10_000_000.0) == 8_000_000.0
+
+
+def test_usable_span_is_bounded_by_the_analog_filter_not_nyquist() -> None:
+    assert usable_span_hz(2_000_000.0) == 1_536_000.0
+    assert usable_span_hz(10_000_000.0) == 8_000_000.0
+    # Below the first filter step the sample rate is the binding constraint.
+    assert usable_span_hz(150_000.0) == 150_000.0
+
+
+def test_preflight_warns_when_a_rate_buys_no_extra_spectrum(tmp_path: Path) -> None:
+    result = run_preflight(
+        tmp_path,
+        band=_band(),
+        center_frequency_hz=868_000_000.0,
+        sample_rate_hz=4_000_000.0,
+        duration_seconds=10.0,
+        skip_throughput=True,
+    )
+    efficiency = next(c for c in result["checks"] if c["name"] == "Rate efficiency")
+    assert efficiency["status"] == "warn"
+    assert "1.536 MHz IF filter" in efficiency["detail"]
+
+
+def test_preflight_accepts_a_well_matched_rate(tmp_path: Path) -> None:
+    result = run_preflight(
+        tmp_path,
+        band=_band(),
+        center_frequency_hz=868_000_000.0,
+        sample_rate_hz=6_000_000.0,
+        duration_seconds=10.0,
+        skip_throughput=True,
+    )
+    efficiency = next(c for c in result["checks"] if c["name"] == "Rate efficiency")
+    assert efficiency["status"] == "pass"
+    coverage = next(c for c in result["checks"] if c["name"] == "Band coverage")
+    assert coverage["status"] == "pass"

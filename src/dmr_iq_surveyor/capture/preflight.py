@@ -35,6 +35,37 @@ PASS = "pass"
 WARN = "warn"
 FAIL = "fail"
 
+# SoapySDRPlay3 picks the analog IF filter from the sample rate, and the
+# available filters are far from a continuum. Transcribed from
+# `SoapySDRPlay3/Settings.cpp::getBwEnumForRate`. The consequence that
+# matters in the field: every rate from 1.536 up to (not including) 5 MS/s
+# gets the same 1.536 MHz filter, so paying 4 MS/s of storage bandwidth buys
+# no more usable spectrum than 2 MS/s does. The next real step up is 5 MS/s.
+_IF_BANDWIDTH_STEPS_HZ: tuple[tuple[float, float], ...] = (
+    (300_000.0, 200_000.0),
+    (600_000.0, 300_000.0),
+    (1_536_000.0, 600_000.0),
+    (5_000_000.0, 1_536_000.0),
+    (6_000_000.0, 5_000_000.0),
+    (7_000_000.0, 6_000_000.0),
+    (8_000_000.0, 7_000_000.0),
+)
+_MAX_IF_BANDWIDTH_HZ = 8_000_000.0
+
+
+def sdrplay_if_bandwidth_hz(sample_rate_hz: float) -> float:
+    """Analog IF filter width SoapySDRPlay3 will select for `sample_rate_hz`."""
+    for threshold, bandwidth in _IF_BANDWIDTH_STEPS_HZ:
+        if sample_rate_hz < threshold:
+            return bandwidth
+    return _MAX_IF_BANDWIDTH_HZ
+
+
+def usable_span_hz(sample_rate_hz: float) -> float:
+    """Spectrum actually usable at this rate: the narrower of the Nyquist
+    width and the analog filter the receiver will apply."""
+    return min(sample_rate_hz, sdrplay_if_bandwidth_hz(sample_rate_hz))
+
 
 @dataclass(slots=True)
 class Check:
@@ -147,22 +178,27 @@ def _check_throughput(directory: Path, sample_rate_hz: float, megabytes: int) ->
 def _check_band_coverage(
     band: BandProfile, center_frequency_hz: float, sample_rate_hz: float
 ) -> Check:
-    nyquist_low = center_frequency_hz - sample_rate_hz / 2.0
-    nyquist_high = center_frequency_hz + sample_rate_hz / 2.0
-    covered_low = max(nyquist_low, band.start_frequency_hz)
-    covered_high = min(nyquist_high, band.stop_frequency_hz)
+    # Coverage is bounded by the analog IF filter, not by Nyquist. Using
+    # Nyquist alone overstates it -- at 2 MS/s the filter is 1.536 MHz, so
+    # 23% of the "covered" span is really in the roll-off.
+    span = usable_span_hz(sample_rate_hz)
+    low = center_frequency_hz - span / 2.0
+    high = center_frequency_hz + span / 2.0
+    covered_low = max(low, band.start_frequency_hz)
+    covered_high = min(high, band.stop_frequency_hz)
     requested_width = band.stop_frequency_hz - band.start_frequency_hz
     if covered_high <= covered_low:
         return Check(
             "Band coverage",
             FAIL,
-            f"tuning covers {nyquist_low / 1e6:.3f}-{nyquist_high / 1e6:.3f} MHz, which does not "
+            f"tuning covers {low / 1e6:.3f}-{high / 1e6:.3f} MHz, which does not "
             f"overlap the {band.name} band ({band.start_frequency_hz / 1e6:.3f}-"
             f"{band.stop_frequency_hz / 1e6:.3f} MHz)",
         )
     covered_fraction = (covered_high - covered_low) / requested_width
     detail = (
-        f"tuning covers {nyquist_low / 1e6:.3f}-{nyquist_high / 1e6:.3f} MHz; "
+        f"usable span {low / 1e6:.3f}-{high / 1e6:.3f} MHz "
+        f"(IF filter {sdrplay_if_bandwidth_hz(sample_rate_hz) / 1e6:.3f} MHz); "
         f"{covered_fraction * 100:.0f}% of the {band.name} band "
         f"({band.start_frequency_hz / 1e6:.3f}-{band.stop_frequency_hz / 1e6:.3f} MHz)"
     )
@@ -173,6 +209,31 @@ def _check_band_coverage(
             detail + " -- the rest is reported as uncovered, not silently skipped",
         )
     return Check("Band coverage", PASS, detail)
+
+
+def _check_rate_efficiency(sample_rate_hz: float) -> Check:
+    """Flag sample rates that cost storage bandwidth without buying spectrum.
+
+    The IF filter steps from 1.536 MHz straight to 5 MHz, so 3 or 4 MS/s
+    writes 1.5-2x as much data as 2 MS/s for exactly the same usable span.
+    """
+    bandwidth = sdrplay_if_bandwidth_hz(sample_rate_hz)
+    if sample_rate_hz <= bandwidth * 1.05:
+        return Check(
+            "Rate efficiency",
+            PASS,
+            f"{sample_rate_hz / 1e6:.3f} MS/s is well matched to its "
+            f"{bandwidth / 1e6:.3f} MHz IF filter",
+        )
+    # Largest rate that yields the same filter, i.e. the wasted headroom.
+    return Check(
+        "Rate efficiency",
+        WARN,
+        f"{sample_rate_hz / 1e6:.3f} MS/s still gets only a {bandwidth / 1e6:.3f} MHz IF filter, "
+        f"so it writes {sample_rate_hz / max(bandwidth, 1.0):.1f}x the data for no extra usable "
+        "spectrum. Drop to just above the filter width, or step up to the next filter "
+        "(5 MS/s gives 5 MHz).",
+    )
 
 
 def _check_gps(gps_url: str | None, timeout_seconds: float) -> Check:
@@ -216,6 +277,7 @@ def run_preflight(
         else:
             checks.append(_check_throughput(destination, sample_rate_hz, probe_megabytes))
     checks.append(_check_band_coverage(band, center_frequency_hz, sample_rate_hz))
+    checks.append(_check_rate_efficiency(sample_rate_hz))
     checks.append(_check_gps(gps_url, gps_timeout_seconds))
 
     statuses = {check.status for check in checks}
@@ -239,4 +301,6 @@ __all__ = [
     "measure_write_throughput",
     "required_bytes_per_second",
     "run_preflight",
+    "sdrplay_if_bandwidth_hz",
+    "usable_span_hz",
 ]

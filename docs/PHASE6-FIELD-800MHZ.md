@@ -117,15 +117,22 @@ of you typing them into a site profile.
 survey.** 16-bit IQ is 4 bytes per frame, so the sustained write requirement is
 `sample_rate x 4 bytes/s`:
 
-| Sample rate | Sustained write needed | RF span covered | ADC resolution |
+The RF span is set by the **analog IF filter**, not by Nyquist, and the filter comes in fixed steps
+(200 k / 300 k / 600 k / 1.536 M / 5 M / 6 M / 7 M / 8 MHz), chosen as the widest step at or below
+the sample rate. That produces a large plateau: **every rate from 1.536 up to 5 MS/s gets the same
+1.536 MHz filter**, so 4 MS/s writes twice the data of 2 MS/s for exactly the same usable spectrum.
+
+| Sample rate | Sustained write needed | RF span usable | ADC resolution |
 |---|---|---|---|
-| 2 MS/s | 8 MB/s | ~1.5 MHz usable (low-IF) — a third of 866-870 | 14-bit |
-| 4 MS/s | 16 MB/s | 4 MHz — the whole band, no margin | 14-bit |
-| 6 MS/s | 24 MB/s | 6 MHz — the whole band with margin | 14-bit |
+| 2 MS/s | 8 MB/s | 1.536 MHz — under half of 866-870 | 14-bit |
+| 4 MS/s | 16 MB/s | 1.536 MHz — **no better than 2 MS/s** | 14-bit |
+| 5 MS/s | 20 MB/s | 5 MHz — the whole band with margin | 14-bit |
+| 6 MS/s | 24 MB/s | 6 MHz — the whole band with more margin | 14-bit |
 | 10 MS/s | 40 MB/s | ~8 MHz usable (8 MHz IF filter) | **8-bit** |
 
 Measured on this project's Pi 5, the SD card sustains only **~10 MB/s**, which caps it at **2 MS/s**
-— half the band per capture. At 10 MS/s the same card truncated a 15-second capture to ~13.5 s even
+— 1.536 MHz per capture, well under half the band. The next genuinely wider setting is 5 MS/s, and
+that needs 20 MB/s, so faster storage is the only route to full-band coverage. At 10 MS/s the same card truncated a 15-second capture to ~13.5 s even
 with an enlarged buffer, so **do not copy a `--sample-rate 10000000` example onto SD-card storage.**
 Full 866-870 MHz coverage in a single capture needs faster storage (a USB3 SSD on the Pi 5); until
 then, either accept `coverage_status: partial` on a 2 MS/s capture or make two captures at different
