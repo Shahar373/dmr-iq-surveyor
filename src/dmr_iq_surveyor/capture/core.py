@@ -15,6 +15,7 @@ import platform
 import resource
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,13 @@ from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_survey
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
 
 _DEFAULT_CHUNK_FRAMES = 262_144
+
+# A capture that has run this many times longer than the requested duration
+# is not going to recover. Bounding it means a field operator gets a short
+# recording plus a clear explanation instead of a terminal that never
+# returns.
+_DEFAULT_TIMEOUT_FACTOR = 3.0
+_TIMEOUT_GRACE_SECONDS = 30.0
 
 
 def _peak_rss_bytes() -> int:
@@ -98,6 +106,8 @@ def run_capture(
     settings: CaptureSettings,
     device: IqDevice | None = None,
     filename: str | None = None,
+    on_progress: Callable[[int, int, float], None] | None = None,
+    timeout_factor: float = _DEFAULT_TIMEOUT_FACTOR,
 ) -> dict[str, Any]:
     """Capture `settings.duration_seconds` of IQ into a new WAV file under
     `output_dir` and return a manifest describing it.
@@ -107,6 +117,16 @@ def run_capture(
     this project's `iq/reader.py` streaming discipline applied to writing.
     `device` defaults to a real `SoapyIqDevice`; tests pass a synthetic stub
     implementing the same `IqDevice` interface instead.
+
+    `on_progress(frames_written, target_frames, elapsed_seconds)` is called
+    as the capture advances, so an operator watching a field capture sees it
+    moving instead of a blank terminal.
+
+    A wall-clock deadline of `timeout_factor` x the requested duration (plus
+    a fixed grace period) bounds the run. A device that delivers samples far
+    slower than real time -- or not at all, without raising -- ends the
+    capture early with whatever was recorded, flagged `timed_out` in the
+    manifest, rather than hanging indefinitely in the field.
     """
     started = time.time()
     settings.validate()
@@ -126,9 +146,14 @@ def run_capture(
         center_frequency_hz=round(settings.center_frequency_hz),
         write_auxi=settings.write_auxi,
     )
+    deadline = started + settings.duration_seconds * timeout_factor + _TIMEOUT_GRACE_SECONDS
+    timed_out = False
     writer = WaveIQWriter(wav_path, writer_settings)
     try:
         while writer.frame_count < target_frame_count:
+            if time.time() > deadline:
+                timed_out = True
+                break
             remaining = target_frame_count - writer.frame_count
             chunk = resolved_device.read_stream_chunk(min(settings.chunk_frames, remaining))
             chunk = np.asarray(chunk)
@@ -137,6 +162,8 @@ def run_capture(
             if chunk.size > remaining:
                 chunk = chunk[:remaining]
             writer.write_frames(chunk)
+            if on_progress is not None:
+                on_progress(writer.frame_count, target_frame_count, time.time() - started)
     finally:
         resolved_device.close()
         writer_summary = writer.close()
@@ -151,6 +178,8 @@ def run_capture(
         "requested_frame_count": target_frame_count,
         "requested_duration_seconds": settings.duration_seconds,
         "actual_duration_seconds": writer_summary["frame_count"] / settings.sample_rate_hz,
+        "complete": writer_summary["frame_count"] >= target_frame_count,
+        "timed_out": timed_out,
         "start_utc": writer_summary["start_utc"],
         "stop_utc": writer_summary["stop_utc"],
         "elapsed_seconds": elapsed,
@@ -182,6 +211,7 @@ def run_capture_and_survey(
     gps_timeout_seconds: float = 10.0,
     gps_latitude: float | None = None,
     gps_longitude: float | None = None,
+    on_progress: Callable[[int, int, float], None] | None = None,
 ) -> dict[str, Any]:
     """Capture live IQ and immediately run the existing `survey run` pipeline
     on the result -- the single command this module was built for. Reuses
@@ -208,6 +238,7 @@ def run_capture_and_survey(
         settings=capture,
         device=device,
         filename=filename,
+        on_progress=on_progress,
     )
     survey_result = run_survey(
         capture_manifest["wav_path"],

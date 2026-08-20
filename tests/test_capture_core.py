@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -259,6 +260,80 @@ def test_run_capture_and_survey_detects_injected_tone(tmp_path: Path) -> None:
     assert (output_dir / "reports" / "report.md").is_file()
     assert (output_dir / "run.json").is_file()
     assert result["gps"]["source"] == "not_configured"
+
+
+class StalledIqDevice:
+    """Never delivers samples and never raises -- the field failure where a
+    capture would otherwise hang forever with no output."""
+
+    def open(self, settings: DeviceSettings) -> None:
+        settings.validate()
+
+    def read_stream_chunk(self, max_frames: int) -> np.ndarray:
+        return np.empty(0, dtype=np.complex64)
+
+    def close(self) -> None:
+        pass
+
+
+def test_stalled_device_hits_the_deadline_instead_of_hanging(tmp_path: Path) -> None:
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=0.5,
+        gain_db=20.0,
+    )
+    started = time.monotonic()
+    manifest = run_capture(
+        tmp_path,
+        settings=settings,
+        device=StalledIqDevice(),
+        # Deadline = 0.5 * 0.2 + grace. Kept short so the test is fast; the
+        # point under test is that the loop terminates at all.
+        timeout_factor=0.2,
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 60, "the capture loop did not respect its deadline"
+    assert manifest["timed_out"] is True
+    assert manifest["complete"] is False
+    assert manifest["frame_count"] == 0
+    # Even a zero-length capture must leave a valid, parseable WAV behind.
+    info = inspect_wave_iq(manifest["wav_path"])
+    assert info.frame_count == 0
+
+
+def test_progress_callback_reports_monotonic_advance(tmp_path: Path) -> None:
+    """The field operator watches this for 90 seconds; it must actually
+    move, and never go backwards."""
+    seen: list[tuple[int, int]] = []
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=0.5,
+        gain_db=20.0,
+        chunk_frames=8192,
+    )
+    run_capture(
+        tmp_path,
+        settings=settings,
+        device=FakeIqDevice(),
+        on_progress=lambda frames, target, _elapsed: seen.append((frames, target)),
+    )
+    assert len(seen) > 1
+    assert [frames for frames, _ in seen] == sorted(frames for frames, _ in seen)
+    assert seen[-1][0] == seen[-1][1] == round(0.5 * SAMPLE_RATE_HZ)
+
+
+def test_completed_capture_is_marked_complete_and_not_timed_out(tmp_path: Path) -> None:
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=0.2,
+        gain_db=20.0,
+    )
+    manifest = run_capture(tmp_path, settings=settings, device=FakeIqDevice())
+    assert manifest["complete"] is True
+    assert manifest["timed_out"] is False
 
 
 class _FixedGpsResponseHandler(BaseHTTPRequestHandler):

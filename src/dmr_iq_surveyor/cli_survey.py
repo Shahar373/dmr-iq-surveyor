@@ -5,6 +5,14 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 
 from dmr_iq_surveyor.capture.core import CaptureSettings, run_capture_and_survey
@@ -372,23 +380,51 @@ def survey_capture(
 
     resolved_survey_output = survey_output or (output / "survey")
     try:
-        result = run_capture_and_survey(
-            output,
-            resolved_survey_output,
-            capture=capture_settings,
-            band=band,
-            site=site,
-            run_id=run_id,
-            database_path=database,
-            assumed_iq_order=iq_order,
-            compute_source_hash=hash_source,
-            gps_url=gps_url,
-            gps_timeout_seconds=gps_timeout,
-            gps_latitude=latitude,
-            gps_longitude=longitude,
-        )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]Capturing[/bold]"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task_id = progress.add_task("capture", total=1000)
+
+            def report(frames: int, target: int, _elapsed: float) -> None:
+                progress.update(task_id, completed=min(1000, round(1000 * frames / max(target, 1))))
+
+            result = run_capture_and_survey(
+                output,
+                resolved_survey_output,
+                capture=capture_settings,
+                band=band,
+                site=site,
+                run_id=run_id,
+                database_path=database,
+                assumed_iq_order=iq_order,
+                compute_source_hash=hash_source,
+                gps_url=gps_url,
+                gps_timeout_seconds=gps_timeout,
+                gps_latitude=latitude,
+                gps_longitude=longitude,
+                on_progress=report,
+            )
     except (FileNotFoundError, OSError, ValueError, ProfileError, RuntimeError) as exc:
         console.print(f"[bold red]Capture/survey failed:[/bold red] {exc}")
+        # A capture that dies mid-stream still leaves a valid, closed WAV
+        # behind. Say so: without this the operator has no way to know a
+        # salvageable recording is sitting on disk, and a usable field
+        # capture gets thrown away as a failed run.
+        salvage = sorted(
+            output.glob("SDRconnect_IQ_*.wav"), key=lambda path: path.stat().st_mtime, reverse=True
+        )
+        if salvage:
+            console.print(
+                f"[yellow]A partial recording was still written:[/yellow] {salvage[0]}\n"
+                "It is a valid WAV. Analyze it with:\n"
+                f"  dmr-surveyor survey run {salvage[0]} --band {band} --site {site}"
+            )
         raise typer.Exit(code=1) from exc
 
     table = Table(title="Live capture + RF survey")

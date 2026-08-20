@@ -98,13 +98,27 @@ The steps above assume SDRconnect recorded the file and `survey run` processes i
 directly via SoapySDR, and can fetch the capture-site coordinates from a phone automatically instead
 of you typing them into a site profile.
 
-**Storage speed matters more than anything else here.** 10 MS/s IQ needs 40 MB/s of sustained write
-throughput; a slow SD card cannot keep up (confirmed on this project's Pi 5: an SD card measured at
-~10 MB/s truncated a 15-second capture to ~13.5s even with an enlarged buffer). Before relying on
-this command for a real capture, retest write speed at the actual output path
-(`dd if=/dev/zero of=<output_dir>/writetest.bin bs=4M count=500 oflag=direct status=progress`) and
-either use faster storage (a USB3 drive on the Pi 5) or drop `--sample-rate` to something the
-storage measurably sustains with margin.
+**Storage speed decides the sample rate, and the sample rate decides how much of the band you can
+survey.** 16-bit IQ is 4 bytes per frame, so the sustained write requirement is
+`sample_rate x 4 bytes/s`:
+
+| Sample rate | Sustained write needed | RF span covered |
+|---|---|---|
+| 2 MS/s | 8 MB/s | 2 MHz — half of 866-870 |
+| 4 MS/s | 16 MB/s | 4 MHz — the whole band, no margin |
+| 5 MS/s | 20 MB/s | 5 MHz — the whole band with margin |
+| 10 MS/s | 40 MB/s | 10 MHz |
+
+Measured on this project's Pi 5, the SD card sustains only **~10 MB/s**, which caps it at **2 MS/s**
+— half the band per capture. At 10 MS/s the same card truncated a 15-second capture to ~13.5 s even
+with an enlarged buffer, so **do not copy a `--sample-rate 10000000` example onto SD-card storage.**
+Full 866-870 MHz coverage in a single capture needs faster storage (a USB3 SSD on the Pi 5); until
+then, either accept `coverage_status: partial` on a 2 MS/s capture or make two captures at different
+center frequencies.
+
+Do not guess at any of this — `dmr-surveyor survey preflight` measures the real write throughput of
+the output path and reports the highest sample rate it can sustain, plus how much of the band
+profile the chosen tuning actually covers. Run it before every session (see §8.3).
 
 ### 8.1 Phone-side GPS server (one-time setup, Android + Termux)
 
@@ -127,20 +141,54 @@ serves a fresh GPS fix (via `termux-location`) on every request — leaving it r
 field session or restarting it before each capture both work identically, since nothing is cached.
 Use the phone's hotspot IP it prints (or check Android Settings -> Hotspot) to build the URL below.
 
-### 8.2 Capture command
+### 8.2 Install the SoapySDR dependency first (one-time, at home)
+
+`survey capture` drives the RSP1B through SoapySDR, which this project does not install and which an
+SDRplay-API-based tool like `rsp-recorder` working is **no** evidence of. Run once, on mains power
+and a real network:
+
+```bash
+bash scripts/pi_soapysdr_setup.sh
+```
+
+It installs SoapySDR, builds the SDRplay driver module if missing, and — the step that is easy to
+miss — links the bindings into this project's virtualenv, because Debian installs them to
+`/usr/lib/python3/dist-packages` where a venv cannot see them. It finishes by enumerating the device
+through the same code path `survey capture` uses.
+
+### 8.3 Preflight, then capture
+
+```bash
+# Measured go/no-go: device present, disk writable and fast enough, band covered, GPS answering
+dmr-surveyor survey preflight ~/Projects/dmr-iq-surveyor/runs/recordings \
+  --band central_800_recon \
+  --center-frequency 867881250 \
+  --sample-rate 2000000 \
+  --duration 90 \
+  --gps-url http://<phone-hotspot-ip>:8765/location
+```
+
+Read the "safe up to ~N MS/s" figure it prints and use it. Then:
 
 ```bash
 dmr-surveyor survey capture \
   ~/Projects/dmr-iq-surveyor/runs/recordings \
   --band central_800_recon \
   --site config/sites/home.example.yaml \
-  --center-frequency 868000000 \
-  --sample-rate 10000000 \
+  --center-frequency 867881250 \
+  --sample-rate 2000000 \
   --duration 90 \
   --gain 40 \
   --no-agc \
   --gps-url http://<phone-hotspot-ip>:8765/location
 ```
+
+**On 867.881250 MHz rather than 868.000000 MHz.** At a reduced sample rate the center frequency has
+to be chosen deliberately. 867.881250 MHz matches the existing 2026-08-08 recording, and at 2 MS/s it
+covers 866.88-868.88 MHz, leaving the candidate already seen near 867.2625 MHz about 620 kHz inside
+the passband edge. Centering on 868.000000 MHz at the same rate would leave that candidate roughly
+60 kHz from the edge, deep in the filter roll-off and likely to trip `edge_warning`. At 5 MS/s or
+above, center on 868.000000 MHz instead — the geometric center of the band.
 
 If the phone server is unreachable, the capture and survey still complete — the run is stored with
 `gps_source=fetch_failed` and the reason recorded (never a silent gap). `--latitude`/`--longitude`
