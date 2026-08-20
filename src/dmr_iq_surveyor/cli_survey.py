@@ -325,6 +325,10 @@ def survey_capture(
         str,
         typer.Option(help="SoapySDR driver name"),
     ] = "sdrplay",
+    serial: Annotated[
+        str | None,
+        typer.Option("--serial", help="Pin to one device by serial number, if more than one is attached"),
+    ] = None,
     survey_output: Annotated[
         Path | None,
         typer.Option(help="Survey run output directory; defaults to <output>/survey"),
@@ -416,6 +420,7 @@ def survey_capture(
             driver=driver,
             write_auxi=write_auxi,
             bandwidth_hz=bandwidth,
+            serial=serial,
         )
     except ValueError as exc:
         console.print(f"[bold red]Invalid capture settings:[/bold red] {exc}")

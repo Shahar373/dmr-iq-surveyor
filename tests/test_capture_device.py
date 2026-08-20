@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from dmr_iq_surveyor.capture.device import DeviceSettings, probe_soapysdr
+from dmr_iq_surveyor.capture.device import DeviceSettings, device_args_string, probe_soapysdr
 
 
 def test_probe_soapysdr_reports_unavailable_without_bindings() -> None:
@@ -68,3 +68,33 @@ def test_device_settings_rejects_non_positive_sample_rate() -> None:
     settings = DeviceSettings(sample_rate_hz=0.0, center_frequency_hz=868_000_000.0, agc=True)
     with pytest.raises(ValueError):
         settings.validate()
+
+
+def test_device_args_string_is_the_form_soapysdr_can_actually_parse() -> None:
+    """Device() must be given `key=value` text, not a dict.
+
+    Verified against a real RSP1B: `Device({'driver':'sdrplay'})` raised
+    "SoapySDR::Device::make() no match" while `Device('driver=sdrplay')`
+    opened the device, on the same machine in the same process. The dict
+    goes through a SWIG conversion to a C++ Kwargs map that loses the
+    contents, so the factory sees no driver key; the string overload is
+    parsed by C++ itself.
+    """
+    assert device_args_string("sdrplay") == "driver=sdrplay"
+    assert device_args_string("sdrplay", "240404AF60") == "driver=sdrplay,serial=240404AF60"
+    # A blank serial must not produce a trailing empty key.
+    assert device_args_string("sdrplay", None) == "driver=sdrplay"
+    assert device_args_string("sdrplay", "") == "driver=sdrplay"
+
+
+def test_device_settings_carries_serial_through_to_the_args_string() -> None:
+    settings = DeviceSettings(
+        driver="sdrplay",
+        if_gain_reduction_db=40.0,
+        lna_state=4,
+        serial="240404AF60",
+    )
+    settings.validate()
+    assert device_args_string(settings.driver, settings.serial) == (
+        "driver=sdrplay,serial=240404AF60"
+    )

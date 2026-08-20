@@ -52,6 +52,24 @@ GAIN_ELEMENT_IF = "IFGR"  # IF gain reduction in dB, typically 20..59
 GAIN_ELEMENT_RF = "RFGR"  # LNA state index, 0..9 on an RSP1B
 
 
+def device_args_string(driver: str, serial: str | None = None) -> str:
+    """Build SoapySDR's `key=value,key=value` device argument string.
+
+    Device() must be given this string rather than the equivalent dict.
+    Passing a dict makes SWIG convert it to a C++ Kwargs map, and that
+    conversion drops the contents: the factory then sees no `driver` key and
+    raises the contentless "SoapySDR::Device::make() no match", even where
+    Device.enumerate() accepts the identical dict and finds the device.
+    Verified against an RSP1B -- the dict form failed and the string form
+    opened the device. The string overload is parsed by C++ itself
+    (KwargsFromString), which is also the form SoapySDRUtil uses.
+    """
+    parts = [f"driver={driver}"]
+    if serial:
+        parts.append(f"serial={serial}")
+    return ",".join(parts)
+
+
 @dataclass(slots=True)
 class DeviceSettings:
     driver: str = "sdrplay"
@@ -63,6 +81,7 @@ class DeviceSettings:
     antenna: str | None = None
     channel: int = 0
     bandwidth_hz: float | None = None
+    serial: str | None = None
 
     def validate(self) -> None:
         if self.sample_rate_hz <= 0:
@@ -181,7 +200,7 @@ class SoapyIqDevice:
         from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_RX
 
         self._channel = settings.channel
-        self._device = SoapySDR.Device({"driver": settings.driver})
+        self._device = SoapySDR.Device(device_args_string(settings.driver, settings.serial))
         try:
             self._configure(settings, SOAPY_SDR_RX)
             self._stream = self._device.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [self._channel])
@@ -322,6 +341,7 @@ __all__ = [
     "GAIN_ELEMENT_IF",
     "GAIN_ELEMENT_RF",
     "DeviceProbe",
+    "device_args_string",
     "DeviceSettings",
     "IqDevice",
     "SoapyIqDevice",

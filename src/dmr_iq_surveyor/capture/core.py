@@ -62,6 +62,7 @@ class CaptureSettings:
     chunk_frames: int = _DEFAULT_CHUNK_FRAMES
     write_auxi: bool = True
     bandwidth_hz: float | None = None
+    serial: str | None = None
 
     def validate(self) -> None:
         if self.center_frequency_hz <= 0:
@@ -91,6 +92,7 @@ class CaptureSettings:
             antenna=self.antenna,
             channel=self.channel,
             bandwidth_hz=self.bandwidth_hz,
+            serial=self.serial,
         )
 
     def to_dict(self) -> dict[str, Any]:
