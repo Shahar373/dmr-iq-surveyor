@@ -7,15 +7,30 @@ Read `docs/FIELD-RECORDING-GUIDE.md` §3 (equipment) and §5 (Pi pre-flight chec
 ## 1. Settings
 
 ```text
-center frequency: 868.000000 MHz
-sample rate:       10.000000 MS/s
+center frequency: 868.000000 MHz   (see the note on reduced sample rates below)
+sample rate:       6.000000 MS/s   (storage permitting -- measure with `survey preflight`)
 format:            signed 16-bit complex IQ
 AGC:               off
 manual gain:       set per the two-step procedure below (unknown ahead of time at a new site)
 capture length:    60-120 seconds
 ```
 
-868.000000 MHz is the geometric center of 866-870 MHz, chosen with no reference to any known frequency — Phase 6A's discovery has to see RF before anything else, and centering on a "known" candidate would bias what gets covered. 10 MS/s gives ±5 MHz of Nyquist width, comfortably covering the requested 4 MHz band with margin on both sides; this reuses the already-validated `10m` extraction-profile chain used elsewhere in the project, unlike a still-unconfirmed 5 MS/s capture.
+868.000000 MHz is the geometric center of 866-870 MHz, chosen with no reference to any known
+frequency — Phase 6A's discovery has to see RF before anything else, and centering on a "known"
+candidate would bias what gets covered.
+
+**On the sample rate.** 6 MS/s is preferred over 10 MS/s even where storage allows the latter. The
+RSP1A/RSP1B ADC resolution falls with the sample rate — roughly 14-bit up to ~6 MS/s, 12-bit to
+~8 MS/s, and 8-bit above ~9.2 MS/s — so capturing at 10 MS/s discards a large part of the receiver's
+dynamic range, which is precisely what a survey looking for weak carriers beside strong ones needs.
+6 MS/s keeps 14-bit resolution, still covers the whole 4 MHz band with margin, and needs 24 MB/s of
+storage instead of 40 MB/s.
+
+Below ~2 MS/s the receiver switches to a low-IF mode and the usable span narrows further than
+Nyquist alone suggests (at 2 MS/s the analog filter is ~1.536 MHz, not 2 MHz). Whatever rate you
+choose, the tuning is also zero-IF at 6 MS/s and above, which places a DC/LO spur at exactly the
+tuned center frequency — a "detection" sitting precisely on the center frequency is almost certainly
+that spur rather than a transmitter.
 
 ## 2. Gain: two-step procedure
 
@@ -102,12 +117,12 @@ of you typing them into a site profile.
 survey.** 16-bit IQ is 4 bytes per frame, so the sustained write requirement is
 `sample_rate x 4 bytes/s`:
 
-| Sample rate | Sustained write needed | RF span covered |
-|---|---|---|
-| 2 MS/s | 8 MB/s | 2 MHz — half of 866-870 |
-| 4 MS/s | 16 MB/s | 4 MHz — the whole band, no margin |
-| 5 MS/s | 20 MB/s | 5 MHz — the whole band with margin |
-| 10 MS/s | 40 MB/s | 10 MHz |
+| Sample rate | Sustained write needed | RF span covered | ADC resolution |
+|---|---|---|---|
+| 2 MS/s | 8 MB/s | ~1.5 MHz usable (low-IF) — a third of 866-870 | 14-bit |
+| 4 MS/s | 16 MB/s | 4 MHz — the whole band, no margin | 14-bit |
+| 6 MS/s | 24 MB/s | 6 MHz — the whole band with margin | 14-bit |
+| 10 MS/s | 40 MB/s | ~8 MHz usable (8 MHz IF filter) | **8-bit** |
 
 Measured on this project's Pi 5, the SD card sustains only **~10 MB/s**, which caps it at **2 MS/s**
 — half the band per capture. At 10 MS/s the same card truncated a 15-second capture to ~13.5 s even
@@ -178,7 +193,7 @@ dmr-surveyor survey capture \
   --center-frequency 867881250 \
   --sample-rate 2000000 \
   --duration 90 \
-  --gain 40 \
+  --if-gr 40 --lna-state 4 \
   --no-agc \
   --gps-url http://<phone-hotspot-ip>:8765/location
 ```
