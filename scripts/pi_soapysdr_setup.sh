@@ -21,6 +21,16 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$REPO_ROOT/.venv"
 BUILD_DIR="${SOAPY_BUILD_DIR:-$HOME/Projects}"
 
+# Resolved explicitly, NOT via `python3` on PATH: if this script is run with
+# the project's venv active (a natural thing to have done, since the rest of
+# the field setup asks for it), `python3` on PATH is the venv's interpreter,
+# not the system one -- so every check below would silently test the venv
+# against itself and "system python can already import SoapySDR" would never
+# be true even after apt installed it system-wide. /usr/bin/python3 is the
+# real system interpreter regardless of what is currently activated.
+SYSTEM_PYTHON=/usr/bin/python3
+[ -x "$SYSTEM_PYTHON" ] || SYSTEM_PYTHON="$(command -v -p python3)"
+
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32mOK\033[0m  %s\n' "$*"; }
 warn() { printf '    \033[33mWARN\033[0m %s\n' "$*"; }
@@ -40,14 +50,18 @@ else
 fi
 
 say "2/6  Installing SoapySDR and its Python bindings"
-if python3 -c 'import SoapySDR' 2>/dev/null; then
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+    warn "running with a virtualenv active ($VIRTUAL_ENV) -- checks below explicitly use"
+    warn "$SYSTEM_PYTHON, not the active venv's python3, so this is fine either way"
+fi
+if "$SYSTEM_PYTHON" -c 'import SoapySDR' 2>/dev/null; then
     ok "system python can already import SoapySDR"
 else
     sudo apt-get update -qq || die "apt-get update failed"
     sudo apt-get install -y git cmake g++ libsoapysdr-dev soapysdr-tools python3-soapysdr \
         || die "could not install SoapySDR packages"
-    python3 -c 'import SoapySDR' 2>/dev/null \
-        || die "SoapySDR still not importable from system python after install"
+    "$SYSTEM_PYTHON" -c 'import SoapySDR' 2>/dev/null \
+        || die "SoapySDR still not importable from system python ($SYSTEM_PYTHON) after install"
     ok "installed"
 fi
 
@@ -78,7 +92,7 @@ if "$VENV/bin/python" -c 'import SoapySDR' 2>/dev/null; then
     ok "the venv can already import SoapySDR"
 else
     SITE_PACKAGES="$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-    DIST_PACKAGES="$(python3 -c 'import SoapySDR, os; print(os.path.dirname(os.path.abspath(SoapySDR.__file__)))')"
+    DIST_PACKAGES="$("$SYSTEM_PYTHON" -c 'import SoapySDR, os; print(os.path.dirname(os.path.abspath(SoapySDR.__file__)))')"
     [ -n "$DIST_PACKAGES" ] || die "could not locate the system SoapySDR module"
     linked=0
     for path in "$DIST_PACKAGES"/SoapySDR.py "$DIST_PACKAGES"/_SoapySDR*.so; do
