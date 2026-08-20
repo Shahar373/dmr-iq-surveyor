@@ -5,10 +5,20 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 
 from dmr_iq_surveyor.capture.core import CaptureSettings, run_capture_and_survey
 from dmr_iq_surveyor.capture.device import probe_soapysdr
+from dmr_iq_surveyor.capture.gps import resolve_gps
+from dmr_iq_surveyor.capture.preflight import run_preflight
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_comparison, run_survey
 from dmr_iq_surveyor.survey.profiles import ProfileError, resolve_band_profile
 from dmr_iq_surveyor.survey.store import (
@@ -70,8 +80,54 @@ def survey_run(
         float,
         typer.Option(help="FFT overlap ratio for segmented spectrum analysis"),
     ] = 0.5,
+    site_id: Annotated[
+        str | None,
+        typer.Option(
+            "--site-id",
+            help=(
+                "Override the profile's site_id for this run. Use one profile "
+                "(same equipment) across a mobile session and give each stop its own id"
+            ),
+        ),
+    ] = None,
+    gps_url: Annotated[
+        str | None,
+        typer.Option(
+            "--gps-url",
+            help=(
+                "HTTP URL of a phone-hosted GPS JSON endpoint, fetched once now. "
+                "Records where the recording is being ANALYZED from, so only use it "
+                "when analyzing at the capture site"
+            ),
+        ),
+    ] = None,
+    gps_timeout: Annotated[
+        float,
+        typer.Option("--gps-timeout", help="Seconds to wait for the GPS server before giving up"),
+    ] = 10.0,
+    latitude: Annotated[
+        float | None,
+        typer.Option("--latitude", help="Manual latitude for this run; takes precedence over --gps-url"),
+    ] = None,
+    longitude: Annotated[
+        float | None,
+        typer.Option("--longitude", help="Manual longitude for this run; takes precedence over --gps-url"),
+    ] = None,
 ) -> None:
     """Discover RF observations in a wideband recording and store them."""
+    if (latitude is None) != (longitude is None):
+        console.print("[bold red]--latitude and --longitude must be given together[/bold red]")
+        raise typer.Exit(code=1)
+
+    gps = resolve_gps(
+        gps_url=gps_url,
+        gps_timeout_seconds=gps_timeout,
+        latitude=latitude,
+        longitude=longitude,
+    )
+    if gps["source"] == "fetch_failed":
+        console.print(f"[yellow]GPS fetch failed:[/yellow] {gps['error']} -- continuing without it")
+
     try:
         result = run_survey(
             recording,
@@ -84,6 +140,13 @@ def survey_run(
             compute_source_hash=hash_source,
             spectrum_fft_size=fft_size,
             spectrum_overlap_ratio=overlap_ratio,
+            gps_latitude=gps["latitude"],
+            gps_longitude=gps["longitude"],
+            gps_altitude_m=gps["altitude_m"],
+            gps_accuracy_m=gps["accuracy_m"],
+            gps_source=gps["source"],
+            gps_fetched_at_utc=gps["fetched_at_utc"],
+            site_id_override=site_id,
         )
     except (FileNotFoundError, OSError, ValueError, ProfileError) as exc:
         console.print(f"[bold red]Survey run failed:[/bold red] {exc}")
@@ -94,6 +157,8 @@ def survey_run(
     table.add_column("Value")
     table.add_row("Run ID", str(result["run_id"]))
     table.add_row("Observations", str(result["observation_count"]))
+    if gps["latitude"] is not None:
+        table.add_row("GPS", f"{gps['latitude']:.6f}, {gps['longitude']:.6f} (source: {gps['source']})")
     passband = result["usable_passband"]
     table.add_row(
         "Usable passband",
@@ -104,6 +169,98 @@ def survey_run(
     console.print(table)
     console.print(f"[green]Artifacts written to:[/green] {result['output_dir']}")
     console.print(f"Open: {Path(result['output_dir']) / 'reports' / 'report.md'}")
+
+
+@survey_app.command("preflight")
+def survey_preflight(
+    output: Annotated[
+        Path,
+        typer.Argument(help="Directory the capture would write into (checked for space and speed)"),
+    ],
+    band: Annotated[
+        str,
+        typer.Option(help="Band profile name (config/bands/<name>.yaml) or a path to one"),
+    ],
+    center_frequency: Annotated[
+        float,
+        typer.Option("--center-frequency", help="Tuner center frequency in Hz"),
+    ] = 868_000_000.0,
+    sample_rate: Annotated[
+        float,
+        typer.Option("--sample-rate", help="IQ sample rate in samples/s"),
+    ] = 2_000_000.0,
+    duration: Annotated[
+        float,
+        typer.Option(help="Capture duration in seconds"),
+    ] = 90.0,
+    driver: Annotated[
+        str,
+        typer.Option(help="SoapySDR driver name"),
+    ] = "sdrplay",
+    gps_url: Annotated[
+        str | None,
+        typer.Option("--gps-url", help="GPS endpoint to test, same value you would pass to capture"),
+    ] = None,
+    gps_timeout: Annotated[
+        float,
+        typer.Option("--gps-timeout", help="Seconds to wait for the GPS server"),
+    ] = 10.0,
+    probe_megabytes: Annotated[
+        int,
+        typer.Option("--probe-mb", help="Size of the write-throughput probe file in MiB"),
+    ] = 128,
+    skip_throughput: Annotated[
+        bool,
+        typer.Option("--skip-throughput", help="Skip the write-speed probe (faster, less certain)"),
+    ] = False,
+) -> None:
+    """Check that a capture would actually succeed, before making it.
+
+    Verifies the SDR is reachable, the output filesystem is writable, has
+    room, and is fast enough for the requested sample rate, that the tuning
+    covers the band profile, and that GPS (if configured) responds.
+    """
+    try:
+        band_profile = resolve_band_profile(band)
+    except ProfileError as exc:
+        console.print(f"[bold red]Invalid band profile:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    result = run_preflight(
+        output,
+        band=band_profile,
+        center_frequency_hz=center_frequency,
+        sample_rate_hz=sample_rate,
+        duration_seconds=duration,
+        driver=driver,
+        gps_url=gps_url,
+        gps_timeout_seconds=gps_timeout,
+        probe_megabytes=probe_megabytes,
+        skip_throughput=skip_throughput,
+    )
+
+    styles = {"pass": "[green]PASS[/green]", "warn": "[yellow]WARN[/yellow]", "fail": "[bold red]FAIL[/bold red]"}
+    table = Table(title="Capture preflight")
+    table.add_column("Check", style="bold")
+    table.add_column("Result")
+    table.add_column("Detail")
+    for check in result["checks"]:
+        table.add_row(check["name"], styles[check["status"]], check["detail"])
+    console.print(table)
+
+    size_gib = result["capture_size_bytes"] / 1024**3
+    console.print(
+        f"Planned capture: {duration:.0f} s at {sample_rate / 1e6:.3f} MS/s "
+        f"= {size_gib:.2f} GiB, needs {result['required_bytes_per_second'] / 1e6:.1f} MB/s sustained"
+    )
+
+    if result["verdict"] == "fail":
+        console.print("[bold red]NO-GO[/bold red] -- fix the FAIL rows above before capturing.")
+        raise typer.Exit(code=1)
+    if result["verdict"] == "warn":
+        console.print("[yellow]GO, with caveats[/yellow] -- read the WARN rows above.")
+        return
+    console.print("[bold green]GO[/bold green] -- all checks passed.")
 
 
 @survey_app.command("capture")
@@ -132,13 +289,33 @@ def survey_capture(
         float,
         typer.Option(help="Capture duration in seconds"),
     ] = 90.0,
-    gain: Annotated[
+    if_gr: Annotated[
         float | None,
-        typer.Option(help="Manual gain reduction in dB; required unless --agc"),
+        typer.Option(
+            "--if-gr",
+            help=(
+                "IF gain REDUCTION in dB (SDRplay units, typically 20-59; higher = less "
+                "sensitive). Required unless --agc"
+            ),
+        ),
+    ] = None,
+    lna_state: Annotated[
+        int | None,
+        typer.Option(
+            "--lna-state",
+            help="LNA state index (0-9 on an RSP1B; higher = less sensitive). Applies with or without AGC",
+        ),
+    ] = None,
+    bandwidth: Annotated[
+        float | None,
+        typer.Option(
+            "--bandwidth",
+            help="IF filter bandwidth in Hz. Defaults to the driver's choice for the sample rate",
+        ),
     ] = None,
     agc: Annotated[
         bool,
-        typer.Option("--agc/--no-agc", help="Enable SDR AGC (mutually exclusive with --gain)"),
+        typer.Option("--agc/--no-agc", help="Enable SDR AGC (mutually exclusive with --if-gr)"),
     ] = False,
     antenna: Annotated[
         str | None,
@@ -178,6 +355,38 @@ def survey_capture(
             help="Write an SDRplay-style auxi metadata chunk (else rely on the SDRconnect filename fallback)",
         ),
     ] = True,
+    site_id: Annotated[
+        str | None,
+        typer.Option(
+            "--site-id",
+            help=(
+                "Override the profile's site_id for this run. Use one profile "
+                "(same equipment) across a mobile session and give each stop its own id"
+            ),
+        ),
+    ] = None,
+    gps_url: Annotated[
+        str | None,
+        typer.Option(
+            "--gps-url",
+            help=(
+                "HTTP URL of a phone-hosted GPS JSON endpoint (e.g. "
+                "scripts/phone_gps_server.py on Termux), fetched once at capture start"
+            ),
+        ),
+    ] = None,
+    gps_timeout: Annotated[
+        float,
+        typer.Option("--gps-timeout", help="Seconds to wait for the GPS server before giving up"),
+    ] = 10.0,
+    latitude: Annotated[
+        float | None,
+        typer.Option("--latitude", help="Manual latitude override; takes precedence over --gps-url"),
+    ] = None,
+    longitude: Annotated[
+        float | None,
+        typer.Option("--longitude", help="Manual longitude override; takes precedence over --gps-url"),
+    ] = None,
 ) -> None:
     """Capture live IQ from an SDRplay device via SoapySDR and immediately
     survey it -- one command instead of a separate recorder plus `survey run`.
@@ -191,16 +400,22 @@ def survey_capture(
         console.print(f"[bold red]SoapySDR device unavailable:[/bold red] {probe.probe_error}")
         raise typer.Exit(code=1)
 
+    if (latitude is None) != (longitude is None):
+        console.print("[bold red]--latitude and --longitude must be given together[/bold red]")
+        raise typer.Exit(code=1)
+
     try:
         capture_settings = CaptureSettings(
             center_frequency_hz=center_frequency,
             sample_rate_hz=sample_rate,
             duration_seconds=duration,
-            gain_db=gain,
+            if_gain_reduction_db=if_gr,
+            lna_state=lna_state,
             agc=agc,
             antenna=antenna,
             driver=driver,
             write_auxi=write_auxi,
+            bandwidth_hz=bandwidth,
         )
     except ValueError as exc:
         console.print(f"[bold red]Invalid capture settings:[/bold red] {exc}")
@@ -208,19 +423,52 @@ def survey_capture(
 
     resolved_survey_output = survey_output or (output / "survey")
     try:
-        result = run_capture_and_survey(
-            output,
-            resolved_survey_output,
-            capture=capture_settings,
-            band=band,
-            site=site,
-            run_id=run_id,
-            database_path=database,
-            assumed_iq_order=iq_order,
-            compute_source_hash=hash_source,
-        )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]Capturing[/bold]"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task_id = progress.add_task("capture", total=1000)
+
+            def report(frames: int, target: int, _elapsed: float) -> None:
+                progress.update(task_id, completed=min(1000, round(1000 * frames / max(target, 1))))
+
+            result = run_capture_and_survey(
+                output,
+                resolved_survey_output,
+                capture=capture_settings,
+                band=band,
+                site=site,
+                run_id=run_id,
+                database_path=database,
+                assumed_iq_order=iq_order,
+                compute_source_hash=hash_source,
+                gps_url=gps_url,
+                gps_timeout_seconds=gps_timeout,
+                gps_latitude=latitude,
+                gps_longitude=longitude,
+                on_progress=report,
+                site_id_override=site_id,
+            )
     except (FileNotFoundError, OSError, ValueError, ProfileError, RuntimeError) as exc:
         console.print(f"[bold red]Capture/survey failed:[/bold red] {exc}")
+        # A capture that dies mid-stream still leaves a valid, closed WAV
+        # behind. Say so: without this the operator has no way to know a
+        # salvageable recording is sitting on disk, and a usable field
+        # capture gets thrown away as a failed run.
+        salvage = sorted(
+            output.glob("SDRconnect_IQ_*.wav"), key=lambda path: path.stat().st_mtime, reverse=True
+        )
+        if salvage:
+            console.print(
+                f"[yellow]A partial recording was still written:[/yellow] {salvage[0]}\n"
+                "It is a valid WAV. Analyze it with:\n"
+                f"  dmr-surveyor survey run {salvage[0]} --band {band} --site {site}"
+            )
         raise typer.Exit(code=1) from exc
 
     table = Table(title="Live capture + RF survey")
@@ -232,8 +480,28 @@ def survey_capture(
         f"{result['capture']['actual_duration_seconds']:.3f} s "
         f"(requested {result['capture']['requested_duration_seconds']:.3f} s)",
     )
+    overflows = result["capture"].get("overflow_count", 0)
+    if overflows:
+        table.add_row(
+            "[yellow]Dropped buffers[/yellow]",
+            f"[yellow]{overflows}[/yellow] -- storage or CPU could not keep up; the recording "
+            "has gaps. Lower --sample-rate or use faster storage.",
+        )
+    applied = result["capture"].get("device_settings_applied") or {}
+    if applied.get("gains"):
+        table.add_row(
+            "Gain applied",
+            ", ".join(f"{name}={value:g}" for name, value in sorted(applied["gains"].items())),
+        )
     table.add_row("Survey run ID", str(result["survey"]["run_id"]))
     table.add_row("Observations", str(result["survey"]["observation_count"]))
+    gps = result["gps"]
+    if gps["latitude"] is not None:
+        table.add_row("GPS", f"{gps['latitude']:.6f}, {gps['longitude']:.6f} (source: {gps['source']})")
+    elif gps["source"] == "fetch_failed":
+        table.add_row("GPS", f"[yellow]fetch failed:[/yellow] {gps['error']}")
+    else:
+        table.add_row("GPS", "not configured")
     console.print(table)
     console.print(f"[green]Recording written to:[/green] {result['capture']['wav_path']}")
     console.print(f"[green]Survey artifacts written to:[/green] {result['survey']['output_dir']}")

@@ -71,7 +71,13 @@ CREATE TABLE IF NOT EXISTS survey_runs (
     tool_version TEXT NOT NULL,
     settings_json TEXT NOT NULL DEFAULT '{}',
     imported_at TEXT NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    gps_latitude REAL,
+    gps_longitude REAL,
+    gps_altitude_m REAL,
+    gps_accuracy_m REAL,
+    gps_source TEXT NOT NULL DEFAULT 'unknown',
+    gps_fetched_at_utc TEXT
 );
 CREATE TABLE IF NOT EXISTS rf_frequencies (
     rf_frequency_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,11 +146,29 @@ _SURVEY_TABLES = (
 )
 
 
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
 def connect_survey_database(path: str | Path) -> sqlite3.Connection:
     """Open (creating if needed) the shared inventory database and ensure
     the survey tables exist. Never touches the pre-existing DMR tables."""
     connection = connect_database(path)
     connection.executescript(SURVEY_SCHEMA)
+    # A pre-existing survey_runs table (created before GPS support was
+    # added) needs these columns added in place -- CREATE TABLE IF NOT
+    # EXISTS above is a no-op on an already-created table.
+    for column, declaration in (
+        ("gps_latitude", "REAL"),
+        ("gps_longitude", "REAL"),
+        ("gps_altitude_m", "REAL"),
+        ("gps_accuracy_m", "REAL"),
+        ("gps_source", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("gps_fetched_at_utc", "TEXT"),
+    ):
+        _ensure_column(connection, "survey_runs", column, declaration)
     connection.commit()
     return connection
 
@@ -307,6 +331,12 @@ class SurveyRunRecord:
     tool_version: str
     status: str = "ok"
     settings: dict[str, Any] | None = None
+    gps_latitude: float | None = None
+    gps_longitude: float | None = None
+    gps_altitude_m: float | None = None
+    gps_accuracy_m: float | None = None
+    gps_source: str = "unknown"
+    gps_fetched_at_utc: str | None = None
 
 
 def import_survey_run(
@@ -343,8 +373,10 @@ def import_survey_run(
             requested_stop_hz, usable_low_hz, usable_high_hz, coverage_status,
             duration_seconds, analyzed_seconds, segment_count,
             occupancy_threshold_db, detection_settings_json, tool_version,
-            settings_json, imported_at, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            settings_json, imported_at, status,
+            gps_latitude, gps_longitude, gps_altitude_m, gps_accuracy_m,
+            gps_source, gps_fetched_at_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run.survey_run_id,
@@ -371,6 +403,12 @@ def import_survey_run(
             json.dumps(run.settings or {}, sort_keys=True),
             datetime.now(UTC).isoformat(),
             run.status,
+            run.gps_latitude,
+            run.gps_longitude,
+            run.gps_altitude_m,
+            run.gps_accuracy_m,
+            run.gps_source,
+            run.gps_fetched_at_utc,
         ),
     )
 

@@ -27,7 +27,7 @@ def test_device_settings_accepts_manual_gain_with_agc_off() -> None:
         sample_rate_hz=10_000_000.0,
         center_frequency_hz=868_000_000.0,
         agc=False,
-        gain_db=30.0,
+        if_gain_reduction_db=30.0,
     )
     settings.validate()  # must not raise
 
@@ -37,7 +37,7 @@ def test_device_settings_accepts_agc_with_no_gain() -> None:
         sample_rate_hz=10_000_000.0,
         center_frequency_hz=868_000_000.0,
         agc=True,
-        gain_db=None,
+        if_gain_reduction_db=None,
     )
     settings.validate()  # must not raise
 
@@ -47,7 +47,7 @@ def test_device_settings_rejects_agc_and_gain_together() -> None:
         sample_rate_hz=10_000_000.0,
         center_frequency_hz=868_000_000.0,
         agc=True,
-        gain_db=30.0,
+        if_gain_reduction_db=30.0,
     )
     with pytest.raises(ValueError):
         settings.validate()
@@ -58,7 +58,7 @@ def test_device_settings_requires_gain_when_agc_off() -> None:
         sample_rate_hz=10_000_000.0,
         center_frequency_hz=868_000_000.0,
         agc=False,
-        gain_db=None,
+        if_gain_reduction_db=None,
     )
     with pytest.raises(ValueError):
         settings.validate()

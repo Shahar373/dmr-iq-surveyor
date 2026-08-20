@@ -15,6 +15,7 @@ import platform
 import resource
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,11 +25,19 @@ import numpy as np
 
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.device import DeviceSettings, IqDevice, SoapyIqDevice
+from dmr_iq_surveyor.capture.gps import resolve_gps
 from dmr_iq_surveyor.capture.wav_writer import WaveIQWriter, WaveIQWriterSettings
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_survey
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
 
 _DEFAULT_CHUNK_FRAMES = 262_144
+
+# A capture that has run this many times longer than the requested duration
+# is not going to recover. Bounding it means a field operator gets a short
+# recording plus a clear explanation instead of a terminal that never
+# returns.
+_DEFAULT_TIMEOUT_FACTOR = 3.0
+_TIMEOUT_GRACE_SECONDS = 30.0
 
 
 def _peak_rss_bytes() -> int:
@@ -41,13 +50,18 @@ class CaptureSettings:
     center_frequency_hz: float
     sample_rate_hz: float
     duration_seconds: float
-    gain_db: float | None = None
+    # SDRplay's own units, so a setting is reproducible and comparable to
+    # SDRplay-native tooling: IF gain *reduction* in dB, and an LNA state
+    # index. Both are reductions -- higher means less sensitive.
+    if_gain_reduction_db: float | None = None
+    lna_state: int | None = None
     agc: bool = False
     antenna: str | None = None
     driver: str = "sdrplay"
     channel: int = 0
     chunk_frames: int = _DEFAULT_CHUNK_FRAMES
     write_auxi: bool = True
+    bandwidth_hz: float | None = None
 
     def validate(self) -> None:
         if self.center_frequency_hz <= 0:
@@ -58,20 +72,25 @@ class CaptureSettings:
             raise ValueError("duration_seconds must be positive")
         if self.chunk_frames <= 0:
             raise ValueError("chunk_frames must be positive")
-        if self.agc and self.gain_db is not None:
-            raise ValueError("gain_db must not be set when agc is enabled")
-        if not self.agc and self.gain_db is None:
-            raise ValueError("gain_db is required when agc is disabled (AGC off requires a manual gain)")
+        if self.agc and self.if_gain_reduction_db is not None:
+            raise ValueError("if_gain_reduction_db must not be set when agc is enabled")
+        if not self.agc and self.if_gain_reduction_db is None:
+            raise ValueError(
+                "if_gain_reduction_db is required when agc is disabled "
+                "(AGC off requires a manual IF gain reduction)"
+            )
 
     def to_device_settings(self) -> DeviceSettings:
         return DeviceSettings(
             driver=self.driver,
             sample_rate_hz=self.sample_rate_hz,
             center_frequency_hz=self.center_frequency_hz,
-            gain_db=self.gain_db,
+            if_gain_reduction_db=self.if_gain_reduction_db,
+            lna_state=self.lna_state,
             agc=self.agc,
             antenna=self.antenna,
             channel=self.channel,
+            bandwidth_hz=self.bandwidth_hz,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -97,6 +116,8 @@ def run_capture(
     settings: CaptureSettings,
     device: IqDevice | None = None,
     filename: str | None = None,
+    on_progress: Callable[[int, int, float], None] | None = None,
+    timeout_factor: float = _DEFAULT_TIMEOUT_FACTOR,
 ) -> dict[str, Any]:
     """Capture `settings.duration_seconds` of IQ into a new WAV file under
     `output_dir` and return a manifest describing it.
@@ -106,6 +127,16 @@ def run_capture(
     this project's `iq/reader.py` streaming discipline applied to writing.
     `device` defaults to a real `SoapyIqDevice`; tests pass a synthetic stub
     implementing the same `IqDevice` interface instead.
+
+    `on_progress(frames_written, target_frames, elapsed_seconds)` is called
+    as the capture advances, so an operator watching a field capture sees it
+    moving instead of a blank terminal.
+
+    A wall-clock deadline of `timeout_factor` x the requested duration (plus
+    a fixed grace period) bounds the run. A device that delivers samples far
+    slower than real time -- or not at all, without raising -- ends the
+    capture early with whatever was recorded, flagged `timed_out` in the
+    manifest, rather than hanging indefinitely in the field.
     """
     started = time.time()
     settings.validate()
@@ -125,9 +156,15 @@ def run_capture(
         center_frequency_hz=round(settings.center_frequency_hz),
         write_auxi=settings.write_auxi,
     )
+    deadline = started + settings.duration_seconds * timeout_factor + _TIMEOUT_GRACE_SECONDS
+    timed_out = False
+    device_close_error: str | None = None
     writer = WaveIQWriter(wav_path, writer_settings)
     try:
         while writer.frame_count < target_frame_count:
+            if time.time() > deadline:
+                timed_out = True
+                break
             remaining = target_frame_count - writer.frame_count
             chunk = resolved_device.read_stream_chunk(min(settings.chunk_frames, remaining))
             chunk = np.asarray(chunk)
@@ -136,9 +173,18 @@ def run_capture(
             if chunk.size > remaining:
                 chunk = chunk[:remaining]
             writer.write_frames(chunk)
+            if on_progress is not None:
+                on_progress(writer.frame_count, target_frame_count, time.time() - started)
     finally:
-        resolved_device.close()
+        # Close the writer FIRST. It is what patches the ds64 chunk with the
+        # real data size; until that runs the file declares a data size of
+        # zero and inspect_wave_iq() reads it as empty. If closing the device
+        # raised before this, a complete recording would be unreadable.
         writer_summary = writer.close()
+        try:
+            resolved_device.close()
+        except Exception as exc:  # noqa: BLE001 -- never lose a recording over teardown
+            device_close_error = f"{type(exc).__name__}: {exc}"
 
     elapsed = time.time() - started
     manifest = {
@@ -150,6 +196,14 @@ def run_capture(
         "requested_frame_count": target_frame_count,
         "requested_duration_seconds": settings.duration_seconds,
         "actual_duration_seconds": writer_summary["frame_count"] / settings.sample_rate_hz,
+        "complete": writer_summary["frame_count"] >= target_frame_count,
+        "timed_out": timed_out,
+        # Each overflow means the driver discarded its FIFO because
+        # something downstream stalled: the recording has a gap there, so
+        # actual_duration_seconds understates the wall-clock span covered.
+        "overflow_count": getattr(resolved_device, "overflow_count", 0),
+        "device_settings_applied": getattr(resolved_device, "applied_settings", {}),
+        "device_close_error": device_close_error,
         "start_utc": writer_summary["start_utc"],
         "stop_utc": writer_summary["stop_utc"],
         "elapsed_seconds": elapsed,
@@ -177,15 +231,40 @@ def run_capture_and_survey(
     compute_source_hash: bool = False,
     spectrum_fft_size: int = 65_536,
     spectrum_overlap_ratio: float = 0.5,
+    gps_url: str | None = None,
+    gps_timeout_seconds: float = 10.0,
+    gps_latitude: float | None = None,
+    gps_longitude: float | None = None,
+    on_progress: Callable[[int, int, float], None] | None = None,
+    site_id_override: str | None = None,
+    site_label_override: str | None = None,
 ) -> dict[str, Any]:
     """Capture live IQ and immediately run the existing `survey run` pipeline
     on the result -- the single command this module was built for. Reuses
-    `survey.pipeline.run_survey()` unchanged."""
+    `survey.pipeline.run_survey()` unchanged.
+
+    GPS is optional and never blocks the capture. `gps_latitude`/
+    `gps_longitude` (a manual override) take precedence over `gps_url` (a
+    live fetch from a phone-hosted HTTP server, see `capture/gps.py`); if
+    neither is given, or the fetch fails, the run is still stored with
+    `gps_source` recording exactly why coordinates are absent rather than
+    silently omitting them.
+    """
+    # Fetched before the capture starts, so the coordinates describe where
+    # the recording was made rather than where it happened to finish.
+    gps_info = resolve_gps(
+        gps_url=gps_url,
+        gps_timeout_seconds=gps_timeout_seconds,
+        latitude=gps_latitude,
+        longitude=gps_longitude,
+    )
+
     capture_manifest = run_capture(
         recording_output_dir,
         settings=capture,
         device=device,
         filename=filename,
+        on_progress=on_progress,
     )
     survey_result = run_survey(
         capture_manifest["wav_path"],
@@ -198,8 +277,16 @@ def run_capture_and_survey(
         compute_source_hash=compute_source_hash,
         spectrum_fft_size=spectrum_fft_size,
         spectrum_overlap_ratio=spectrum_overlap_ratio,
+        gps_latitude=gps_info["latitude"],
+        gps_longitude=gps_info["longitude"],
+        gps_altitude_m=gps_info["altitude_m"],
+        gps_accuracy_m=gps_info["accuracy_m"],
+        gps_source=gps_info["source"],
+        gps_fetched_at_utc=gps_info["fetched_at_utc"],
+        site_id_override=site_id_override,
+        site_label_override=site_label_override,
     )
-    return {"capture": capture_manifest, "survey": survey_result}
+    return {"capture": capture_manifest, "survey": survey_result, "gps": gps_info}
 
 
 __all__ = [
