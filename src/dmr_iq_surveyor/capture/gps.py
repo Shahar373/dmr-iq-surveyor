@@ -79,4 +79,49 @@ def fetch_gps_fix(url: str, *, timeout_seconds: float = 10.0) -> GpsFix:
     )
 
 
-__all__ = ["GPS_SOURCE_PHONE", "GpsFix", "GpsFixError", "fetch_gps_fix"]
+def resolve_gps(
+    *,
+    gps_url: str | None = None,
+    gps_timeout_seconds: float = 10.0,
+    latitude: float | None = None,
+    longitude: float | None = None,
+) -> dict[str, Any]:
+    """Resolve coordinates for one run, never raising.
+
+    Precedence: an explicit `latitude`/`longitude` pair wins over a live
+    `gps_url` fetch. The returned `source` always says exactly why
+    coordinates are or aren't present -- `user`, `phone_gps`,
+    `fetch_failed` (with `error` set) or `not_configured` -- so a caller can
+    record the reason instead of storing a bare NULL.
+    """
+    resolved: dict[str, Any] = {
+        "source": "not_configured",
+        "latitude": None,
+        "longitude": None,
+        "altitude_m": None,
+        "accuracy_m": None,
+        "fetched_at_utc": None,
+        "error": None,
+    }
+    if latitude is not None and longitude is not None:
+        resolved.update(source="user", latitude=latitude, longitude=longitude)
+        return resolved
+    if not gps_url:
+        return resolved
+    try:
+        fix = fetch_gps_fix(gps_url, timeout_seconds=gps_timeout_seconds)
+    except GpsFixError as exc:
+        resolved.update(source="fetch_failed", error=str(exc))
+        return resolved
+    resolved.update(
+        source=GPS_SOURCE_PHONE,
+        latitude=fix.latitude,
+        longitude=fix.longitude,
+        altitude_m=fix.altitude_m,
+        accuracy_m=fix.accuracy_m,
+        fetched_at_utc=fix.fetched_at_utc,
+    )
+    return resolved
+
+
+__all__ = ["GPS_SOURCE_PHONE", "GpsFix", "GpsFixError", "fetch_gps_fix", "resolve_gps"]

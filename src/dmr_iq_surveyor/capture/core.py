@@ -24,7 +24,7 @@ import numpy as np
 
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.device import DeviceSettings, IqDevice, SoapyIqDevice
-from dmr_iq_surveyor.capture.gps import GPS_SOURCE_PHONE, GpsFixError, fetch_gps_fix
+from dmr_iq_surveyor.capture.gps import resolve_gps
 from dmr_iq_surveyor.capture.wav_writer import WaveIQWriter, WaveIQWriterSettings
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_survey
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
@@ -194,33 +194,14 @@ def run_capture_and_survey(
     `gps_source` recording exactly why coordinates are absent rather than
     silently omitting them.
     """
-    gps_info: dict[str, Any] = {
-        "source": "unknown",
-        "latitude": None,
-        "longitude": None,
-        "altitude_m": None,
-        "accuracy_m": None,
-        "fetched_at_utc": None,
-        "error": None,
-    }
-    if gps_latitude is not None and gps_longitude is not None:
-        gps_info.update(source="user", latitude=gps_latitude, longitude=gps_longitude)
-    elif gps_url:
-        try:
-            fix = fetch_gps_fix(gps_url, timeout_seconds=gps_timeout_seconds)
-        except GpsFixError as exc:
-            gps_info.update(source="fetch_failed", error=str(exc))
-        else:
-            gps_info.update(
-                source=GPS_SOURCE_PHONE,
-                latitude=fix.latitude,
-                longitude=fix.longitude,
-                altitude_m=fix.altitude_m,
-                accuracy_m=fix.accuracy_m,
-                fetched_at_utc=fix.fetched_at_utc,
-            )
-    else:
-        gps_info["source"] = "not_configured"
+    # Fetched before the capture starts, so the coordinates describe where
+    # the recording was made rather than where it happened to finish.
+    gps_info = resolve_gps(
+        gps_url=gps_url,
+        gps_timeout_seconds=gps_timeout_seconds,
+        latitude=gps_latitude,
+        longitude=gps_longitude,
+    )
 
     capture_manifest = run_capture(
         recording_output_dir,
