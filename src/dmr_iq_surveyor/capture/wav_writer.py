@@ -50,7 +50,8 @@ _FMT_PAYLOAD_SIZE = 16
 _DS64_PAYLOAD_SIZE = 28
 _AUXI_PAYLOAD_SIZE = 164
 _U32_MAX = 0xFFFFFFFF
-_PCM16_FULL_SCALE = 32767.0
+_PCM16_FULL_SCALE = 32767.0  # largest representable magnitude, reported in auxi.max_value
+_PCM16_SCALE = 32768.0  # float<->int16 scale factor; matches the driver's own 1/32768
 
 
 def _system_time(moment: datetime) -> tuple[int, ...]:
@@ -179,8 +180,14 @@ class WaveIQWriter:
         capture at once (see `capture/core.py::run_capture`)."""
         if iq.size == 0:
             return
-        i_values = np.clip(np.real(iq) * _PCM16_FULL_SCALE, -32768, 32767).astype("<i2")
-        q_values = np.clip(np.imag(iq) * _PCM16_FULL_SCALE, -32768, 32767).astype("<i2")
+        # Round, do not truncate, and scale by 2**15 rather than 2**15 - 1.
+        # SoapySDRPlay3 produces CF32 as `adc_value / 32768.0`, so this pair
+        # of choices makes the round-trip exact. Truncating toward zero
+        # instead cost every non-zero sample 1 LSB of magnitude and mapped
+        # ADC values of +/-1 to 0 -- a deadband right at the noise floor,
+        # in a tool built to find weak carriers.
+        i_values = np.clip(np.rint(np.real(iq) * _PCM16_SCALE), -32768, 32767).astype("<i2")
+        q_values = np.clip(np.rint(np.imag(iq) * _PCM16_SCALE), -32768, 32767).astype("<i2")
         interleaved = np.empty(iq.size * 2, dtype="<i2")
         interleaved[0::2] = i_values
         interleaved[1::2] = q_values

@@ -50,13 +50,18 @@ class CaptureSettings:
     center_frequency_hz: float
     sample_rate_hz: float
     duration_seconds: float
-    gain_db: float | None = None
+    # SDRplay's own units, so a setting is reproducible and comparable to
+    # SDRplay-native tooling: IF gain *reduction* in dB, and an LNA state
+    # index. Both are reductions -- higher means less sensitive.
+    if_gain_reduction_db: float | None = None
+    lna_state: int | None = None
     agc: bool = False
     antenna: str | None = None
     driver: str = "sdrplay"
     channel: int = 0
     chunk_frames: int = _DEFAULT_CHUNK_FRAMES
     write_auxi: bool = True
+    bandwidth_hz: float | None = None
 
     def validate(self) -> None:
         if self.center_frequency_hz <= 0:
@@ -67,20 +72,25 @@ class CaptureSettings:
             raise ValueError("duration_seconds must be positive")
         if self.chunk_frames <= 0:
             raise ValueError("chunk_frames must be positive")
-        if self.agc and self.gain_db is not None:
-            raise ValueError("gain_db must not be set when agc is enabled")
-        if not self.agc and self.gain_db is None:
-            raise ValueError("gain_db is required when agc is disabled (AGC off requires a manual gain)")
+        if self.agc and self.if_gain_reduction_db is not None:
+            raise ValueError("if_gain_reduction_db must not be set when agc is enabled")
+        if not self.agc and self.if_gain_reduction_db is None:
+            raise ValueError(
+                "if_gain_reduction_db is required when agc is disabled "
+                "(AGC off requires a manual IF gain reduction)"
+            )
 
     def to_device_settings(self) -> DeviceSettings:
         return DeviceSettings(
             driver=self.driver,
             sample_rate_hz=self.sample_rate_hz,
             center_frequency_hz=self.center_frequency_hz,
-            gain_db=self.gain_db,
+            if_gain_reduction_db=self.if_gain_reduction_db,
+            lna_state=self.lna_state,
             agc=self.agc,
             antenna=self.antenna,
             channel=self.channel,
+            bandwidth_hz=self.bandwidth_hz,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -148,6 +158,7 @@ def run_capture(
     )
     deadline = started + settings.duration_seconds * timeout_factor + _TIMEOUT_GRACE_SECONDS
     timed_out = False
+    device_close_error: str | None = None
     writer = WaveIQWriter(wav_path, writer_settings)
     try:
         while writer.frame_count < target_frame_count:
@@ -165,8 +176,15 @@ def run_capture(
             if on_progress is not None:
                 on_progress(writer.frame_count, target_frame_count, time.time() - started)
     finally:
-        resolved_device.close()
+        # Close the writer FIRST. It is what patches the ds64 chunk with the
+        # real data size; until that runs the file declares a data size of
+        # zero and inspect_wave_iq() reads it as empty. If closing the device
+        # raised before this, a complete recording would be unreadable.
         writer_summary = writer.close()
+        try:
+            resolved_device.close()
+        except Exception as exc:  # noqa: BLE001 -- never lose a recording over teardown
+            device_close_error = f"{type(exc).__name__}: {exc}"
 
     elapsed = time.time() - started
     manifest = {
@@ -180,6 +198,12 @@ def run_capture(
         "actual_duration_seconds": writer_summary["frame_count"] / settings.sample_rate_hz,
         "complete": writer_summary["frame_count"] >= target_frame_count,
         "timed_out": timed_out,
+        # Each overflow means the driver discarded its FIFO because
+        # something downstream stalled: the recording has a gap there, so
+        # actual_duration_seconds understates the wall-clock span covered.
+        "overflow_count": getattr(resolved_device, "overflow_count", 0),
+        "device_settings_applied": getattr(resolved_device, "applied_settings", {}),
+        "device_close_error": device_close_error,
         "start_utc": writer_summary["start_utc"],
         "stop_utc": writer_summary["stop_utc"],
         "elapsed_seconds": elapsed,
@@ -212,6 +236,8 @@ def run_capture_and_survey(
     gps_latitude: float | None = None,
     gps_longitude: float | None = None,
     on_progress: Callable[[int, int, float], None] | None = None,
+    site_id_override: str | None = None,
+    site_label_override: str | None = None,
 ) -> dict[str, Any]:
     """Capture live IQ and immediately run the existing `survey run` pipeline
     on the result -- the single command this module was built for. Reuses
@@ -257,6 +283,8 @@ def run_capture_and_survey(
         gps_accuracy_m=gps_info["accuracy_m"],
         gps_source=gps_info["source"],
         gps_fetched_at_utc=gps_info["fetched_at_utc"],
+        site_id_override=site_id_override,
+        site_label_override=site_label_override,
     )
     return {"capture": capture_manifest, "survey": survey_result, "gps": gps_info}
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import resource
 import sys
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,8 @@ def run_survey(
     gps_accuracy_m: float | None = None,
     gps_source: str = "unknown",
     gps_fetched_at_utc: str | None = None,
+    site_id_override: str | None = None,
+    site_label_override: str | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     log = SurveyLog()
@@ -106,6 +109,18 @@ def run_survey(
     site_profile = (
         site if isinstance(site, SiteProfile) else resolve_site_profile(site, base_dir=profile_base_dir)
     )
+    # One profile describes the equipment; a mobile session visits several
+    # places with that same equipment. Overriding the id keeps each stop a
+    # distinct site, which matters because `survey compare` treats runs from
+    # one site_id as the same place and would otherwise report every signal
+    # that differs between two locations as NEW or MISSING_THIS_RUN.
+    if site_id_override or site_label_override:
+        site_profile = replace(
+            site_profile,
+            site_id=site_id_override or site_profile.site_id,
+            label=site_label_override or (site_id_override or site_profile.label),
+        )
+        site_profile.validate()
     log.info(f"resolved band profile {band_profile.name!r}, site profile {site_profile.site_id!r}")
     if not site_profile.is_gain_comparable:
         log.warning(

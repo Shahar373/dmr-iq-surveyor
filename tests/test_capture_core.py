@@ -109,7 +109,7 @@ def test_sdrconnect_style_filename_matches_discovery_fallback_pattern(tmp_path: 
         center_frequency_hz=CENTER_HZ,
         sample_rate_hz=SAMPLE_RATE_HZ,
         duration_seconds=0.05,
-        gain_db=20.0,
+        if_gain_reduction_db=20.0,
         write_auxi=False,
     )
     manifest = run_capture(tmp_path, settings=settings, device=device, filename=name)
@@ -125,7 +125,7 @@ def test_capture_settings_rejects_agc_and_gain_together() -> None:
         sample_rate_hz=SAMPLE_RATE_HZ,
         duration_seconds=1.0,
         agc=True,
-        gain_db=10.0,
+        if_gain_reduction_db=10.0,
     )
     with pytest.raises(ValueError):
         settings.validate()
@@ -137,7 +137,7 @@ def test_capture_settings_requires_gain_when_agc_off() -> None:
         sample_rate_hz=SAMPLE_RATE_HZ,
         duration_seconds=1.0,
         agc=False,
-        gain_db=None,
+        if_gain_reduction_db=None,
     )
     with pytest.raises(ValueError):
         settings.validate()
@@ -149,7 +149,7 @@ def test_run_capture_writes_wav_that_round_trips(tmp_path: Path) -> None:
         center_frequency_hz=CENTER_HZ,
         sample_rate_hz=SAMPLE_RATE_HZ,
         duration_seconds=0.5,
-        gain_db=30.0,
+        if_gain_reduction_db=30.0,
         agc=False,
         chunk_frames=8192,
     )
@@ -171,7 +171,7 @@ def test_run_capture_writes_wav_that_round_trips(tmp_path: Path) -> None:
     assert device.closed is True
     assert device.opened_with is not None
     assert device.opened_with.agc is False
-    assert device.opened_with.gain_db == 30.0
+    assert device.opened_with.if_gain_reduction_db == 30.0
     assert device.opened_with.sample_rate_hz == SAMPLE_RATE_HZ
     assert device.opened_with.center_frequency_hz == CENTER_HZ
     assert device.opened_with.driver == "sdrplay"
@@ -180,7 +180,7 @@ def test_run_capture_writes_wav_that_round_trips(tmp_path: Path) -> None:
     assert report_path.is_file()
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["frame_count"] == expected_frames
-    assert report["settings"]["gain_db"] == 30.0
+    assert report["settings"]["if_gain_reduction_db"] == 30.0
     assert report["settings"]["agc"] is False
 
     info = inspect_wave_iq(wav_path)
@@ -203,12 +203,12 @@ def test_run_capture_passes_agc_through_to_device(tmp_path: Path) -> None:
         sample_rate_hz=SAMPLE_RATE_HZ,
         duration_seconds=0.1,
         agc=True,
-        gain_db=None,
+        if_gain_reduction_db=None,
     )
     run_capture(tmp_path, settings=settings, device=device)
     assert device.opened_with is not None
     assert device.opened_with.agc is True
-    assert device.opened_with.gain_db is None
+    assert device.opened_with.if_gain_reduction_db is None
 
 
 def test_run_capture_trims_overshoot_to_requested_duration(tmp_path: Path) -> None:
@@ -220,7 +220,7 @@ def test_run_capture_trims_overshoot_to_requested_duration(tmp_path: Path) -> No
         center_frequency_hz=CENTER_HZ,
         sample_rate_hz=SAMPLE_RATE_HZ,
         duration_seconds=0.05,
-        gain_db=20.0,
+        if_gain_reduction_db=20.0,
         chunk_frames=100_000,  # far larger than the ~10k frames requested
     )
     manifest = run_capture(tmp_path, settings=settings, device=device)
@@ -238,7 +238,7 @@ def test_run_capture_and_survey_detects_injected_tone(tmp_path: Path) -> None:
         center_frequency_hz=CENTER_HZ,
         sample_rate_hz=SAMPLE_RATE_HZ,
         duration_seconds=6.0,
-        gain_db=30.0,
+        if_gain_reduction_db=30.0,
         agc=False,
     )
     result = run_capture_and_survey(
@@ -281,7 +281,7 @@ def test_stalled_device_hits_the_deadline_instead_of_hanging(tmp_path: Path) -> 
         center_frequency_hz=CENTER_HZ,
         sample_rate_hz=SAMPLE_RATE_HZ,
         duration_seconds=0.5,
-        gain_db=20.0,
+        if_gain_reduction_db=20.0,
     )
     started = time.monotonic()
     manifest = run_capture(
@@ -310,7 +310,7 @@ def test_progress_callback_reports_monotonic_advance(tmp_path: Path) -> None:
         center_frequency_hz=CENTER_HZ,
         sample_rate_hz=SAMPLE_RATE_HZ,
         duration_seconds=0.5,
-        gain_db=20.0,
+        if_gain_reduction_db=20.0,
         chunk_frames=8192,
     )
     run_capture(
@@ -329,7 +329,7 @@ def test_completed_capture_is_marked_complete_and_not_timed_out(tmp_path: Path) 
         center_frequency_hz=CENTER_HZ,
         sample_rate_hz=SAMPLE_RATE_HZ,
         duration_seconds=0.2,
-        gain_db=20.0,
+        if_gain_reduction_db=20.0,
     )
     manifest = run_capture(tmp_path, settings=settings, device=FakeIqDevice())
     assert manifest["complete"] is True
@@ -362,7 +362,7 @@ def gps_server() -> Iterator[str]:
 def test_run_capture_and_survey_fetches_gps_from_url(tmp_path: Path, gps_server: str) -> None:
     device = FakeIqDevice()
     settings = CaptureSettings(
-        center_frequency_hz=CENTER_HZ, sample_rate_hz=SAMPLE_RATE_HZ, duration_seconds=0.2, gain_db=20.0
+        center_frequency_hz=CENTER_HZ, sample_rate_hz=SAMPLE_RATE_HZ, duration_seconds=0.2, if_gain_reduction_db=20.0
     )
     result = run_capture_and_survey(
         tmp_path / "recording",
@@ -391,7 +391,7 @@ def test_run_capture_and_survey_fetches_gps_from_url(tmp_path: Path, gps_server:
 def test_run_capture_and_survey_manual_gps_override_skips_fetch(tmp_path: Path, gps_server: str) -> None:
     device = FakeIqDevice()
     settings = CaptureSettings(
-        center_frequency_hz=CENTER_HZ, sample_rate_hz=SAMPLE_RATE_HZ, duration_seconds=0.2, gain_db=20.0
+        center_frequency_hz=CENTER_HZ, sample_rate_hz=SAMPLE_RATE_HZ, duration_seconds=0.2, if_gain_reduction_db=20.0
     )
     result = run_capture_and_survey(
         tmp_path / "recording",
@@ -417,7 +417,7 @@ def test_run_capture_and_survey_gps_fetch_failure_does_not_block_capture(tmp_pat
     the RF capture and survey from completing."""
     device = FakeIqDevice()
     settings = CaptureSettings(
-        center_frequency_hz=CENTER_HZ, sample_rate_hz=SAMPLE_RATE_HZ, duration_seconds=0.2, gain_db=20.0
+        center_frequency_hz=CENTER_HZ, sample_rate_hz=SAMPLE_RATE_HZ, duration_seconds=0.2, if_gain_reduction_db=20.0
     )
     result = run_capture_and_survey(
         tmp_path / "recording",

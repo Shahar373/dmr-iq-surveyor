@@ -80,6 +80,16 @@ def survey_run(
         float,
         typer.Option(help="FFT overlap ratio for segmented spectrum analysis"),
     ] = 0.5,
+    site_id: Annotated[
+        str | None,
+        typer.Option(
+            "--site-id",
+            help=(
+                "Override the profile's site_id for this run. Use one profile "
+                "(same equipment) across a mobile session and give each stop its own id"
+            ),
+        ),
+    ] = None,
     gps_url: Annotated[
         str | None,
         typer.Option(
@@ -136,6 +146,7 @@ def survey_run(
             gps_accuracy_m=gps["accuracy_m"],
             gps_source=gps["source"],
             gps_fetched_at_utc=gps["fetched_at_utc"],
+            site_id_override=site_id,
         )
     except (FileNotFoundError, OSError, ValueError, ProfileError) as exc:
         console.print(f"[bold red]Survey run failed:[/bold red] {exc}")
@@ -278,13 +289,33 @@ def survey_capture(
         float,
         typer.Option(help="Capture duration in seconds"),
     ] = 90.0,
-    gain: Annotated[
+    if_gr: Annotated[
         float | None,
-        typer.Option(help="Manual gain reduction in dB; required unless --agc"),
+        typer.Option(
+            "--if-gr",
+            help=(
+                "IF gain REDUCTION in dB (SDRplay units, typically 20-59; higher = less "
+                "sensitive). Required unless --agc"
+            ),
+        ),
+    ] = None,
+    lna_state: Annotated[
+        int | None,
+        typer.Option(
+            "--lna-state",
+            help="LNA state index (0-9 on an RSP1B; higher = less sensitive). Applies with or without AGC",
+        ),
+    ] = None,
+    bandwidth: Annotated[
+        float | None,
+        typer.Option(
+            "--bandwidth",
+            help="IF filter bandwidth in Hz. Defaults to the driver's choice for the sample rate",
+        ),
     ] = None,
     agc: Annotated[
         bool,
-        typer.Option("--agc/--no-agc", help="Enable SDR AGC (mutually exclusive with --gain)"),
+        typer.Option("--agc/--no-agc", help="Enable SDR AGC (mutually exclusive with --if-gr)"),
     ] = False,
     antenna: Annotated[
         str | None,
@@ -324,6 +355,16 @@ def survey_capture(
             help="Write an SDRplay-style auxi metadata chunk (else rely on the SDRconnect filename fallback)",
         ),
     ] = True,
+    site_id: Annotated[
+        str | None,
+        typer.Option(
+            "--site-id",
+            help=(
+                "Override the profile's site_id for this run. Use one profile "
+                "(same equipment) across a mobile session and give each stop its own id"
+            ),
+        ),
+    ] = None,
     gps_url: Annotated[
         str | None,
         typer.Option(
@@ -368,11 +409,13 @@ def survey_capture(
             center_frequency_hz=center_frequency,
             sample_rate_hz=sample_rate,
             duration_seconds=duration,
-            gain_db=gain,
+            if_gain_reduction_db=if_gr,
+            lna_state=lna_state,
             agc=agc,
             antenna=antenna,
             driver=driver,
             write_auxi=write_auxi,
+            bandwidth_hz=bandwidth,
         )
     except ValueError as exc:
         console.print(f"[bold red]Invalid capture settings:[/bold red] {exc}")
@@ -409,6 +452,7 @@ def survey_capture(
                 gps_latitude=latitude,
                 gps_longitude=longitude,
                 on_progress=report,
+                site_id_override=site_id,
             )
     except (FileNotFoundError, OSError, ValueError, ProfileError, RuntimeError) as exc:
         console.print(f"[bold red]Capture/survey failed:[/bold red] {exc}")
@@ -436,6 +480,19 @@ def survey_capture(
         f"{result['capture']['actual_duration_seconds']:.3f} s "
         f"(requested {result['capture']['requested_duration_seconds']:.3f} s)",
     )
+    overflows = result["capture"].get("overflow_count", 0)
+    if overflows:
+        table.add_row(
+            "[yellow]Dropped buffers[/yellow]",
+            f"[yellow]{overflows}[/yellow] -- storage or CPU could not keep up; the recording "
+            "has gaps. Lower --sample-rate or use faster storage.",
+        )
+    applied = result["capture"].get("device_settings_applied") or {}
+    if applied.get("gains"):
+        table.add_row(
+            "Gain applied",
+            ", ".join(f"{name}={value:g}" for name, value in sorted(applied["gains"].items())),
+        )
     table.add_row("Survey run ID", str(result["survey"]["run_id"]))
     table.add_row("Observations", str(result["survey"]["observation_count"]))
     gps = result["gps"]

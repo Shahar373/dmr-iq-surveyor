@@ -118,3 +118,28 @@ def test_wave_iq_writer_empty_frames_are_a_no_op(tmp_path: Path) -> None:
     writer.write_frames(np.zeros(0, dtype=np.complex64))
     summary = writer.close()
     assert summary["frame_count"] == 50
+
+
+def test_int16_round_trip_is_exact_for_driver_scaled_samples(tmp_path: Path) -> None:
+    """SoapySDRPlay3 hands out CF32 as `adc_value / 32768.0`. Writing those
+    back to int16 must return the original ADC values exactly.
+
+    Truncating toward zero (and scaling by 32767) instead cost every
+    non-zero sample 1 LSB and mapped ADC values of +/-1 to 0 -- a deadband
+    at the noise floor, which is precisely where a weak-signal survey
+    lives.
+    """
+    adc_values = np.array(
+        [-32768, -100, -5, -3, -2, -1, 0, 1, 2, 3, 5, 100, 32767], dtype=np.int64
+    )
+    samples = (adc_values / 32768.0).astype(np.complex64)
+    samples = samples + 1j * samples
+
+    path = tmp_path / "roundtrip.wav"
+    writer = WaveIQWriter(path, WaveIQWriterSettings(sample_rate_hz=200_000, center_frequency_hz=868_000_000))
+    writer.write_frames(samples)
+    writer.close()
+
+    raw = np.frombuffer(path.read_bytes(), dtype="<i2")
+    recovered_i = raw[-2 * adc_values.size :: 2]
+    np.testing.assert_array_equal(recovered_i, adc_values.astype("<i2"))
