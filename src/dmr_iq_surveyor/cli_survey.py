@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Annotated
 
@@ -148,7 +149,7 @@ def survey_run(
             gps_fetched_at_utc=gps["fetched_at_utc"],
             site_id_override=site_id,
         )
-    except (FileNotFoundError, OSError, ValueError, ProfileError) as exc:
+    except (FileNotFoundError, OSError, ValueError, ProfileError, sqlite3.Error) as exc:
         console.print(f"[bold red]Survey run failed:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
 
@@ -459,7 +460,7 @@ def survey_capture(
                 on_progress=report,
                 site_id_override=site_id,
             )
-    except (FileNotFoundError, OSError, ValueError, ProfileError, RuntimeError) as exc:
+    except (FileNotFoundError, OSError, ValueError, ProfileError, RuntimeError, sqlite3.Error) as exc:
         console.print(f"[bold red]Capture/survey failed:[/bold red] {exc}")
         # A capture that dies mid-stream still leaves a valid, closed WAV
         # behind. Say so: without this the operator has no way to know a
@@ -638,7 +639,7 @@ def survey_compare(
             database_path=database,
             tolerances_from=band_profile,
         )
-    except (FileNotFoundError, OSError, ValueError, ProfileError) as exc:
+    except (FileNotFoundError, OSError, ValueError, ProfileError, sqlite3.Error) as exc:
         console.print(f"[bold red]Survey comparison failed:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
 
