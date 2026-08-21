@@ -235,6 +235,12 @@ def run_survey(
             f"stored {import_summary['observations_imported']} observations, "
             f"touched {import_summary['rf_frequencies_touched']} catalog frequencies"
         )
+        if import_summary["raster_collisions_merged"]:
+            log.warning(
+                f"{import_summary['raster_collisions_merged']} observation(s) landed on a raster "
+                "bin another observation in this run already used; kept the stronger measurement "
+                "per bin rather than storing both"
+            )
 
         run_row = get_run(connection, resolved_run_id)
         observation_rows = get_run_observations(connection, resolved_run_id)

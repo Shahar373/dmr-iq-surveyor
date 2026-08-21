@@ -103,6 +103,38 @@ def test_idempotent_reimport_leaves_row_counts_unchanged(tmp_path: Path) -> None
     connection.close()
 
 
+def test_two_observations_on_the_same_raster_bin_merge_instead_of_crashing(tmp_path: Path) -> None:
+    """Reproduces a real field crash: a busy passband can put two distinct
+    observations (already deduplicated by discover_observations's own
+    clustering) on the same raster bin -- both resolve to the same catalog
+    row, and `rf_observations` allows only one row per (run, frequency).
+    Previously the second INSERT raised IntegrityError and aborted the
+    whole run (hit live, at IFGR=25 in a home environment: 23 observations
+    from a single 15 s capture). The stronger measurement must be kept
+    instead, with the collision counted rather than silently dropped."""
+    connection = connect_survey_database(tmp_path / "db.sqlite3")
+    upsert_site(connection, SITE)
+    run = _run_record("r1", capture_start_utc="2026-08-01T00:00:00+00:00", capture_time_source="auxi")
+    weaker = _observation(868_050_000.0, persistence=0.4)
+    weaker.peak_dbfs_per_hz = -60.0
+    stronger = _observation(868_053_000.0, persistence=0.9)
+    stronger.peak_dbfs_per_hz = -20.0
+    assert weaker.nearest_raster_hz == stronger.nearest_raster_hz
+
+    summary = import_survey_run(
+        connection, run=run, observations=[weaker, stronger], raster_tolerance_hz=6250.0
+    )
+
+    assert summary["observations_imported"] == 1
+    assert summary["rf_frequencies_touched"] == 1
+    assert summary["raster_collisions_merged"] == 1
+    stored = fetch_survey_table(connection, "rf_observations")
+    assert len(stored) == 1
+    # The stronger of the two survived, regardless of insertion order.
+    assert stored[0]["peak_dbfs_per_hz"] == -20.0
+    connection.close()
+
+
 def test_two_runs_accumulate(tmp_path: Path) -> None:
     connection = connect_survey_database(tmp_path / "db.sqlite3")
     upsert_site(connection, SITE)

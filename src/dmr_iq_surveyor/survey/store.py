@@ -412,12 +412,30 @@ def import_survey_run(
         ),
     )
 
-    touched_frequency_ids: set[int] = set()
+    # rf_observations allows at most one row per (run, catalog frequency).
+    # A busy passband can put two distinct observations -- already
+    # deduplicated by discover_observations's own clustering -- within
+    # raster_tolerance_hz of the same catalog row (dense real detections,
+    # not one channel measured twice; reproduced with IFGR=25 in a home
+    # environment: 23 observations from a single 15 s capture). Rather than
+    # let the second insert crash the whole run on the UNIQUE constraint,
+    # keep the stronger measurement per catalog frequency and record how
+    # many collided so it is visible, not silently dropped.
+    observations_by_frequency_id: dict[int, RfObservation] = {}
+    collisions = 0
     for observation in observations:
         rf_frequency_id = _find_or_create_rf_frequency(
             connection, observation.nearest_raster_hz, raster_tolerance_hz
         )
-        touched_frequency_ids.add(rf_frequency_id)
+        existing = observations_by_frequency_id.get(rf_frequency_id)
+        if existing is not None:
+            collisions += 1
+            if observation.peak_dbfs_per_hz <= existing.peak_dbfs_per_hz:
+                continue
+        observations_by_frequency_id[rf_frequency_id] = observation
+
+    touched_frequency_ids = set(observations_by_frequency_id)
+    for rf_frequency_id, observation in observations_by_frequency_id.items():
         connection.execute(
             """
             INSERT INTO rf_observations(
@@ -475,8 +493,9 @@ def import_survey_run(
 
     return {
         "survey_run_id": run.survey_run_id,
-        "observations_imported": len(observations),
+        "observations_imported": len(observations_by_frequency_id),
         "rf_frequencies_touched": len(touched_frequency_ids),
+        "raster_collisions_merged": collisions,
     }
 
 

@@ -7,6 +7,7 @@ import pytest
 from dmr_iq_surveyor.capture.preflight import (
     BYTES_PER_FRAME,
     capture_size_bytes,
+    lowest_rate_for_same_bandwidth,
     max_sustainable_sample_rate,
     measure_write_throughput,
     required_bytes_per_second,
@@ -178,6 +179,34 @@ def test_preflight_warns_when_a_rate_buys_no_extra_spectrum(tmp_path: Path) -> N
     efficiency = next(c for c in result["checks"] if c["name"] == "Rate efficiency")
     assert efficiency["status"] == "warn"
     assert "1.536 MHz IF filter" in efficiency["detail"]
+
+
+def test_lowest_rate_for_same_bandwidth_does_not_recommend_an_unsupported_rate() -> None:
+    """The RSP1B has no sample rate between 1 and 2 MS/s. At 2 MS/s -- the
+    lowest rate that reaches the 1.536 MHz filter -- there is nothing lower
+    to recommend; the function must say so rather than pointing at a rate
+    the hardware would reject."""
+    assert lowest_rate_for_same_bandwidth(2_000_000.0) == 2_000_000.0
+    # 4 MS/s buys nothing over 2 MS/s -- that is the real recommendation.
+    assert lowest_rate_for_same_bandwidth(4_000_000.0) == 2_000_000.0
+
+
+def test_preflight_accepts_2msps_as_rate_efficient_despite_the_nominal_filter_threshold(
+    tmp_path: Path,
+) -> None:
+    """1.536 MHz is nominally available from 1.536 MS/s, but the device has
+    no rate between 1 and 2 MS/s, so 2 MS/s must not be flagged as wasteful
+    -- there is no lower rate an operator could actually use instead."""
+    result = run_preflight(
+        tmp_path,
+        band=_band(),
+        center_frequency_hz=868_000_000.0,
+        sample_rate_hz=2_000_000.0,
+        duration_seconds=10.0,
+        skip_throughput=True,
+    )
+    efficiency = next(c for c in result["checks"] if c["name"] == "Rate efficiency")
+    assert efficiency["status"] == "pass"
 
 
 def test_preflight_accepts_a_well_matched_rate(tmp_path: Path) -> None:
