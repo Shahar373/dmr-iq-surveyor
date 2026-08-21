@@ -20,6 +20,7 @@ from dmr_iq_surveyor.capture.core import CaptureSettings, run_capture_and_survey
 from dmr_iq_surveyor.capture.device import probe_soapysdr
 from dmr_iq_surveyor.capture.gps import resolve_gps
 from dmr_iq_surveyor.capture.preflight import run_preflight
+from dmr_iq_surveyor.reporting.export import export_survey
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_comparison, run_survey
 from dmr_iq_surveyor.survey.profiles import ProfileError, resolve_band_profile
 from dmr_iq_surveyor.survey.store import (
@@ -610,6 +611,56 @@ def survey_show(
             str(observation["spectral_class"]),
         )
     console.print(obs_table)
+
+
+@survey_app.command("export")
+def survey_export(
+    output: Annotated[
+        Path,
+        typer.Argument(help="Directory to write the spreadsheet files into"),
+    ] = Path("runs/export"),
+    site: Annotated[
+        str | None,
+        typer.Option("--site", help="Limit the export to one site id"),
+    ] = None,
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Persistent inventory SQLite path"),
+    ] = None,
+    xlsx: Annotated[
+        bool,
+        typer.Option("--xlsx", help="Also write a single multi-sheet workbook (needs openpyxl)"),
+    ] = False,
+) -> None:
+    """Export stored survey results as spreadsheet tables.
+
+    Writes runs.csv, observations.csv and frequencies.csv. The frequencies
+    table aggregates each catalog frequency across every run that saw it,
+    which is what distinguishes a recurring signal from a one-off detection.
+    """
+    resolved_database = database or DEFAULT_DATABASE_PATH
+    if not Path(resolved_database).expanduser().exists():
+        console.print(f"[bold red]No survey database at:[/bold red] {resolved_database}")
+        raise typer.Exit(code=1)
+
+    connection = connect_survey_database(resolved_database)
+    try:
+        result = export_survey(connection, output, site_id=site, write_xlsx=xlsx)
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        console.print(f"[bold red]Export failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        connection.close()
+
+    table = Table(title="Survey export")
+    table.add_column("Table", style="bold")
+    table.add_column("Rows")
+    table.add_row("runs", str(result["run_count"]))
+    table.add_row("observations", str(result["observation_count"]))
+    table.add_row("frequencies", str(result["frequency_count"]))
+    console.print(table)
+    for written in result["files"]:
+        console.print(f"[green]Wrote:[/green] {written}")
 
 
 @survey_app.command("compare")
