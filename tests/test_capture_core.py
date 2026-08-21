@@ -443,7 +443,7 @@ def test_capture_time_reaches_the_database_from_the_auxi_chunk(tmp_path: Path) -
     it has to be the real wall-clock time of the recording and it has to be
     sourced from the auxi chunk this writer produces -- not from import
     time, and not from a filename guess."""
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
 
     from dmr_iq_surveyor.survey.store import connect_survey_database, get_run
 
@@ -475,7 +475,11 @@ def test_capture_time_reaches_the_database_from_the_auxi_chunk(tmp_path: Path) -
     assert row is not None
     assert row["capture_time_source"] == "auxi"
     stored = datetime.fromisoformat(row["capture_start_utc"])
-    assert before <= stored <= after
+    # auxi's SYSTEMTIME stores milliseconds only (floor, no microseconds),
+    # so the stored value can read up to ~1ms earlier than a
+    # microsecond-precision "before" taken just ahead of it -- not a defect
+    # in what's being tested, just the auxi format's resolution.
+    assert before - timedelta(milliseconds=1) <= stored <= after
     # The site id is the other half of the join key for a location table
     # assembled after the fact.
     assert row["site_id"] == "park1"

@@ -67,6 +67,38 @@ def usable_span_hz(sample_rate_hz: float) -> float:
     return min(sample_rate_hz, sdrplay_if_bandwidth_hz(sample_rate_hz))
 
 
+# Sample rates an RSP1B accepts: a discrete ladder below 2 MS/s, then
+# continuous from 2 to 10.66 MS/s. Reported by `SoapySDRUtil --probe` on the
+# device itself. This matters because the filter thresholds do not line up
+# with the ladder: the 1.536 MHz filter nominally starts at 1.536 MS/s, but
+# no rate between 1 and 2 MS/s exists, so 2 MS/s is the lowest rate that can
+# actually reach it.
+_DISCRETE_RATES_HZ: tuple[float, ...] = (
+    62_500.0, 96_000.0, 125_000.0, 192_000.0, 250_000.0,
+    384_000.0, 500_000.0, 768_000.0, 1_000_000.0,
+)
+_CONTINUOUS_RATE_MIN_HZ = 2_000_000.0
+_CONTINUOUS_RATE_MAX_HZ = 10_660_000.0
+
+
+def lowest_rate_for_same_bandwidth(sample_rate_hz: float) -> float:
+    """Lowest sample rate the device supports that still yields the same
+    analog IF filter as `sample_rate_hz`.
+
+    Returns `sample_rate_hz` itself when nothing lower would do, which is
+    the common case at 2 MS/s: the filter it earns nominally begins at
+    1.536 MS/s, but the device offers no rate between 1 and 2 MS/s, so
+    there is nothing to drop to. Advising a lower rate there would send an
+    operator after a setting the hardware will reject.
+    """
+    target = sdrplay_if_bandwidth_hz(sample_rate_hz)
+    candidates = [rate for rate in _DISCRETE_RATES_HZ if rate <= sample_rate_hz]
+    if sample_rate_hz >= _CONTINUOUS_RATE_MIN_HZ:
+        candidates.append(_CONTINUOUS_RATE_MIN_HZ)
+    viable = [rate for rate in candidates if sdrplay_if_bandwidth_hz(rate) >= target]
+    return min(viable) if viable else sample_rate_hz
+
+
 @dataclass(slots=True)
 class Check:
     name: str
@@ -225,14 +257,26 @@ def _check_rate_efficiency(sample_rate_hz: float) -> Check:
             f"{sample_rate_hz / 1e6:.3f} MS/s is well matched to its "
             f"{bandwidth / 1e6:.3f} MHz IF filter",
         )
-    # Largest rate that yields the same filter, i.e. the wasted headroom.
+    floor = lowest_rate_for_same_bandwidth(sample_rate_hz)
+    waste = sample_rate_hz / max(floor, 1.0)
+    if waste <= 1.05:
+        # No lower rate the device actually supports reaches this filter --
+        # true at 2 MS/s, the lowest rate that reaches 1.536 MHz. Nothing to
+        # advise; recommending a rate the hardware would reject is worse
+        # than the inefficiency itself.
+        return Check(
+            "Rate efficiency",
+            PASS,
+            f"{sample_rate_hz / 1e6:.3f} MS/s is the lowest rate this device supports that "
+            f"reaches its {bandwidth / 1e6:.3f} MHz IF filter",
+        )
     return Check(
         "Rate efficiency",
         WARN,
         f"{sample_rate_hz / 1e6:.3f} MS/s still gets only a {bandwidth / 1e6:.3f} MHz IF filter, "
-        f"so it writes {sample_rate_hz / max(bandwidth, 1.0):.1f}x the data for no extra usable "
-        "spectrum. Drop to just above the filter width, or step up to the next filter "
-        "(5 MS/s gives 5 MHz).",
+        f"so it writes {waste:.1f}x the data for no extra usable spectrum. "
+        f"{floor / 1e6:.3f} MS/s gets the same filter for less storage bandwidth, "
+        "or step up to the next filter (5 MS/s gives 5 MHz).",
     )
 
 
@@ -297,6 +341,7 @@ __all__ = [
     "WARN",
     "Check",
     "capture_size_bytes",
+    "lowest_rate_for_same_bandwidth",
     "max_sustainable_sample_rate",
     "measure_write_throughput",
     "required_bytes_per_second",
