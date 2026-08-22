@@ -1,0 +1,57 @@
+# Uplink counterpart of central_800_recon.yaml: the 821-825 MHz range that a
+# 45 MHz duplex split would pair with detections in 866-870 MHz.
+#
+# Every detection threshold, raster and comparison tolerance below is
+# character-for-character identical to central_800_recon.yaml. That is the
+# whole point: a signal found here and a signal found there must be measured
+# on exactly the same terms, or comparing them proves nothing. Only the
+# frequency range differs.
+#
+# This profile asserts nothing about what lives in 821-825 MHz. It says where
+# to look, not what to expect -- if a 45 MHz duplex system is present, its
+# uplinks fall in this range; if the 866-870 detections are simplex short-range
+# devices (863-870 MHz is the European/Israeli SRD allocation), there is no
+# uplink to find and this range should come back quiet. Both outcomes are
+# results. Note that a quiet result is weak evidence either way: uplink
+# transmitters are handheld or mobile, run 1-3 W against a base station's
+# 25-100 W, are not sited on the mast, and key up only during a call. A high
+# vantage point hears base stations far better than it hears mobiles.
+name: central_800_ul_recon
+label: "800 MHz uplink candidate range (821-825 MHz) - short recon capture"
+
+start_frequency_hz: 821000000
+stop_frequency_hz: 825000000
+
+raster_spacings_hz:
+  - 12500
+  - 6250
+
+detection:
+  scan_step_hz: 6250
+  integration_width_hz: 12500
+  min_p95_channel_snr_db: 9.0
+  min_average_channel_snr_db: 4.0
+  min_equivalent_width_hz: 3000
+  min_width_90_hz: 5000
+  max_width_90_hz: 13000
+  max_peak_to_channel_mean_db: 13.0
+  min_fill_ratio: 0.20
+  fill_threshold_db: 6.0
+  merge_tolerance_hz: 4000
+
+# 1s segments every 5s, matching the downlink profile. Uplink activity is
+# bursty by nature -- a mobile transmits only while someone is talking -- so
+# persistence here should be read as "how often did anyone key up", not as
+# the continuous-carrier measure it approximates on a control channel.
+segment_seconds: 1.0
+segment_stride_seconds: 5.0
+max_segments: 30
+
+usable_passband_rolloff_db: 3.0
+
+comparison:
+  frequency_tolerance_hz: 6250
+  snr_delta_db: 3.0
+  occupancy_delta_pct: 10.0
+  persistence_delta: 0.25
+  analyzed_seconds_ratio_limit: 4.0
