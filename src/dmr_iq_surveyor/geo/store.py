@@ -87,6 +87,14 @@ CREATE TABLE IF NOT EXISTS geo_solutions (
 );
 CREATE INDEX IF NOT EXISTS idx_geo_solutions_site
     ON geo_solutions(p25_site_id, solved_at);
+CREATE TABLE IF NOT EXISTS geo_plans (
+    solve_batch_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    plan_json TEXT NOT NULL DEFAULT '{}',
+    geojson TEXT NOT NULL DEFAULT '{}'
+);
 CREATE TABLE IF NOT EXISTS geo_run_exclusions (
     survey_run_id TEXT PRIMARY KEY REFERENCES survey_runs(survey_run_id) ON DELETE CASCADE,
     reason TEXT NOT NULL,
@@ -100,6 +108,36 @@ def connect_geo_database(path: str | Path) -> sqlite3.Connection:
     connection.executescript(GEO_SCHEMA)
     connection.commit()
     return connection
+
+
+def store_plan(
+    connection: sqlite3.Connection,
+    *,
+    solve_batch_id: str,
+    plan: dict[str, Any],
+    geojson: dict[str, Any],
+) -> None:
+    connection.execute(
+        "INSERT OR REPLACE INTO geo_plans(solve_batch_id, created_at, status, reason, "
+        "plan_json, geojson) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            solve_batch_id,
+            datetime.now(UTC).isoformat(),
+            plan.get("status", "unknown"),
+            plan.get("reason", ""),
+            json.dumps(plan),
+            json.dumps(geojson),
+        ),
+    )
+    connection.commit()
+
+
+def latest_plan(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    """The most recent plan, by insertion order rather than by clock."""
+    row = connection.execute(
+        "SELECT * FROM geo_plans ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def exclude_run(connection: sqlite3.Connection, survey_run_id: str, reason: str) -> None:
@@ -324,11 +362,13 @@ __all__ = [
     "clear_run_exclusion",
     "connect_geo_database",
     "exclude_run",
+    "latest_plan",
     "fetch_all_measurements",
     "fetch_site_measurements",
     "latest_solutions",
     "replace_run_measurements",
     "run_exclusion",
     "solution_history",
+    "store_plan",
     "store_solution",
 ]

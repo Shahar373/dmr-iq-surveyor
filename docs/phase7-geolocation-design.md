@@ -65,6 +65,33 @@ detected would arrive as a **non-detection**, and a non-detection is evidence th
 *away* from that stop. A short capture would therefore not merely lose a measurement — it would
 manufacture a confident wrong one. The run stays in the database as evidence; it stops counting.
 
+### Per-stop common-mode offsets
+
+Anything that shifts a whole stop's levels together corrupts a method built on comparing levels
+between places. Such an effect is separable from geometry precisely because it is *common*: the
+propagation model already predicts how strong each site should be at each stop, so if every site at
+one stop sits the same distance from its prediction while the rest of the campaign fits, the stop is
+what differs.
+
+The solve therefore runs in two passes. The first fits every site independently; the median residual
+per stop across sites is that stop's offset; the second re-solves the sites a corrected stop
+contributed to. A consistent campaign does no second pass.
+
+Three limits are enforced rather than assumed away:
+
+- **Identifiability.** Below `min_sites` (3) detections at a stop, a shared offset cannot be told
+  apart from one site's model error, and none is estimated.
+- **Commonality.** A large median residual whose sites disagree among themselves is model misfit at
+  one stop, not the receiver; correcting it would bend real geometry to suit a fitting error. The
+  scatter about the offset must be well under the offset itself.
+- **Gauge.** Adding a constant to every stop's offset and to every site's reference level is an
+  identical fit, so the offsets are centred on zero and only differences between stops mean
+  anything.
+
+The reported magnitude is a *lower bound*: the first pass has already absorbed part of the shift
+into each site's reference level and position, so what remains in the residuals understates it. Sign
+and identification are what the correction needs.
+
 ### Gain drift
 
 Levels recorded at different receiver gain are not on one scale, and the method is a comparison of
@@ -232,6 +259,25 @@ Rules enforced in code:
   sessions is inspectable, not overwritten. "Latest" is by insertion order, never by timestamp: a
   Raspberry Pi has no real-time clock, so a solve run later in the day can carry an earlier
   timestamp than one run before it.
+
+## 7a. Next-stop planning
+
+Geometry decides a campaign more than stop count does. After each solve, candidate places are ranked
+by how much a stop there would teach:
+
+```
+p_detect(x) = sum over posterior cells  P(cell) * Phi( (mu(cell, x) - y_threshold) / sigma )
+value_s(x)  = H_binary( p_detect(x) )
+```
+
+summed over sites, weighted so a site whose region is already tight stops pulling the plan, and
+damped near places already measured, since a second stop beside the first repeats a measurement
+rather than adding one.
+
+The binary entropy is maximised at a predicted probability of one half: a place whose outcome cannot
+be predicted is exactly the place whose outcome is informative. This is a planning aid computed from
+current posteriors, not a prediction about the transmitters, and it knows nothing about roads or
+access.
 
 ## 8. Field web app
 

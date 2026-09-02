@@ -20,6 +20,7 @@
 <nav id="tabs">
   <button data-panel="record" class="active">Record</button>
   <button data-panel="sites">Sites</button>
+  <button data-panel="stops">Stops</button>
   <button data-panel="legend">Layers</button>
 </nav>
 
@@ -82,6 +83,16 @@
     <div id="device-status" class="notice" hidden></div>
     <div id="disk-status" class="notice" hidden></div>
 
+    <div id="plan-box" hidden>
+      <hr>
+      <div class="field"><label>Where to go next</label></div>
+      <div id="plan-list"></div>
+      <p class="hint">
+        Value is how unpredictable a measurement there would be. A place where a site is certainly
+        heard, or certainly not, teaches nothing about where it is.
+      </p>
+    </div>
+
     <div id="job" hidden>
       <div class="progress"><div id="progress-bar"></div></div>
       <div id="job-stage" class="readout"></div>
@@ -93,9 +104,19 @@
     <div class="row buttons">
       <button id="resolve">Re-solve all sites</button>
       <button id="purge">Free disk</button>
-      <span id="site-summary" class="hint"></span>
+      <button id="export-kml">KML</button>
+      <button id="export-gpx">GPX</button>
     </div>
+    <div class="row"><span id="site-summary" class="hint"></span></div>
     <div id="site-list"></div>
+  </div>
+
+  <div class="panel" data-panel="stops" hidden>
+    <p class="hint">
+      A stop can be set aside without losing it — its measurements stop counting and the reason is
+      recorded. Delete only a stop that should never have existed.
+    </p>
+    <div id="stop-list"></div>
   </div>
 
   <div class="panel" data-panel="legend" hidden>
@@ -103,6 +124,7 @@
     <label class="check"><input type="checkbox" id="layer-nondetections" checked> Non-detections</label>
     <label class="check"><input type="checkbox" id="layer-regions" checked> Credible regions</label>
     <label class="check"><input type="checkbox" id="layer-estimates" checked> Best estimates</label>
+    <label class="check"><input type="checkbox" id="layer-plan" checked> Where to go next</label>
     <hr>
     <div class="legend-key">
       <div><span class="swatch strong"></span> strong signal</div>
@@ -110,6 +132,7 @@
       <div><span class="swatch none"></span> looked, heard nothing</div>
       <div><span class="swatch region50"></span> 50% credible region</div>
       <div><span class="swatch region90"></span> 90% credible region</div>
+      <div><span class="swatch plan"></span> a stop here would teach the most</div>
     </div>
     <p class="hint">
       A credible region is a search area, not a transmitter coordinate. A region marked

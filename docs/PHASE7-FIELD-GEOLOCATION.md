@@ -109,6 +109,19 @@ Geometry decides the result far more than the number of stops does.
 - **Prefer repeatable spots** you can return to; a second visit at a different time is one of the
   cheapest ways to tighten a region.
 
+## 3a. Let the system pick the next stop
+
+After each solve, `geo plan` — and the numbered markers in the field app — rank where a stop would
+teach the most. The measure is how *unpredictable* a measurement there would be: somewhere a site is
+certainly heard, or certainly not, teaches nothing about where it is.
+
+Use it as a shortlist, not an instruction. It knows nothing about roads, access or safety, and a
+suggestion 400 m into a field is a suggestion to stop at the nearest reachable point near it.
+`dmr-surveyor geo export stops.gpx --format gpx` puts them into a phone navigator.
+
+If the plan says every candidate has a predictable outcome, more stops of the same kind will not
+help — change the geometry, or accept the regions you have.
+
 ## 4. At each stop
 
 Serve the field app from the Pi and drive it from a phone on the same hotspot:
@@ -179,6 +192,10 @@ wrong measurement rather than a missing one.
 
 The gain actually applied is stored per stop. If one stop was recorded at a different gain from the
 rest of the campaign, every measurement from it is flagged `gain_differs_from_campaign`.
+
+If a stop went wrong — you stood in the wrong place, the antenna was knocked, you forgot to update
+the position — the **Stops** tab sets it aside without losing it: its measurements stop counting and
+the reason is recorded. Delete only a stop that should never have existed.
 
 `geo history` is the campaign's progress report: the 90% area for a site should shrink as sessions
 accumulate. If it stops shrinking, more stops of the same kind will not help — change the geometry.

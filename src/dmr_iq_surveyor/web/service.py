@@ -19,6 +19,7 @@ from typing import Any
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.core import CaptureSettings, run_capture
 from dmr_iq_surveyor.capture.device import probe_soapysdr
+from dmr_iq_surveyor.geo.export import to_gpx, to_kml
 from dmr_iq_surveyor.geo.measurements import MeasurementSettings
 from dmr_iq_surveyor.geo.model import SolveSettings
 from dmr_iq_surveyor.geo.pipeline import (
@@ -27,7 +28,14 @@ from dmr_iq_surveyor.geo.pipeline import (
     site_overview,
     solve_all_sites,
 )
-from dmr_iq_surveyor.geo.store import connect_geo_database, exclude_run
+from dmr_iq_surveyor.geo.store import (
+    clear_run_exclusion,
+    connect_geo_database,
+    exclude_run,
+    latest_plan,
+    run_exclusion,
+    solution_history,
+)
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_survey
 from dmr_iq_surveyor.survey.profiles import (
     ProfileError,
@@ -35,6 +43,7 @@ from dmr_iq_surveyor.survey.profiles import (
     resolve_band_profile,
     resolve_site_profile,
 )
+from dmr_iq_surveyor.survey.store import delete_survey_run
 from dmr_iq_surveyor.web.jobs import Job, JobRegistry
 from dmr_iq_surveyor.web.recordings import disk_status, enforce_retention, purge_recordings
 
@@ -215,11 +224,137 @@ class FieldService:
             "disk": self.disk(),
             "sites": site_overview(database_path=self.settings.database_path),
             "runs": self.survey_runs(),
+            "stops": self.stops(),
+            "plan": self.plan(),
             "jobs": self.jobs.list(),
         }
 
     def geojson(self) -> dict[str, Any]:
-        return build_map_geojson(database_path=self.settings.database_path)
+        collection = build_map_geojson(database_path=self.settings.database_path)
+        plan = self.plan()
+        collection["features"].extend(plan.get("geojson", {}).get("features", []))
+        return collection
+
+    def plan(self) -> dict[str, Any]:
+        """The latest next-stop plan, or an explicit note that there is none."""
+        connection = connect_geo_database(Path(self.settings.database_path))
+        try:
+            stored = latest_plan(connection)
+        finally:
+            connection.close()
+        if stored is None:
+            return {
+                "status": "none",
+                "reason": "no solve has run yet",
+                "plan": {},
+                "geojson": {"type": "FeatureCollection", "features": []},
+            }
+        return {
+            "status": stored["status"],
+            "reason": stored["reason"],
+            "solve_batch_id": stored["solve_batch_id"],
+            "plan": json.loads(stored["plan_json"] or "{}"),
+            "geojson": json.loads(stored["geojson"] or "{}"),
+        }
+
+    def site_history(self, site_key: str) -> dict[str, Any]:
+        """How one site's region changed as sessions accumulated."""
+        connection = connect_geo_database(Path(self.settings.database_path))
+        try:
+            row = connection.execute(
+                "SELECT p25_site_id FROM p25_sites WHERE site_key = ?", (site_key,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown site key: {site_key}")
+            history = solution_history(connection, int(row["p25_site_id"]))
+        finally:
+            connection.close()
+        return {"site_key": site_key, "history": history}
+
+    def stops(self) -> list[dict[str, Any]]:
+        """Every stop, with whether it is contributing and why not."""
+        connection = connect_geo_database(Path(self.settings.database_path))
+        try:
+            rows = connection.execute(
+                """
+                SELECT r.survey_run_id, r.site_id, r.capture_start_utc, r.coverage_status,
+                       r.gps_latitude, r.gps_longitude, r.analyzed_seconds, s.gain,
+                       (SELECT COUNT(*) FROM rf_observations o
+                        WHERE o.survey_run_id = r.survey_run_id) AS observation_count,
+                       (SELECT COUNT(*) FROM geo_measurements m
+                        WHERE m.survey_run_id = r.survey_run_id AND m.usability = 'usable'
+                          AND m.detected = 1) AS detections,
+                       (SELECT COUNT(*) FROM geo_measurements m
+                        WHERE m.survey_run_id = r.survey_run_id AND m.usability = 'usable'
+                          AND m.detected = 0) AS non_detections,
+                       (SELECT reason FROM geo_run_exclusions e
+                        WHERE e.survey_run_id = r.survey_run_id) AS exclusion_reason
+                FROM survey_runs r LEFT JOIN sites s ON s.site_id = r.site_id
+                ORDER BY COALESCE(r.capture_start_utc, r.imported_at) DESC
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        return [dict(row) for row in rows]
+
+    def set_stop_excluded(
+        self, run_id: str, *, excluded: bool, reason: str = ""
+    ) -> dict[str, Any]:
+        """Take a stop out of the geolocation, or put it back.
+
+        Excluding keeps the recording's observations and says why they do not
+        count; it is the reversible option, and the right one when a stop is
+        merely suspect.
+        """
+        connection = connect_geo_database(Path(self.settings.database_path))
+        try:
+            if connection.execute(
+                "SELECT COUNT(*) AS n FROM survey_runs WHERE survey_run_id = ?", (run_id,)
+            ).fetchone()["n"] == 0:
+                raise ValueError(f"unknown stop: {run_id}")
+            if excluded:
+                exclude_run(
+                    connection, run_id, reason or "excluded by the operator in the field"
+                )
+            else:
+                clear_run_exclusion(connection, run_id)
+            current = run_exclusion(connection, run_id)
+        finally:
+            connection.close()
+        materialise_measurements(database_path=self.settings.database_path, run_ids=[run_id])
+        return {"survey_run_id": run_id, "excluded": current is not None, "reason": current or ""}
+
+    def delete_stop(self, run_id: str) -> dict[str, Any]:
+        """Remove a stop entirely, including its observations."""
+        connection = connect_geo_database(Path(self.settings.database_path))
+        try:
+            result = delete_survey_run(connection, run_id)
+        finally:
+            connection.close()
+        if not result["existed"]:
+            raise ValueError(f"unknown stop: {run_id}")
+        return result
+
+    def export(self, export_format: str) -> tuple[str, str, str]:
+        """(body, content type, filename) for a downloadable export."""
+        chosen = (export_format or "geojson").lower()
+        collection = self.geojson()
+        if chosen == "kml":
+            return to_kml(collection), "application/vnd.google-earth.kml+xml", "p25_survey.kml"
+        if chosen == "gpx":
+            plan = self.plan().get("plan", {})
+            visited = [
+                {
+                    "survey_run_id": stop["survey_run_id"],
+                    "latitude": stop["gps_latitude"],
+                    "longitude": stop["gps_longitude"],
+                }
+                for stop in self.stops()
+            ]
+            return to_gpx(plan, visited=visited), "application/gpx+xml", "p25_survey.gpx"
+        if chosen in ("geojson", "json"):
+            return json.dumps(collection, indent=2), "application/geo+json", "p25_survey.geojson"
+        raise ValueError(f"unsupported export format: {export_format}")
 
     # -- jobs --------------------------------------------------------------
 

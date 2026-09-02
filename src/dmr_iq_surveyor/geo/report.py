@@ -31,6 +31,8 @@ def render_solution_markdown(
     solutions: list[dict[str, Any]],
     measurement_summary: dict[str, Any],
     settings: dict[str, Any],
+    common_mode: dict[str, Any] | None = None,
+    plan: dict[str, Any] | None = None,
 ) -> str:
     lines: list[str] = [
         "# P25 site geolocation",
@@ -98,6 +100,67 @@ def render_solution_markdown(
             lines.append(f"- **{solution.get('site_key')}** (`{solution.get('status')}`): {reason}")
             for warning in solution.get("warnings", []):
                 lines.append(f"  - warning: {warning}")
+
+    if common_mode:
+        lines += [
+            "",
+            "## Per-stop common-mode offsets",
+            "",
+            "Anything that shifts a whole stop's levels together -- a re-seated antenna, local",
+            "interference raising the noise floor, front-end compression -- corrupts a method built",
+            "on comparing levels between places. Such an effect is separable because it is *common*:",
+            "if every site heard at one stop sits the same distance from its predicted level while",
+            "the rest of the campaign fits, the stop is what differs. Only differences between stops",
+            "are identifiable, so these are centred on zero.",
+            "",
+            f"- estimated at {common_mode.get('estimated', 0)} stop(s), "
+            f"{common_mode.get('within_noise', 0)} within noise, "
+            f"{common_mode.get('not_estimable', 0)} not estimable",
+            f"- corrections applied: {common_mode.get('applied', 0)}",
+            f"- largest offset: {common_mode.get('largest_offset_db', 0.0):.1f} dB",
+            "",
+        ]
+        notable = [
+            offset
+            for offset in (common_mode.get("offsets") or {}).values()
+            if offset.get("applied") or offset.get("status") == "not_estimable"
+        ]
+        if notable:
+            lines += ["| Stop | Status | Offset | Sites | Why |", "|---|---|---:|---:|---|"]
+            for offset in sorted(notable, key=lambda item: item["survey_run_id"]):
+                lines.append(
+                    "| `{run}` | {status} | {offset:+.1f} dB | {sites} | {reason} |".format(
+                        run=offset["survey_run_id"],
+                        status=offset["status"],
+                        offset=offset["offset_db"],
+                        sites=offset["site_count"],
+                        reason=offset["reason"],
+                    )
+                )
+
+    if plan:
+        lines += [
+            "",
+            "## Where to go next",
+            "",
+            "A stop is worth making where its outcome is least predictable: a place where a site is",
+            "certainly heard, or certainly not, teaches nothing about where it is. Value below is the",
+            "binary entropy of the predicted detection probability under each site's current",
+            "posterior, weighted so a site already pinned down stops pulling the plan, and damped",
+            "near places already measured. It is a planning aid computed from current beliefs, not a",
+            "prediction about the transmitters.",
+            "",
+        ]
+        if plan.get("status") != "ok":
+            lines.append(f"No suggestion: {plan.get('reason', plan.get('status'))}")
+        else:
+            lines += ["| Rank | Latitude | Longitude | Value | Helps most |", "|---:|---|---|---:|---|"]
+            for rank, stop in enumerate(plan.get("top_stops", []), start=1):
+                helps = ", ".join(item["site_key"] for item in stop.get("helps_most", []))
+                lines.append(
+                    f"| {rank} | {stop['latitude']:.5f} | {stop['longitude']:.5f} | "
+                    f"{stop['value']:.2f} | {helps} |"
+                )
 
     lines += [
         "",

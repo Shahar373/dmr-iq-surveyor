@@ -363,3 +363,88 @@ def test_cross_origin_state_changing_requests_are_refused(client: Client) -> Non
     except urllib.error.HTTPError as error:
         status = error.code
     assert status == 403
+
+
+def _materialise(client: Client) -> None:
+    """Run one solve so geo_measurements exist for the stop listing."""
+    _, job = client.request("/api/solve", {"rebuild_measurements": True})
+    client.stream(f"/api/jobs/{job['job_id']}/events?token=s3cret")
+
+
+def test_stops_can_be_set_aside_and_put_back_from_the_field(client: Client) -> None:
+    """Setting aside keeps the stop and records why it stopped counting."""
+    _materialise(client)
+    stops = client.request("/api/stops")[1]["stops"]
+    assert len(stops) == len(STOPS)
+    # A stop that actually heard something, so "stops contributing" is visible.
+    heard = next(stop for stop in stops if stop["detections"] > 0)
+    target = heard["survey_run_id"]
+    assert heard["exclusion_reason"] is None
+
+    status, result = client.request(
+        f"/api/stops/{target}/exclude", {"reason": "parked under a bridge"}
+    )
+    assert status == 200
+    assert result["excluded"] is True
+    assert "bridge" in result["reason"]
+
+    after = {row["survey_run_id"]: row for row in client.request("/api/stops")[1]["stops"]}
+    assert after[target]["exclusion_reason"] == "parked under a bridge"
+    assert after[target]["detections"] == 0, "an excluded stop stops contributing"
+    assert after[target]["observation_count"] > 0, "but keeps what it observed"
+
+    assert client.request(f"/api/stops/{target}/include", {})[1]["excluded"] is False
+    restored = {row["survey_run_id"]: row for row in client.request("/api/stops")[1]["stops"]}
+    assert restored[target]["exclusion_reason"] is None
+
+
+def test_a_stop_can_be_deleted_entirely(client: Client) -> None:
+    target = client.request("/api/stops")[1]["stops"][0]["survey_run_id"]
+    assert target
+    status, result = client.request(f"/api/stops/{target}/delete", {})
+    assert status == 200
+    assert result["existed"] is True
+    remaining = {row["survey_run_id"] for row in client.request("/api/stops")[1]["stops"]}
+    assert target not in remaining
+    assert client.request(f"/api/stops/{target}/delete", {})[0] == 400
+
+
+def test_the_plan_and_history_are_available_after_a_solve(client: Client) -> None:
+    _materialise(client)
+
+    plan = client.request("/api/plan")[1]
+    assert plan["status"] in ("ok", "no_useful_candidate", "no_targets")
+    if plan["status"] == "ok":
+        assert plan["plan"]["top_stops"]
+        kinds = {
+            feature["properties"]["kind"] for feature in plan["geojson"]["features"]
+        }
+        assert "plan_stop" in kinds
+
+    history = client.request("/api/history/BEE00:37D:1:30")[1]
+    assert history["site_key"] == "BEE00:37D:1:30"
+    assert len(history["history"]) >= 1
+    assert client.request("/api/history/NOPE:0:0:0")[0] == 500
+
+
+def test_exports_are_downloadable_in_each_format(client: Client) -> None:
+    _materialise(client)
+
+    for export_format, marker in (
+        ("kml", "<kml"),
+        ("gpx", "<gpx"),
+        ("geojson", "FeatureCollection"),
+    ):
+        request = urllib.request.Request(
+            client.base + f"/api/export?format={export_format}&token=s3cret"
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read().decode()
+            assert response.status == 200
+            assert "attachment" in response.headers["Content-Disposition"]
+        assert marker in body, f"{export_format} export looks wrong"
+
+    # KML must escape operator-supplied text rather than emitting it raw.
+    request = urllib.request.Request(client.base + "/api/export?format=kml&token=s3cret")
+    with urllib.request.urlopen(request, timeout=60) as response:
+        assert "<script>" not in response.read().decode()

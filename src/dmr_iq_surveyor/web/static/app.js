@@ -11,6 +11,8 @@ const state = {
   settings: null,
   position: null,
   sites: [],
+  stops: [],
+  plan: null,
   picking: false,
   jobId: null,
   cursor: 0,
@@ -144,6 +146,7 @@ function initMap() {
   layers.measurements = L.layerGroup().addTo(map);
   layers.nondetections = L.layerGroup().addTo(map);
   layers.estimates = L.layerGroup().addTo(map);
+  layers.plan = L.layerGroup().addTo(map);
   layers.position = L.layerGroup().addTo(map);
 
   map.on("click", (event) => {
@@ -225,7 +228,7 @@ async function refreshMap() {
   // turned off precisely when the map is too busy to read.
   const hidden = Object.keys(layers).filter((name) => !map.hasLayer(layers[name]));
   const collection = await api("/api/geojson");
-  ["regions50", "regions90", "measurements", "nondetections", "estimates"].forEach(
+  ["regions50", "regions90", "measurements", "nondetections", "estimates", "plan"].forEach(
     (name) => layers[name].clearLayers()
   );
   for (const feature of collection.features) {
@@ -256,6 +259,33 @@ async function refreshMap() {
         `<dt>area</dt><dd>${formatArea(properties.area_km2)}</dd>` +
         `<dt>status</dt><dd>${escapeHtml(properties.status)}</dd></dl>`
       ).addTo(inner ? layers.regions50 : layers.regions90);
+    } else if (properties.kind === "plan_cell") {
+      L.geoJSON(feature, {
+        style: {
+          stroke: false,
+          fillColor: "#7a3ff2",
+          fillOpacity: 0.06 + 0.34 * properties.value,
+        },
+      }).addTo(layers.plan);
+    } else if (properties.kind === "plan_stop") {
+      const helps = (properties.helps_most || []).map((h) => h.site_key).join(", ");
+      L.marker([feature.geometry.coordinates[1], feature.geometry.coordinates[0]], {
+        icon: L.divIcon({
+          className: "",
+          html: `<div style="width:26px;height:26px;border-radius:50%;background:#7a3ff2;color:#fff;
+                 display:grid;place-items:center;font:700 13px system-ui;border:2px solid #fff;
+                 box-shadow:0 1px 4px rgba(0,0,0,.4)">${properties.rank}</div>`,
+          iconSize: [26, 26],
+          iconAnchor: [13, 13],
+        }),
+      })
+        .bindPopup(
+          `<b>Suggested stop ${properties.rank}</b><dl>` +
+            `<dt>value</dt><dd>${properties.value.toFixed(2)}</dd>` +
+            `<dt>helps most</dt><dd>${escapeHtml(helps)}</dd></dl>` +
+            "<p>A stop here is worth making because its outcome is hard to predict.</p>"
+        )
+        .addTo(layers.plan);
     } else if (properties.kind === "estimate") {
       L.marker([feature.geometry.coordinates[1], feature.geometry.coordinates[0]])
         .bindPopup(estimatePopup(properties))
@@ -277,6 +307,126 @@ function statusBadge(status) {
   if (status === "frequency_unknown") return ["none", "no control channel known"];
   if (status === "no_measurements") return ["none", "nothing usable"];
   return ["none", status || "not solved"];
+}
+
+function renderPlan() {
+  const box = $("#plan-box");
+  const list = $("#plan-list");
+  const plan = (state.plan && state.plan.plan) || {};
+  const stops = plan.top_stops || [];
+  list.replaceChildren();
+  if (!stops.length) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  stops.slice(0, 3).forEach((stop, index) => {
+    const item = el("div", "plan-item");
+    item.append(el("div", "rank", String(index + 1)));
+    const body = el("div");
+    body.append(el("div", "where", `${stop.latitude.toFixed(5)}, ${stop.longitude.toFixed(5)}`));
+    body.append(
+      el("div", "why", "helps: " + (stop.helps_most || []).map((h) => h.site_key).join(", "))
+    );
+    item.append(body);
+    item.addEventListener("click", () => {
+      if (map) map.setView([stop.latitude, stop.longitude], 14);
+    });
+    list.append(item);
+  });
+}
+
+function renderStops() {
+  const container = $("#stop-list");
+  container.replaceChildren();
+  for (const stop of state.stops || []) {
+    const excluded = Boolean(stop.exclusion_reason);
+    const card = el("div", "stop" + (excluded ? " excluded" : ""));
+    const header = el("header");
+    header.append(el("span", "key", stop.survey_run_id));
+    header.append(
+      el("span", "badge " + (excluded ? "warn" : "ok"), excluded ? "not counting" : "counting")
+    );
+    card.append(header);
+    const when = (stop.capture_start_utc || "").replace("T", " ").slice(0, 16);
+    card.append(
+      el(
+        "div",
+        "meta",
+        `${when} · ${stop.detections} detection(s), ${stop.non_detections} non-detection(s)` +
+          (stop.gain !== null && stop.gain !== undefined ? ` · gain ${stop.gain}` : "") +
+          (stop.gps_latitude !== null && stop.gps_latitude !== undefined
+            ? ` · ${stop.gps_latitude.toFixed(4)}, ${stop.gps_longitude.toFixed(4)}`
+            : " · no position")
+      )
+    );
+    if (excluded) card.append(el("div", "meta", stop.exclusion_reason));
+
+    const actions = el("div", "actions");
+    const toggle = el("button", null, excluded ? "Put back" : "Set aside");
+    toggle.addEventListener("click", async () => {
+      const path = `/api/stops/${encodeURIComponent(stop.survey_run_id)}/` +
+        (excluded ? "include" : "exclude");
+      const body = excluded ? {} : { reason: "set aside by the operator in the field" };
+      try {
+        await api(path, { method: "POST", body: JSON.stringify(body) });
+        await refreshState();
+      } catch (error) {
+        alert("Could not change the stop: " + error.message);
+      }
+    });
+    actions.append(toggle);
+
+    const remove = el("button", "danger", "Delete");
+    remove.addEventListener("click", async () => {
+      if (!confirm(`Delete ${stop.survey_run_id} and everything measured at it? This cannot be undone.`)) return;
+      try {
+        await api(`/api/stops/${encodeURIComponent(stop.survey_run_id)}/delete`, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        await refreshState();
+        await refreshMap();
+      } catch (error) {
+        alert("Could not delete the stop: " + error.message);
+      }
+    });
+    actions.append(remove);
+    card.append(actions);
+
+    if (stop.gps_latitude !== null && stop.gps_latitude !== undefined) {
+      card.addEventListener("dblclick", () => {
+        if (map) map.setView([stop.gps_latitude, stop.gps_longitude], 14);
+      });
+    }
+    container.append(card);
+  }
+  if (!(state.stops || []).length) {
+    container.append(el("p", "hint", "No stops recorded yet."));
+  }
+}
+
+async function showHistory(siteKey, target) {
+  try {
+    const payload = await api("/api/history/" + encodeURIComponent(siteKey));
+    const areas = payload.history
+      .map((entry) => entry.area_km2_90)
+      .filter((value) => value !== null && value !== undefined);
+    if (areas.length < 2) {
+      target.textContent = "90% region: one solve so far";
+      return;
+    }
+    const shown = areas.slice(-5).map((value) => formatArea(value));
+    target.replaceChildren();
+    target.append(document.createTextNode("90% region: " + shown.join(" → ")));
+    if (areas[areas.length - 1] < areas[0]) {
+      const factor = areas[0] / areas[areas.length - 1];
+      const gain = el("b", null, `  (${factor.toFixed(1)}x tighter)`);
+      target.append(gain);
+    }
+  } catch (error) {
+    target.textContent = "history unavailable: " + error.message;
+  }
 }
 
 function renderSites() {
@@ -302,6 +452,12 @@ function renderSites() {
 
     if (site.status_reason) card.append(el("div", "meta", site.status_reason));
     for (const warning of site.warnings || []) card.append(el("div", "warn", warning));
+
+    if (site.solved_at) {
+      const trend = el("div", "trend", "90% region: …");
+      card.append(trend);
+      showHistory(site.site_key, trend);
+    }
 
     if (site.mode_latitude !== null && site.mode_latitude !== undefined) {
       card.style.cursor = "pointer";
@@ -498,8 +654,12 @@ async function refreshState() {
   state.settings = payload.settings;
   state.position = payload.position;
   state.sites = payload.sites;
+  state.stops = payload.stops || [];
+  state.plan = payload.plan || null;
   renderPosition();
   renderSites();
+  renderStops();
+  renderPlan();
 
   const disk = payload.disk;
   const diskPill = $("#disk");
@@ -577,6 +737,13 @@ function wireUi() {
   });
   $("#record").addEventListener("click", () => startCapture());
   $("#purge").addEventListener("click", purgeRecordings);
+  for (const [id, format] of [["#export-kml", "kml"], ["#export-gpx", "gpx"]]) {
+    $(id).addEventListener("click", () => {
+      const query = new URLSearchParams({ format });
+      if (TOKEN) query.set("token", TOKEN);
+      window.open("/api/export?" + query.toString(), "_blank");
+    });
+  }
   $("#resolve").addEventListener("click", startSolve);
   $("#cancel-job").addEventListener("click", async () => {
     if (state.jobId) await api("/api/jobs/" + state.jobId + "/cancel", { method: "POST" });
@@ -586,6 +753,7 @@ function wireUi() {
     "layer-measurements": "measurements",
     "layer-nondetections": "nondetections",
     "layer-estimates": "estimates",
+    "layer-plan": "plan",
   };
   for (const [id, name] of Object.entries(toggles)) {
     $("#" + id).addEventListener("change", (event) => {

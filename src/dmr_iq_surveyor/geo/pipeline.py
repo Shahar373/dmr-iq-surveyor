@@ -13,14 +13,25 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from dmr_iq_surveyor import __version__
+from dmr_iq_surveyor.geo.commonmode import CommonModeSettings, estimate_offsets
+from dmr_iq_surveyor.geo.commonmode import residuals_by_run as _residuals_by_run
+from dmr_iq_surveyor.geo.commonmode import summarise as summarise_common_mode
 from dmr_iq_surveyor.geo.contours import credible_regions, regions_to_geojson
 from dmr_iq_surveyor.geo.measurements import (
     MeasurementSettings,
     build_run_measurements,
     summarise,
 )
-from dmr_iq_surveyor.geo.model import GeoMeasurement, SolveSettings
+from dmr_iq_surveyor.geo.model import GeoMeasurement, LocalProjection, SolveSettings
+from dmr_iq_surveyor.geo.planning import (
+    PlanSettings,
+    build_target,
+    plan_next_stops,
+    plan_to_geojson,
+)
 from dmr_iq_surveyor.geo.report import render_solution_markdown
 from dmr_iq_surveyor.geo.solver import SOURCE_MODEL, solve_site
 from dmr_iq_surveyor.geo.store import (
@@ -29,6 +40,7 @@ from dmr_iq_surveyor.geo.store import (
     fetch_site_measurements,
     latest_solutions,
     replace_run_measurements,
+    store_plan,
     store_solution,
 )
 from dmr_iq_surveyor.inspection import write_json
@@ -44,6 +56,10 @@ METHOD = "bayesian_grid_log_distance"
 # too weak".
 STATUS_FREQUENCY_UNKNOWN = "frequency_unknown"
 STATUS_NO_MEASUREMENTS = "no_measurements"
+
+# A local noise floor this far from the campaign's changes every level at the
+# stop, in the direction the solver reads as distance.
+NOISE_FLOOR_SHIFT_DB = 4.0
 
 
 def _database(path: str | Path | None) -> Path:
@@ -119,11 +135,14 @@ def materialise_measurements(
             ]
         gains = _campaign_gains(connection, run_ids)
         reference_gain = _modal_gain(gains)
+        noise_floors = _campaign_noise_floors(connection, run_ids)
+        reference_noise = _median_noise_floor(noise_floors)
         per_run: list[dict[str, Any]] = []
         total: list[dict[str, Any]] = []
         for run_id in run_ids:
             rows = build_run_measurements(connection, run_id, resolved)
             _flag_gain_drift(rows, gains.get(run_id), reference_gain)
+            _flag_noise_floor_shift(rows, noise_floors.get(run_id), reference_noise)
             replace_run_measurements(connection, run_id, rows)
             per_run.append({"survey_run_id": run_id, **summarise(rows)})
             total.extend(rows)
@@ -141,7 +160,64 @@ def materialise_measurements(
         "settings": resolved.to_dict(),
         "reference_gain": reference_gain,
         "gain_drift_runs": drifted,
+        "reference_noise_floor_dbfs_per_hz": reference_noise,
+        "noise_floor_by_run": noise_floors,
+        "noise_floor_shift_runs": sorted(
+            run_id
+            for run_id, floor in noise_floors.items()
+            if reference_noise is not None
+            and floor is not None
+            and abs(floor - reference_noise) >= NOISE_FLOOR_SHIFT_DB
+        ),
     }
+
+
+def _campaign_noise_floors(connection: Any, run_ids: Sequence[str]) -> dict[str, float | None]:
+    """The local noise floor each stop measured, one number per stop."""
+    rows = connection.execute(
+        """
+        SELECT survey_run_id, noise_floor_dbfs_per_hz
+        FROM rf_observations
+        """
+    ).fetchall()
+    wanted = set(run_ids)
+    collected: dict[str, list[float]] = {}
+    for row in rows:
+        run_id = str(row["survey_run_id"])
+        if run_id in wanted and row["noise_floor_dbfs_per_hz"] is not None:
+            collected.setdefault(run_id, []).append(float(row["noise_floor_dbfs_per_hz"]))
+    result: dict[str, float | None] = {run_id: None for run_id in wanted}
+    for run_id, values in collected.items():
+        ordered = sorted(values)
+        result[run_id] = ordered[len(ordered) // 2]
+    return result
+
+
+def _median_noise_floor(noise_floors: dict[str, float | None]) -> float | None:
+    values = sorted(value for value in noise_floors.values() if value is not None)
+    return values[len(values) // 2] if values else None
+
+
+def _flag_noise_floor_shift(
+    rows: list[dict[str, Any]], floor: float | None, reference: float | None
+) -> None:
+    """Flag a stop whose noise floor sits well away from the campaign's.
+
+    The level every measurement carries is SNR above the local noise floor. If
+    that floor moves -- car electronics, an interferer, a different antenna
+    environment -- every level at the stop moves with it, in the direction the
+    solver reads as distance.
+    """
+    if reference is None or floor is None:
+        return
+    shift = floor - reference
+    if abs(shift) < NOISE_FLOOR_SHIFT_DB:
+        return
+    for row in rows:
+        row["quality_flags"] = [
+            *row["quality_flags"],
+            f"noise_floor_shift:{shift:+.1f}dB",
+        ]
 
 
 def _campaign_gains(connection: Any, run_ids: Sequence[str]) -> dict[str, float | None]:
@@ -192,20 +268,186 @@ def _flag_gain_drift(
         row["quality_flags"] = [*row["quality_flags"], f"gain_differs_from_campaign:{gain:g}"]
 
 
-def _to_geo_measurements(rows: list[dict[str, Any]]) -> list[GeoMeasurement]:
-    return [
-        GeoMeasurement(
-            label=f"{row['survey_run_id']}@{row['frequency_hz'] / 1e6:.6f}MHz",
-            latitude=float(row["latitude"]),
-            longitude=float(row["longitude"]),
-            detected=bool(row["detected"]),
-            level_db=None if row["level_db"] is None else float(row["level_db"]),
-            censor_level_db=float(row["censor_level_db"]),
-            survey_run_id=str(row["survey_run_id"]),
-            frequency_hz=float(row["frequency_hz"]),
+def _to_geo_measurements(
+    rows: list[dict[str, Any]], offsets: dict[str, float] | None = None
+) -> list[GeoMeasurement]:
+    """Rows as solver inputs, optionally shifted by a per-stop common-mode offset.
+
+    The offset moves the detection threshold with the level: whatever raised
+    or lowered this stop's whole receive path raised or lowered the level at
+    which the detector called something present, too.
+    """
+    applied = offsets or {}
+    measurements = []
+    for row in rows:
+        offset = applied.get(str(row["survey_run_id"]), 0.0)
+        measurements.append(
+            GeoMeasurement(
+                label=f"{row['survey_run_id']}@{row['frequency_hz'] / 1e6:.6f}MHz",
+                latitude=float(row["latitude"]),
+                longitude=float(row["longitude"]),
+                detected=bool(row["detected"]),
+                level_db=(
+                    None if row["level_db"] is None else float(row["level_db"]) - offset
+                ),
+                censor_level_db=float(row["censor_level_db"]) - offset,
+                survey_run_id=str(row["survey_run_id"]),
+                frequency_hz=float(row["frequency_hz"]),
+            )
         )
-        for row in rows
-    ]
+    return measurements
+
+
+def _solve_one(
+    *,
+    site: dict[str, Any],
+    usable: list[dict[str, Any]],
+    excluded: int,
+    settings: SolveSettings,
+    level_metric: str,
+    offsets: dict[str, float],
+) -> tuple[dict[str, Any], Any]:
+    """Solve one site and shape its result row. Returns (row, SolveResult|None)."""
+    row: dict[str, Any] = {
+        "p25_site_id": int(site["p25_site_id"]),
+        "site_key": site["site_key"],
+        "rfss": site["rfss"],
+        "site": site["site"],
+        "solved_at": datetime.now(UTC).isoformat(),
+        "method": METHOD,
+        "source_model": SOURCE_MODEL,
+        "level_metric": level_metric,
+        "excluded_count": excluded,
+        "tool_version": __version__,
+        "settings": settings.to_dict(),
+        "input_run_ids": sorted({str(item["survey_run_id"]) for item in usable}),
+        "warnings": [],
+    }
+
+    if not site["channels"]:
+        row.update(
+            status=STATUS_FREQUENCY_UNKNOWN,
+            status_reason=(
+                "no control-channel frequency is on record for this site, so nothing could be "
+                "measured; it stays listed rather than being dropped"
+            ),
+            detection_count=0,
+            non_detection_count=0,
+        )
+        return row, None
+    if not usable:
+        row.update(
+            status=STATUS_NO_MEASUREMENTS,
+            status_reason=(
+                f"{excluded} measurement slot(s) exist for this site but none is usable "
+                "(ambiguous frequency, no run position, excluded stop, or outside every "
+                "measured passband)"
+            ),
+            detection_count=0,
+            non_detection_count=0,
+        )
+        return row, None
+
+    result = solve_site(_to_geo_measurements(usable, offsets), settings)
+    row.update(
+        status=result.status,
+        status_reason=result.status_reason,
+        detection_count=result.detection_count,
+        non_detection_count=result.non_detection_count,
+        mode_latitude=result.mode_latitude,
+        mode_longitude=result.mode_longitude,
+        mean_latitude=result.mean_latitude,
+        mean_longitude=result.mean_longitude,
+        path_loss_exponent=result.path_loss_exponent,
+        reference_level_db=result.reference_level_db,
+        residual_rms_db=result.residual_rms_db,
+        azimuth_span_deg=result.azimuth_span_deg,
+        warnings=list(result.warnings),
+        diagnostics=result.diagnostics,
+        residuals=result.residuals,
+    )
+    # Surface the flags the contributing measurements carry. Stored-but-unread
+    # flags are the same failure as no flags: the reader never learns that half
+    # the evidence came from a stop whose gain was different.
+    flags: dict[str, int] = {}
+    for measurement in usable:
+        for flag in json.loads(measurement["quality_flags_json"] or "[]"):
+            flags[flag] = flags.get(flag, 0) + 1
+    row["measurement_flags"] = flags
+    for flag, count in sorted(flags.items()):
+        row["warnings"].append(
+            f"{count} of {len(usable)} contributing measurement(s) carry {flag!r}"
+        )
+    if result.surface is not None:
+        regions = credible_regions(result.surface, settings.credible_levels)
+        by_level = {region["level"]: region for region in regions}
+        row["area_km2_50"] = (by_level.get(0.5) or {}).get("area_km2")
+        row["area_km2_90"] = (by_level.get(0.9) or {}).get("area_km2")
+        row["geojson"] = regions_to_geojson(
+            regions,
+            {"site_key": site["site_key"], "status": result.status, "kind": "credible_region"},
+        )
+    return row, result
+
+
+def _build_plan(
+    *,
+    rows: list[dict[str, Any]],
+    results: dict[str, Any],
+    usable_by_site: dict[str, list[dict[str, Any]]],
+    settings: SolveSettings,
+    plan_settings: PlanSettings,
+) -> dict[str, Any]:
+    """Rank where the next stop would teach the most, from the final posteriors."""
+    targets = []
+    projection: LocalProjection | None = None
+    for row in rows:
+        result = results.get(row["site_key"])
+        if result is None or result.surface is None:
+            continue
+        projection = result.surface.projection
+        measurements = usable_by_site.get(row["site_key"], [])
+        thresholds = [float(item["censor_level_db"]) for item in measurements]
+        target = build_target(
+            site_key=row["site_key"],
+            surface=result.surface,
+            projection=projection,
+            reference_level_db=float(row["reference_level_db"]),
+            path_loss_exponent=float(row["path_loss_exponent"]),
+            threshold_db=float(np.median(thresholds)) if thresholds else 0.0,
+            area_km2=row.get("area_km2_90"),
+            settings=plan_settings,
+        )
+        if target is not None:
+            targets.append(target)
+
+    if projection is None:
+        return {
+            "status": "no_targets",
+            "reason": (
+                "no site has a posterior to plan against yet; make a few stops spread around the "
+                "area first"
+            ),
+            "candidates": [],
+            "top_stops": [],
+            "settings": plan_settings.to_dict(),
+        }
+
+    visited = sorted(
+        {
+            (float(item["latitude"]), float(item["longitude"]))
+            for measurements in usable_by_site.values()
+            for item in measurements
+            if item["latitude"] is not None
+        }
+    )
+    return plan_next_stops(
+        targets=targets,
+        projection=projection,
+        visited=visited,
+        solve=settings,
+        settings=plan_settings,
+    )
 
 
 def solve_all_sites(
@@ -216,121 +458,114 @@ def solve_all_sites(
     solve_batch_id: str | None = None,
     settings: SolveSettings | None = None,
     level_metric: str = "snr_db",
+    common_mode: CommonModeSettings | None = None,
+    plan_settings: PlanSettings | None = None,
     on_progress: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Solve every registry site that has usable measurements.
 
-    Sites without a control-channel frequency, and sites whose measurements
-    are all excluded, are recorded with an explicit status rather than
-    quietly omitted -- otherwise a map would silently show fewer sites than
-    the system actually has.
+    Runs in two passes. The first fits every site independently. Its residuals
+    then reveal any stop whose whole receive path sat off the campaign -- a
+    re-seated antenna, a raised noise floor -- and the second pass re-solves the
+    sites that stop contributed to, with that offset removed. A campaign with
+    consistent stops does no second pass at all.
+
+    Sites without a control-channel frequency, and sites whose measurements are
+    all excluded, are recorded with an explicit status rather than quietly
+    omitted -- otherwise a map would silently show fewer sites than exist.
     """
     resolved = settings or SolveSettings()
     resolved.validate()
+    common = common_mode or CommonModeSettings()
+    common.validate()
+    planning = plan_settings if plan_settings is not None else PlanSettings()
+    planning.validate()
+
     batch = solve_batch_id or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     connection = connect_geo_database(_database(database_path))
-    solutions: list[dict[str, Any]] = []
     try:
         sites = list_sites(connection)
         if site_keys is not None:
             wanted = set(site_keys)
             sites = [site for site in sites if site["site_key"] in wanted]
-        for index, site in enumerate(sites):
-            if on_progress is not None:
-                on_progress(str(site["site_key"]), index, len(sites))
+
+        usable_by_site: dict[str, list[dict[str, Any]]] = {}
+        excluded_by_site: dict[str, int] = {}
+        for site in sites:
             site_id = int(site["p25_site_id"])
             usable = fetch_site_measurements(connection, site_id, usable_only=True)
             everything = fetch_site_measurements(connection, site_id, usable_only=False)
-            excluded = len(everything) - len(usable)
-            solved_at = datetime.now(UTC).isoformat()
-            row: dict[str, Any] = {
-                "p25_site_id": site_id,
-                "site_key": site["site_key"],
-                "rfss": site["rfss"],
-                "site": site["site"],
-                "solved_at": solved_at,
-                "method": METHOD,
-                "source_model": SOURCE_MODEL,
-                "level_metric": level_metric,
-                "excluded_count": excluded,
-                "tool_version": __version__,
-                "settings": resolved.to_dict(),
-                "input_run_ids": sorted({str(item["survey_run_id"]) for item in usable}),
+            usable_by_site[site["site_key"]] = usable
+            excluded_by_site[site["site_key"]] = len(everything) - len(usable)
+
+        rows: list[dict[str, Any]] = []
+        results: dict[str, Any] = {}
+        for index, site in enumerate(sites):
+            if on_progress is not None:
+                on_progress(str(site["site_key"]), index, len(sites))
+            row, result = _solve_one(
+                site=site,
+                usable=usable_by_site[site["site_key"]],
+                excluded=excluded_by_site[site["site_key"]],
+                settings=resolved,
+                level_metric=level_metric,
+                offsets={},
+            )
+            rows.append(row)
+            if result is not None:
+                results[site["site_key"]] = result
+
+        offsets = estimate_offsets(_residuals_by_run(rows), common)
+        applied = {
+            run_id: offset.offset_db for run_id, offset in offsets.items() if offset.applied
+        }
+        if applied:
+            affected = {
+                site["site_key"]
+                for site in sites
+                if any(
+                    str(item["survey_run_id"]) in applied
+                    for item in usable_by_site[site["site_key"]]
+                )
             }
+            for index, site in enumerate(sites):
+                if site["site_key"] not in affected:
+                    continue
+                if on_progress is not None:
+                    on_progress(f"{site['site_key']} (common-mode corrected)", index, len(sites))
+                row, result = _solve_one(
+                    site=site,
+                    usable=usable_by_site[site["site_key"]],
+                    excluded=excluded_by_site[site["site_key"]],
+                    settings=resolved,
+                    level_metric=level_metric,
+                    offsets=applied,
+                )
+                row["warnings"].append(
+                    "levels were corrected for a per-stop common-mode offset at "
+                    + ", ".join(f"{run_id} ({applied[run_id]:+.1f} dB)" for run_id in sorted(applied))
+                )
+                rows = [existing for existing in rows if existing["site_key"] != site["site_key"]]
+                rows.append(row)
+                if result is not None:
+                    results[site["site_key"]] = result
 
-            if not site["channels"]:
-                row.update(
-                    status=STATUS_FREQUENCY_UNKNOWN,
-                    status_reason=(
-                        "no control-channel frequency is on record for this site, so nothing "
-                        "could be measured; it stays listed rather than being dropped"
-                    ),
-                    detection_count=0,
-                    non_detection_count=0,
-                )
-            elif not usable:
-                row.update(
-                    status=STATUS_NO_MEASUREMENTS,
-                    status_reason=(
-                        f"{excluded} measurement slot(s) exist for this site but none is usable "
-                        "(ambiguous frequency, no run position, or outside every measured passband)"
-                    ),
-                    detection_count=0,
-                    non_detection_count=0,
-                )
-            else:
-                result = solve_site(_to_geo_measurements(usable), resolved)
-                row.update(
-                    status=result.status,
-                    status_reason=result.status_reason,
-                    detection_count=result.detection_count,
-                    non_detection_count=result.non_detection_count,
-                    mode_latitude=result.mode_latitude,
-                    mode_longitude=result.mode_longitude,
-                    mean_latitude=result.mean_latitude,
-                    mean_longitude=result.mean_longitude,
-                    path_loss_exponent=result.path_loss_exponent,
-                    reference_level_db=result.reference_level_db,
-                    residual_rms_db=result.residual_rms_db,
-                    azimuth_span_deg=result.azimuth_span_deg,
-                    warnings=list(result.warnings),
-                    diagnostics=result.diagnostics,
-                    residuals=result.residuals,
-                )
-                # Surface the flags the contributing measurements carry.
-                # Stored-but-unread flags are the same failure as no flags:
-                # the reader never learns that half the evidence came from a
-                # stop whose gain was different.
-                flags: dict[str, int] = {}
-                for measurement in usable:
-                    for flag in json.loads(measurement["quality_flags_json"] or "[]"):
-                        flags[flag] = flags.get(flag, 0) + 1
-                row["measurement_flags"] = flags
-                for flag, count in sorted(flags.items()):
-                    row.setdefault("warnings", [])
-                    row["warnings"].append(
-                        f"{count} of {len(usable)} contributing measurement(s) carry {flag!r}"
-                    )
-                if result.surface is not None:
-                    regions = credible_regions(result.surface, resolved.credible_levels)
-                    by_level = {region["level"]: region for region in regions}
-                    row["area_km2_50"] = (by_level.get(0.5) or {}).get("area_km2")
-                    row["area_km2_90"] = (by_level.get(0.9) or {}).get("area_km2")
-                    row["geojson"] = regions_to_geojson(
-                        regions,
-                        {
-                            "site_key": site["site_key"],
-                            "status": result.status,
-                            "kind": "credible_region",
-                        },
-                    )
+        for row in rows:
             store_solution(connection, solve_batch_id=batch, row=row)
-            solutions.append(row)
 
+        plan = _build_plan(
+            rows=rows,
+            results=results,
+            usable_by_site=usable_by_site,
+            settings=resolved,
+            plan_settings=planning,
+        )
+        store_plan(connection, solve_batch_id=batch, plan=plan, geojson=plan_to_geojson(plan))
         measurement_summary = summarise(fetch_all_measurements(connection))
     finally:
         connection.close()
 
+    rows.sort(key=lambda item: (item.get("rfss", 0), item.get("site", 0)))
     report = {
         "tool": "dmr-iq-surveyor",
         "tool_version": __version__,
@@ -340,9 +575,11 @@ def solve_all_sites(
         "generated_at": datetime.now(UTC).isoformat(),
         "measurement_summary": measurement_summary,
         "settings": resolved.to_dict(),
+        "common_mode": summarise_common_mode(offsets),
+        "plan": plan,
         "solutions": [
             {key: value for key, value in solution.items() if key != "geojson"}
-            for solution in solutions
+            for solution in rows
         ],
     }
     if output_root is not None:
@@ -352,9 +589,11 @@ def solve_all_sites(
         (destination / "reports" / f"geolocation_{batch}.md").write_text(
             render_solution_markdown(
                 solve_batch_id=batch,
-                solutions=solutions,
+                solutions=rows,
                 measurement_summary=measurement_summary,
                 settings=resolved.to_dict(),
+                common_mode=report["common_mode"],
+                plan=plan,
             ),
             encoding="utf-8",
         )
@@ -498,6 +737,7 @@ def site_overview(*, database_path: str | Path | None = None) -> list[dict[str, 
 
 __all__ = [
     "METHOD",
+    "NOISE_FLOOR_SHIFT_DB",
     "STATUS_FREQUENCY_UNKNOWN",
     "STATUS_NO_MEASUREMENTS",
     "build_map_geojson",

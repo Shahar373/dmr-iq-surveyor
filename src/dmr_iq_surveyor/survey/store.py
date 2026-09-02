@@ -499,6 +499,38 @@ def import_survey_run(
     }
 
 
+def delete_survey_run(connection: sqlite3.Connection, survey_run_id: str) -> dict[str, Any]:
+    """Remove one survey run and everything derived from it.
+
+    Additive to this module: nothing existing changes behaviour. The frequency
+    catalog's first/last-seen columns are recomputed from what survives, the
+    same rule `import_survey_run` follows, so a deleted run's timestamps cannot
+    linger on a catalog row.
+    """
+    touched = {
+        int(row["rf_frequency_id"])
+        for row in connection.execute(
+            "SELECT rf_frequency_id FROM rf_observations WHERE survey_run_id = ?",
+            (survey_run_id,),
+        )
+    }
+    existed = (
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM survey_runs WHERE survey_run_id = ?", (survey_run_id,)
+        ).fetchone()["n"]
+        > 0
+    )
+    _delete_run(connection, survey_run_id)
+    for rf_frequency_id in touched:
+        _rebuild_rf_frequency_timestamps(connection, rf_frequency_id)
+    connection.commit()
+    return {
+        "survey_run_id": survey_run_id,
+        "existed": existed,
+        "rf_frequencies_recomputed": len(touched),
+    }
+
+
 def fetch_survey_table(connection: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
     if table not in _SURVEY_TABLES:
         raise ValueError(f"Unsupported survey table: {table}")
@@ -563,6 +595,7 @@ __all__ = [
     "SurveyRunRecord",
     "band_profile_settings_json",
     "connect_survey_database",
+    "delete_survey_run",
     "fetch_survey_table",
     "get_run",
     "get_run_observations",

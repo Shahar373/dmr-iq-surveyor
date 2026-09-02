@@ -392,7 +392,7 @@ and separately, whether it can be used at all:
 | `level_unreliable` | detected outside the measured passband, so the roll-off understates its level |
 | `receiver_artifact` | landed on the receiver's own DC/LO spike, whose level is a property of the radio |
 | `superseded_channel` | the site has two control channels; only one may count per stop |
-| `run_excluded` | the whole stop was barred — a truncated capture or driver overflows |
+| `run_excluded` | the whole stop was barred — a truncated capture, driver overflows, or set aside by the operator |
 | `no_position` | the run has no coordinates |
 | `ambiguous` | excluded by the ladder above |
 
@@ -426,6 +426,52 @@ The solver refuses rather than guessing:
 A region is a search-area reduction, not a transmitter coordinate, and reports never present the
 posterior mode as one. Simulcast — several transmitters keyed together as one logical site — is not
 modelled; every solution records `source_model: single_transmitter_assumed`.
+
+### Where to go next
+
+```bash
+dmr-surveyor geo plan
+```
+
+Geometry decides a campaign more than stop count does, and choosing well is hard from inside a car.
+After every solve the system ranks candidate places by how much a stop there would teach: for each
+site, the binary entropy of the detection probability its current posterior predicts, weighted so a
+site already pinned down stops pulling the plan, and damped near places already measured.
+
+A place where a site is certainly heard, or certainly not, teaches nothing about where it is. A place
+where the posterior genuinely cannot say teaches the most. The field app draws this as a layer and
+numbers the top suggestions; `geo export plan.gpx --format gpx` loads them into a phone navigator.
+
+It is a planning aid computed from current beliefs, not a prediction about the transmitters.
+
+### Keeping stops comparable
+
+The method compares levels between places, so anything that shifts one stop's levels as a whole
+corrupts it. Three guards, all reported whether or not they fire:
+
+- **Per-stop common-mode offset.** If every site heard at one stop sits the same distance from its
+  predicted level while the rest of the campaign fits, the stop is what differs — a re-seated
+  antenna, local interference, front-end compression. The solve runs a second pass with that offset
+  removed. It is only estimated where it is identifiable (three or more sites heard), only applied
+  when the sites actually agree on it (a large but scattered residual is model misfit, not a shared
+  shift), and the reported magnitude is a lower bound because the first pass already absorbed part
+  of it. `--no-common-mode` reports without applying.
+- **Gain drift.** The gain actually applied is stored per stop, and measurements from a stop
+  recorded at a gain other than the campaign's are flagged.
+- **Noise-floor shift.** Levels are SNR above the local noise floor, so a floor that moves takes
+  every level with it. A stop more than 4 dB from the campaign's median floor is flagged.
+
+### Managing stops and exporting
+
+The field app's **Stops** tab lists every stop and can set one aside — its measurements stop
+counting, the reason is recorded, and it can be put back — or delete it outright. Exports:
+
+```bash
+dmr-surveyor geo export survey.kml --format kml   # regions over imagery in Google Earth
+dmr-surveyor geo export stops.gpx --format gpx    # suggested next stops for a navigator
+dmr-surveyor geo export map.geojson               # everything, for anything else
+```
+
 
 ### Field web app
 

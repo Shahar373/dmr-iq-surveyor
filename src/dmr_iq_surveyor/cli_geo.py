@@ -15,6 +15,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from dmr_iq_surveyor.geo.commonmode import CommonModeSettings
+from dmr_iq_surveyor.geo.export import to_gpx, to_kml
 from dmr_iq_surveyor.geo.measurements import MeasurementSettings
 from dmr_iq_surveyor.geo.model import SolveSettings
 from dmr_iq_surveyor.geo.pipeline import (
@@ -24,7 +26,11 @@ from dmr_iq_surveyor.geo.pipeline import (
     site_overview,
     solve_all_sites,
 )
-from dmr_iq_surveyor.geo.store import connect_geo_database, solution_history
+from dmr_iq_surveyor.geo.store import (
+    connect_geo_database,
+    latest_plan,
+    solution_history,
+)
 from dmr_iq_surveyor.reference.p25_sites import ReferenceError
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
 
@@ -157,6 +163,17 @@ def geo_solve(
     min_detections: Annotated[
         int, typer.Option("--min-detections", help="Detections required before solving at all")
     ] = 3,
+    common_mode: Annotated[
+        bool,
+        typer.Option(
+            "--common-mode/--no-common-mode",
+            help=(
+                "Detect and correct a per-stop level offset shared by every site heard there "
+                "(a moved antenna, a raised noise floor). It is always reported; this controls "
+                "whether it is applied"
+            ),
+        ),
+    ] = True,
 ) -> None:
     """Estimate a credible region for every site with usable measurements."""
     # The coarse pass must never be finer than the fine pass. Scaling it with
@@ -176,6 +193,7 @@ def geo_solve(
             site_keys=site or None,
             solve_batch_id=batch_id,
             settings=settings,
+            common_mode=CommonModeSettings(enabled=common_mode),
         )
     except (ValueError, OSError, sqlite3.Error) as exc:
         console.print(f"[bold red]Solve failed:[/bold red] {exc}")
@@ -207,6 +225,47 @@ def geo_solve(
     console.print(
         "[yellow]A region is a search-area reduction, not a transmitter coordinate.[/yellow]"
     )
+
+    offsets = report["common_mode"]
+    notable = [
+        offset for offset in offsets["offsets"].values() if offset["status"] != "within_noise"
+    ]
+    if notable:
+        table = Table(title="Per-stop common-mode level offsets")
+        table.add_column("Stop", style="bold")
+        table.add_column("Status")
+        table.add_column("Offset", justify="right")
+        table.add_column("Sites", justify="right")
+        table.add_column("Applied")
+        for offset in sorted(notable, key=lambda item: item["survey_run_id"]):
+            table.add_row(
+                offset["survey_run_id"],
+                offset["status"],
+                f"{offset['offset_db']:+.1f} dB",
+                str(offset["site_count"]),
+                "yes" if offset["applied"] else "no",
+            )
+        console.print(table)
+
+    plan = report["plan"]
+    if plan.get("top_stops"):
+        table = Table(title="Where to go next")
+        table.add_column("#", justify="right")
+        table.add_column("Latitude")
+        table.add_column("Longitude")
+        table.add_column("Value", justify="right")
+        table.add_column("Helps most")
+        for rank, stop in enumerate(plan["top_stops"], start=1):
+            table.add_row(
+                str(rank),
+                f"{stop['latitude']:.5f}",
+                f"{stop['longitude']:.5f}",
+                f"{stop['value']:.2f}",
+                ", ".join(item["site_key"] for item in stop["helps_most"]),
+            )
+        console.print(table)
+    elif plan.get("reason"):
+        console.print(f"[dim]No next-stop suggestion: {plan['reason']}[/dim]")
     if "output_dir" in report:
         markdown = (
             Path(report["output_dir"]) / "reports" / f"geolocation_{report['solve_batch_id']}.md"
@@ -295,23 +354,105 @@ def geo_history(
     console.print(table)
 
 
+@geo_app.command("plan")
+def geo_plan(database: DatabaseOption = None) -> None:
+    """Show where the next stop would teach the most."""
+    connection = connect_geo_database(_database(database))
+    try:
+        stored = latest_plan(connection)
+    finally:
+        connection.close()
+    if stored is None:
+        console.print("No plan yet. Run `dmr-surveyor geo solve` first.")
+        return
+    plan = json.loads(stored["plan_json"] or "{}")
+    if not plan.get("top_stops"):
+        console.print(f"[yellow]{plan.get('reason') or stored['status']}[/yellow]")
+        return
+
+    table = Table(title=f"Where to go next (from solve {stored['solve_batch_id']})")
+    table.add_column("#", justify="right")
+    table.add_column("Latitude")
+    table.add_column("Longitude")
+    table.add_column("Value", justify="right")
+    table.add_column("Helps most")
+    for rank, stop in enumerate(plan["top_stops"], start=1):
+        table.add_row(
+            str(rank),
+            f"{stop['latitude']:.5f}",
+            f"{stop['longitude']:.5f}",
+            f"{stop['value']:.2f}",
+            ", ".join(item["site_key"] for item in stop["helps_most"]),
+        )
+    console.print(table)
+    console.print(
+        "[dim]Value is how unpredictable a measurement there would be: a place where a site is "
+        "certainly heard, or certainly not, teaches nothing about where it is.[/dim]"
+    )
+
+
 @geo_app.command("export")
 def geo_export(
-    output: Annotated[Path, typer.Argument(help="GeoJSON file to write")],
+    output: Annotated[
+        Path,
+        typer.Argument(
+            help="File to write. The format follows the extension unless --format is given"
+        ),
+    ],
     database: DatabaseOption = None,
+    export_format: Annotated[
+        str | None,
+        typer.Option(
+            "--format",
+            help="geojson, kml (regions over imagery in Google Earth), or gpx (stops for a navigator)",
+        ),
+    ] = None,
 ) -> None:
-    """Write measurements, estimates and credible regions as one GeoJSON."""
+    """Write measurements, estimates, regions and the next-stop plan."""
+    destination = Path(output).expanduser().resolve()
+    chosen = (export_format or destination.suffix.lstrip(".") or "geojson").lower()
+    if chosen not in ("geojson", "json", "kml", "gpx"):
+        console.print(f"[bold red]Unsupported format:[/bold red] {chosen}")
+        raise typer.Exit(code=1)
+
     try:
-        payload = build_map_geojson(database_path=_database(database))
+        connection = connect_geo_database(_database(database))
+        try:
+            stored = latest_plan(connection)
+            visited = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT DISTINCT survey_run_id, latitude, longitude FROM geo_measurements "
+                    "WHERE latitude IS NOT NULL"
+                )
+            ]
+        finally:
+            connection.close()
+        plan = json.loads((stored or {}).get("plan_json") or "{}")
+        collection = build_map_geojson(database_path=_database(database))
+        if stored is not None:
+            plan_features = json.loads(stored["geojson"] or "{}").get("features", [])
+            collection["features"].extend(plan_features)
     except (OSError, sqlite3.Error) as exc:
         console.print(f"[bold red]Export failed:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
-    destination = Path(output).expanduser().resolve()
+
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    console.print(
-        f"[green]Wrote[/green] {len(payload['features'])} features to {destination}"
-    )
+    if chosen == "kml":
+        destination.write_text(to_kml(collection), encoding="utf-8")
+        console.print(f"[green]Wrote KML to[/green] {destination}")
+    elif chosen == "gpx":
+        if not plan.get("top_stops"):
+            console.print(
+                "[yellow]No suggested stops to export.[/yellow] Run `geo solve` first."
+            )
+        destination.write_text(to_gpx(plan, visited=visited), encoding="utf-8")
+        console.print(f"[green]Wrote GPX to[/green] {destination}")
+    else:
+        destination.write_text(json.dumps(collection, indent=2), encoding="utf-8")
+        console.print(
+            f"[green]Wrote[/green] {len(collection['features'])} features to {destination}"
+        )
 
 
 __all__ = ["geo_app"]
