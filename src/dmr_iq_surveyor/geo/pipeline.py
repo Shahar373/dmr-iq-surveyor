@@ -103,8 +103,10 @@ def import_reference_sites(
         summary["measurements_rebuilt"] = rebuilt["summary"]
         summary["warnings"] = [
             *summary["warnings"],
-            f"{stale} existing measurement(s) were rebuilt against the new snapshot; "
-            "re-run `geo solve` for the solutions to follow",
+            (
+                f"{stale} existing measurement(s) were rebuilt against the new snapshot; "
+                "re-run `geo solve` for the solutions to follow"
+            ),
         ]
     return summary
 

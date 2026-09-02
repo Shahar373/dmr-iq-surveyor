@@ -113,9 +113,11 @@ def render_solution_markdown(
             "the rest of the campaign fits, the stop is what differs. Only differences between stops",
             "are identifiable, so these are centred on zero.",
             "",
-            f"- estimated at {common_mode.get('estimated', 0)} stop(s), "
-            f"{common_mode.get('within_noise', 0)} within noise, "
-            f"{common_mode.get('not_estimable', 0)} not estimable",
+            (
+                f"- estimated at {common_mode.get('estimated', 0)} stop(s), "
+                f"{common_mode.get('within_noise', 0)} within noise, "
+                f"{common_mode.get('not_estimable', 0)} not estimable"
+            ),
             f"- corrections applied: {common_mode.get('applied', 0)}",
             f"- largest offset: {common_mode.get('largest_offset_db', 0.0):.1f} dB",
             "",
