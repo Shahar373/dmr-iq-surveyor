@@ -16,7 +16,12 @@ from fixtures.geo_scenario import Transmitter, build_database, seed_run
 
 from dmr_iq_surveyor.web.jobs import JobRegistry
 from dmr_iq_surveyor.web.server import create_server
-from dmr_iq_surveyor.web.service import FieldService, FieldSettings, slugify
+from dmr_iq_surveyor.web.service import (
+    FieldService,
+    FieldSettings,
+    slugify,
+    throttle_capture_progress,
+)
 
 SITE30 = Transmitter(867_762_500.0, 32.050, 34.800, reference_level_db=25.0)
 STOPS = [
@@ -448,3 +453,90 @@ def test_exports_are_downloadable_in_each_format(client: Client) -> None:
     request = urllib.request.Request(client.base + "/api/export?format=kml&token=s3cret")
     with urllib.request.urlopen(request, timeout=60) as response:
         assert "<script>" not in response.read().decode()
+
+
+# ------------------------------------------------------- capture progress throttle
+
+
+def test_throttle_capture_progress_suppresses_rapid_calls() -> None:
+    """Reproduces the field failure at the unit level: `run_capture()` calls
+    `on_progress` on every device read -- tens of times a second at a real
+    sample rate -- and the wrapped callback (in practice `Job.emit`, which
+    takes a lock and appends to a list) must not run anywhere near that
+    often, or its overhead starves the loop reading from the SDR."""
+    calls: list[tuple[int, int, float]] = []
+    wrapped = throttle_capture_progress(
+        lambda frames, target, elapsed: calls.append((frames, target, elapsed)),
+        min_interval_seconds=0.5,
+    )
+    # 100 chunks arriving within 0.2s of wall-clock time, as they would at a
+    # real sample rate on a device that streams far faster than 2 Hz.
+    for index in range(1, 101):
+        wrapped(index * 100, 10_000, elapsed=0.002 * index)
+    assert len(calls) <= 2, f"expected the burst collapsed to ~1 call, got {len(calls)}"
+    assert calls[0][2] == pytest.approx(0.002, abs=1e-9), "the first call must pass through"
+
+
+def test_throttle_capture_progress_always_forwards_the_final_call() -> None:
+    """The 100%-complete update must never be swallowed by the throttle,
+    however close in time it lands to the previous forwarded one."""
+    calls: list[tuple[int, int, float]] = []
+    wrapped = throttle_capture_progress(
+        lambda frames, target, elapsed: calls.append((frames, target, elapsed)),
+        min_interval_seconds=0.5,
+    )
+    wrapped(0, 1000, elapsed=0.0)
+    wrapped(1000, 1000, elapsed=0.001)  # completion, 1ms after the first call
+    assert calls[-1] == (1000, 1000, 0.001)
+
+
+def test_throttle_capture_progress_forwards_calls_spaced_far_enough_apart() -> None:
+    calls: list[float] = []
+    wrapped = throttle_capture_progress(
+        lambda frames, target, elapsed: calls.append(elapsed), min_interval_seconds=0.5
+    )
+    for elapsed in (0.0, 0.6, 1.3, 1.35, 2.0):
+        wrapped(1, 100, elapsed=elapsed)
+    # 1.35 lands under 0.5s after 1.3 and must be suppressed; the rest are
+    # each at least 0.5s apart from the last FORWARDED call.
+    assert calls == [0.0, 0.6, 1.3, 2.0]
+
+
+def test_throttle_capture_progress_matches_a_real_capture_loops_call_pattern(
+    tmp_path: Path,
+) -> None:
+    """End to end through the actual capture loop (`run_capture` with the
+    project's own synthetic device stub), not just the throttle function in
+    isolation: proves the fix applies where the bug actually lived."""
+    from test_capture_core import FakeIqDevice
+
+    from dmr_iq_surveyor.capture.core import CaptureSettings, run_capture
+
+    settings = CaptureSettings(
+        center_frequency_hz=868_000_000.0,
+        sample_rate_hz=200_000.0,
+        duration_seconds=0.5,
+        if_gain_reduction_db=40.0,
+        agc=False,
+        chunk_frames=1_000,  # small chunks -> many on_progress calls per second
+    )
+    raw_calls: list[float] = []
+    forwarded_calls: list[float] = []
+    throttled = throttle_capture_progress(
+        lambda frames, target, elapsed: forwarded_calls.append(elapsed), min_interval_seconds=0.5
+    )
+
+    def on_progress(frames: int, target: int, elapsed: float) -> None:
+        raw_calls.append(elapsed)
+        throttled(frames, target, elapsed)
+
+    manifest = run_capture(
+        tmp_path, settings=settings, device=FakeIqDevice(), on_progress=on_progress
+    )
+    assert manifest["complete"] is True
+    assert len(raw_calls) > 10, "the test setup should exercise many chunks, like a real capture"
+    assert len(forwarded_calls) <= 3, (
+        f"a synthetic device with no artificial delay delivers all chunks within "
+        f"milliseconds of wall-clock time, so almost all {len(raw_calls)} raw calls "
+        f"should collapse to the first and the final one; got {len(forwarded_calls)}"
+    )

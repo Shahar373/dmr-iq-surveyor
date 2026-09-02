@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,6 +61,45 @@ POSITION_SOURCE_MANUAL = "user"
 def slugify(value: str, fallback: str) -> str:
     slug = _SLUG.sub("_", value.strip().lower()).strip("_")
     return slug or fallback
+
+
+# Minimum wall-clock spacing between forwarded capture-progress callbacks.
+# Fast enough to look live to a human, far below the per-chunk rate a
+# capture actually delivers at.
+_CAPTURE_PROGRESS_MIN_INTERVAL_SECONDS = 0.5
+
+
+def throttle_capture_progress(
+    callback: Callable[[int, int, float], None],
+    *,
+    min_interval_seconds: float = _CAPTURE_PROGRESS_MIN_INTERVAL_SECONDS,
+) -> Callable[[int, int, float], None]:
+    """Wrap a capture `on_progress` callback so it forwards at most a few
+    times a second, always including the final (`frames >= target`) call.
+
+    `run_capture()` calls its `on_progress` on every device read -- tens of
+    times a second at a field sample rate -- from INSIDE the same loop that
+    reads from the SDR. `Job.emit()` (the callback this wraps in practice)
+    takes a lock, formats a timestamp and appends to a list; cheap once, but
+    SoapySDR's own ring buffer is only tens of milliseconds deep (see
+    `capture/device.py`), so that overhead, paid on every single chunk for
+    the whole capture, is enough to starve the read loop into a real buffer
+    overflow. Reproduced live in the field: a 90 s capture at 5 MS/s through
+    this app overflowed continuously and had to be aborted, while the
+    identical rate and gain through the plain CLI -- whose progress callback
+    only updates a Rich progress bar, no lock or list involved -- completed
+    two clean 15 s runs with zero overflows.
+    """
+    last_emitted = -min_interval_seconds
+
+    def wrapped(frames: int, target: int, elapsed: float) -> None:
+        nonlocal last_emitted
+        if frames < target and elapsed - last_emitted < min_interval_seconds:
+            return
+        last_emitted = elapsed
+        callback(frames, target, elapsed)
+
+    return wrapped
 
 
 @dataclass(slots=True)
@@ -485,8 +525,7 @@ class FieldService:
         recordings = Path(self.settings.recordings_dir).expanduser().resolve()
         started = time.time()
 
-        def on_progress(frames: int, target: int, elapsed: float) -> None:
-            job.check_cancelled()
+        def emit_capture_progress(frames: int, target: int, elapsed: float) -> None:
             fraction = frames / target if target else 0.0
             # Capture is the long pole, so it owns most of the bar; the
             # analysis stages that follow are quick by comparison.
@@ -497,6 +536,15 @@ class FieldService:
                 progress=0.02 + 0.58 * fraction,
                 extra={"frames": frames, "target_frames": target},
             )
+
+        throttled_emit = throttle_capture_progress(emit_capture_progress)
+
+        def on_progress(frames: int, target: int, elapsed: float) -> None:
+            # Cancellation must stay responsive on every chunk; only the
+            # expensive part (job.emit -- see throttle_capture_progress) is
+            # throttled.
+            job.check_cancelled()
+            throttled_emit(frames, target, elapsed)
 
         job.emit("capture", "recording", progress=0.02)
         manifest = run_capture(
@@ -758,4 +806,10 @@ class FieldService:
         return report
 
 
-__all__ = ["FieldService", "FieldSettings", "PositionStale", "slugify"]
+__all__ = [
+    "FieldService",
+    "FieldSettings",
+    "PositionStale",
+    "slugify",
+    "throttle_capture_progress",
+]
