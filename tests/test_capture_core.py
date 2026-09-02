@@ -302,6 +302,67 @@ def test_stalled_device_hits_the_deadline_instead_of_hanging(tmp_path: Path) -> 
     assert info.frame_count == 0
 
 
+def test_on_progress_fires_even_when_every_read_comes_back_empty(tmp_path: Path) -> None:
+    """The field app checks for job cancellation from inside `on_progress`.
+    A device that is overflowing continuously returns an empty chunk on
+    every read; that check must still run on every loop iteration, or the
+    operator's Cancel button silently stops working for as long as the
+    overflow storm lasts."""
+    calls: list[int] = []
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=0.5,
+        if_gain_reduction_db=20.0,
+    )
+    run_capture(
+        tmp_path,
+        settings=settings,
+        device=StalledIqDevice(),
+        on_progress=lambda frames, target, _elapsed: calls.append(frames),
+        timeout_factor=0.2,
+    )
+    assert len(calls) > 5, "on_progress must keep firing during a sustained empty-read streak"
+    assert all(frames == 0 for frames in calls), "no frames were ever actually written"
+
+
+def test_cancellation_from_on_progress_stops_an_overflow_storm_promptly(tmp_path: Path) -> None:
+    """Reproduces the field failure directly: a capture overflowing
+    continuously must still respond to cancellation quickly, not only once
+    the (much longer, minutes-scale) wall-clock deadline elapses. Before the
+    fix, a cancelling exception raised from `on_progress` could never fire
+    here because the empty-chunk fast path skipped `on_progress` entirely."""
+
+    class _Cancelled(Exception):
+        pass
+
+    calls: list[int] = []
+
+    def on_progress(frames: int, target: int, elapsed: float) -> None:
+        calls.append(frames)
+        if len(calls) >= 5:
+            raise _Cancelled("operator cancelled")
+
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=1.0,
+        if_gain_reduction_db=20.0,
+    )
+    started = time.monotonic()
+    with pytest.raises(_Cancelled):
+        run_capture(
+            tmp_path,
+            settings=settings,
+            device=StalledIqDevice(),
+            on_progress=on_progress,
+            timeout_factor=1.0,
+        )
+    elapsed = time.monotonic() - started
+    assert elapsed < 5.0, "cancellation must not wait for the overflow-storm deadline"
+    assert len(calls) == 5
+
+
 def test_progress_callback_reports_monotonic_advance(tmp_path: Path) -> None:
     """The field operator watches this for 90 seconds; it must actually
     move, and never go backwards."""

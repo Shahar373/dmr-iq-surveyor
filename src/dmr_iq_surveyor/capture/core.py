@@ -132,7 +132,12 @@ def run_capture(
 
     `on_progress(frames_written, target_frames, elapsed_seconds)` is called
     as the capture advances, so an operator watching a field capture sees it
-    moving instead of a blank terminal.
+    moving instead of a blank terminal. It fires every loop iteration,
+    including one where the device read came back empty (an overflow or a
+    timed-out read) -- the field app's caller checks for cancellation from
+    inside this callback, and a sustained overflow storm must not be able to
+    block that check, or "Cancel" silently stops working for as long as the
+    storm lasts.
 
     A wall-clock deadline of `timeout_factor` x the requested duration (plus
     a fixed grace period) bounds the run. A device that delivers samples far
@@ -170,11 +175,10 @@ def run_capture(
             remaining = target_frame_count - writer.frame_count
             chunk = resolved_device.read_stream_chunk(min(settings.chunk_frames, remaining))
             chunk = np.asarray(chunk)
-            if chunk.size == 0:
-                continue
-            if chunk.size > remaining:
-                chunk = chunk[:remaining]
-            writer.write_frames(chunk)
+            if chunk.size > 0:
+                if chunk.size > remaining:
+                    chunk = chunk[:remaining]
+                writer.write_frames(chunk)
             if on_progress is not None:
                 on_progress(writer.frame_count, target_frame_count, time.time() - started)
     finally:
