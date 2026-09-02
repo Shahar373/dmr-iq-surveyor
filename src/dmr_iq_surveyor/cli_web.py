@@ -14,7 +14,12 @@ import typer
 from rich.console import Console
 
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
-from dmr_iq_surveyor.survey.profiles import ProfileError, resolve_band_profile, resolve_site_profile
+from dmr_iq_surveyor.survey.profiles import (
+    ProfileError,
+    SiteProfile,
+    resolve_band_profile,
+    resolve_site_profile,
+)
 from dmr_iq_surveyor.web.recordings import GIB, disk_status
 from dmr_iq_surveyor.web.server import serve_forever
 from dmr_iq_surveyor.web.service import FieldSettings
@@ -45,6 +50,51 @@ def _local_addresses(port: int) -> list[str]:
         probe.close()
     addresses.append(f"http://localhost:{port}")
     return addresses
+
+
+def _resolve_capture_gain(
+    if_gain_reduction: float | None,
+    lna_state: int | None,
+    site_profile: SiteProfile,
+) -> tuple[float, int, list[str]]:
+    """Resolve the field app's default capture gain, and say where it came from.
+
+    Precedence: an explicit CLI flag always wins. Otherwise the resolved
+    site profile -- the one file this project's whole field guide tells an
+    operator to fill in -- seeds it silently, since that is a deliberate
+    choice already recorded. Only when NEITHER says anything does this fall
+    back to a hardcoded default, and that fallback is always reported: an
+    unconfirmed default is exactly the risk the project's gain-discipline
+    checks (`gain_differs_from_campaign`) exist to catch after the fact, so
+    it is better caught here, before a single stop is recorded.
+    """
+    notices: list[str] = []
+
+    resolved_gain = if_gain_reduction
+    if resolved_gain is None:
+        if site_profile.gain is not None:
+            resolved_gain = site_profile.gain
+        else:
+            resolved_gain = 40.0
+            notices.append(
+                f"no gain recorded in the {site_profile.site_id!r} site profile; "
+                f"defaulting IF gain reduction to {resolved_gain:g} dB -- confirm this in the "
+                "app before recording"
+            )
+
+    resolved_lna = lna_state
+    if resolved_lna is None:
+        if site_profile.lna_state is not None:
+            resolved_lna = site_profile.lna_state
+        else:
+            resolved_lna = 2
+            notices.append(
+                f"no LNA state recorded in the {site_profile.site_id!r} site profile; "
+                f"defaulting to LNA state {resolved_lna} -- confirm this in the app before "
+                "recording"
+            )
+
+    return resolved_gain, resolved_lna, notices
 
 
 @web_app.command("serve")
@@ -96,13 +146,26 @@ def web_serve(
         ),
     ] = 90.0,
     if_gain_reduction: Annotated[
-        float,
+        float | None,
         typer.Option(
             "--if-gain-reduction",
-            help="Default SDRplay IF gain reduction in dB; keep it identical at every stop",
+            help=(
+                "Default SDRplay IF gain reduction in dB; keep it identical at every stop. "
+                "Falls back to the resolved site profile's `gain`, then to 40.0 if neither "
+                "is set -- an explicit flag here always wins over the site profile"
+            ),
         ),
-    ] = 40.0,
-    lna_state: Annotated[int, typer.Option("--lna-state", help="Default SDRplay LNA state")] = 2,
+    ] = None,
+    lna_state: Annotated[
+        int | None,
+        typer.Option(
+            "--lna-state",
+            help=(
+                "Default SDRplay LNA state. Falls back to the site profile's `lna_state`, "
+                "then to 2 if neither is set"
+            ),
+        ),
+    ] = None,
     driver: Annotated[str, typer.Option(help="SoapySDR driver name")] = "sdrplay",
     map_latitude: Annotated[
         float, typer.Option("--map-latitude", help="Initial map centre latitude")
@@ -170,6 +233,34 @@ def web_serve(
     unless `--host` says otherwise. On an open network, pass `--token auto`
     and use the printed URL.
     """
+    # Resolved BEFORE FieldSettings, and before anything is paid for: a typo
+    # here must fail now, not after the operator has driven somewhere and
+    # recorded a 90 s stop against a profile that doesn't exist. The
+    # resolved site profile also seeds the gain defaults below -- editing
+    # `config/sites/<name>.yaml` is the one thing this project's whole field
+    # guide tells an operator to do, so the app has to actually read it.
+    try:
+        resolve_band_profile(band)
+        resolved_site_profile = resolve_site_profile(site)
+    except (ProfileError, FileNotFoundError, OSError) as exc:
+        console.print(f"[bold red]Profile could not be resolved:[/bold red] {exc}")
+        console.print(
+            "Band profiles live in config/bands/, site profiles in config/sites/, "
+            "resolved relative to the current directory."
+        )
+        raise typer.Exit(code=1) from exc
+
+    resolved_gain, resolved_lna, gain_notices = _resolve_capture_gain(
+        if_gain_reduction, lna_state, resolved_site_profile
+    )
+    for notice in gain_notices:
+        console.print(f"[yellow]Gain default:[/yellow] {notice}")
+    if not gain_notices:
+        console.print(
+            f"[green]Gain from site profile[/green] {site!r}: "
+            f"IF gain reduction {resolved_gain:g} dB, LNA state {resolved_lna}"
+        )
+
     resolved_token = secrets.token_urlsafe(12) if token == "auto" else token
     settings = FieldSettings(
         database_path=database or DEFAULT_DATABASE_PATH,
@@ -180,8 +271,8 @@ def web_serve(
         center_frequency_hz=center_frequency,
         sample_rate_hz=sample_rate,
         duration_seconds=duration,
-        if_gain_reduction_db=if_gain_reduction,
-        lna_state=lna_state,
+        if_gain_reduction_db=resolved_gain,
+        lna_state=resolved_lna,
         driver=driver,
         allow_capture=capture_enabled,
         keep_recordings=keep_recordings,
@@ -193,19 +284,6 @@ def web_serve(
         map_zoom=map_zoom,
         token=resolved_token,
     )
-
-    # Fail here rather than after the operator has driven somewhere and paid
-    # for a 120 s capture.
-    try:
-        resolve_band_profile(band)
-        resolve_site_profile(site)
-    except (ProfileError, FileNotFoundError, OSError) as exc:
-        console.print(f"[bold red]Profile could not be resolved:[/bold red] {exc}")
-        console.print(
-            "Band profiles live in config/bands/, site profiles in config/sites/, "
-            "resolved relative to the current directory."
-        )
-        raise typer.Exit(code=1) from exc
 
     space = disk_status(
         settings.recordings_dir,

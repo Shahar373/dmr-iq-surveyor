@@ -98,3 +98,23 @@ def test_site_profile_gain_comparable_requires_both_fields() -> None:
     assert not SiteProfile(site_id="x", label="x", gain_mode="manual").is_gain_comparable
     assert not SiteProfile(site_id="x", label="x", gain=10.0).is_gain_comparable
     assert SiteProfile(site_id="x", label="x", gain_mode="manual", gain=10.0).is_gain_comparable
+
+
+def test_site_profile_lna_state_defaults_to_none_and_round_trips(tmp_path: Path) -> None:
+    """A profile written before this field existed must still load cleanly."""
+    profile = load_site_profile(REPO_ROOT / "config" / "sites" / "home.example.yaml")
+    assert profile.lna_state is None
+
+    path = tmp_path / "site.yaml"
+    path.write_text(
+        "site_id: field\nlabel: field\ngain_mode: manual\ngain: 26\nlna_state: 8\n",
+        encoding="utf-8",
+    )
+    loaded = load_site_profile(path)
+    assert loaded.gain == 26.0
+    assert loaded.lna_state == 8
+
+
+def test_site_profile_rejects_negative_lna_state() -> None:
+    with pytest.raises(ProfileError, match="lna_state"):
+        SiteProfile(site_id="x", label="x", lna_state=-1).validate()

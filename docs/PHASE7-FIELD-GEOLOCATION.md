@@ -35,8 +35,26 @@ dmr-surveyor survey preflight runs/field/recordings \
 
 Pick an IF gain reduction that leaves headroom at the strongest site you expect (a clipped or
 compressed capture reports a *lower* SNR than a clean one, which the model reads as "further away").
-Write it into `config/sites/mobile.yaml` and pass the same value at every stop. A site profile with
-no recorded gain is imported, but every measurement from it carries `not_gain_comparable`.
+A fast way to get a real number without trial and error: record ~10-15 s at a deliberately
+insensitive setting (e.g. `--if-gr 55 --lna-state 8`, guaranteed not to clip), `dmr-surveyor inspect`
+it, and read `aggregate.i.peak_abs` / `aggregate.q.peak_abs` from `sample_statistics.json` (values
+are normalized, so `1.0` is full-scale). Headroom in dB is `-20*log10(peak_abs)`; reduce the IF gain
+reduction by that minus a safety margin (10-15 dB) to land on a working value.
+
+Write both `gain` (the IF gain reduction) **and** `lna_state` into `config/sites/mobile.yaml`:
+
+```yaml
+gain_mode: manual
+gain: 26
+lna_state: 8
+```
+
+`dmr-surveyor web serve` reads its default capture gain from **this file**, not from its own
+`--if-gain-reduction`/`--lna-state` flags — those exist only as an override, and are never the place
+to record a real value. The server prints which source it used (site profile, or a fallback) on
+startup; a fallback is a mistake waiting to record a stop at the wrong gain, so treat it as one. A
+site profile with no recorded gain is imported, but every measurement from it carries
+`not_gain_comparable`.
 
 ## 2. Capture settings
 
