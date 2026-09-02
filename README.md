@@ -389,6 +389,10 @@ and separately, whether it can be used at all:
 |---|---|
 | `usable` | inside the run's *measured* usable passband, and the run has a position |
 | `not_covered` | outside the measured passband. **Not evidence** — we did not look there |
+| `level_unreliable` | detected outside the measured passband, so the roll-off understates its level |
+| `receiver_artifact` | landed on the receiver's own DC/LO spike, whose level is a property of the radio |
+| `superseded_channel` | the site has two control channels; only one may count per stop |
+| `run_excluded` | the whole stop was barred — a truncated capture or driver overflows |
 | `no_position` | the run has no coordinates |
 | `ambiguous` | excluded by the ladder above |
 
@@ -443,6 +447,13 @@ localhost, so over plain HTTP from a phone, tap the map to place your position.
 The solve that runs after each stop uses a coarser grid (`--solve-resolution-m`, default 250 m) so it
 finishes in seconds; `--no-solve-after-capture` skips it entirely on a long campaign. Run
 `dmr-surveyor geo solve --resolution-m 100` once at the end of the day.
+
+**Recordings are not kept.** A 5 MS/s, 90 s stop writes 1.68 GiB, so a 20-stop campaign would be
+33 GiB — more than a Pi in the field has. The recording is only needed until the survey has
+extracted its observations into SQLite, so free space is checked *before* every capture (a capture
+that does not fit is refused, with the numbers) and, after a survey succeeds, recordings beyond
+`--keep-recordings` (default 1) are deleted, with each deletion written to a ledger and every
+capture's `*_capture_report.json` left behind. A failed stop keeps its IQ. Peak disk is 3.35 GiB.
 
 See [`docs/phase7-geolocation-design.md`](docs/phase7-geolocation-design.md) for the full design and
 schema, [`docs/PHASE7-FIELD-GEOLOCATION.md`](docs/PHASE7-FIELD-GEOLOCATION.md) for the campaign

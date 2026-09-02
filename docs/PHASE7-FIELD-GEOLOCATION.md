@@ -44,11 +44,49 @@ no recorded gain is imported, but every measurement from it carries `not_gain_co
 centre frequency: 867.406250 MHz     midpoint of the control channels in the snapshot
 sample rate:      5.000 MS/s          covers 866.0-868.8 MHz in one capture
 band profile:     central_800_narrow  matches what that capture can actually cover
-duration:         90-180 s            long enough for persistence to separate a control
-                                      channel from a passing burst
+duration:         90 s                18 analysis segments; 1.68 GiB
 AGC:              off
 antenna:          same mount, same height, same orientation at every stop
 ```
+
+### Why 5 MS/s, and why not lower
+
+The control channels span 866.0625-868.7500 MHz, or 2.6875 MHz. The SDRplay driver picks the
+analog IF filter from the sample rate, and the steps are coarse: **every rate from 1.536 up to (but
+not including) 5 MS/s gets the same 1.536 MHz filter**. So 3 and 4 MS/s cost storage bandwidth and
+buy no extra spectrum, and 2 MS/s cannot cover the band at all.
+
+| Rate | Analog IF | Usable | Covers 2.6875 MHz? | Per stop at 90 s |
+|---|---|---|---|---|
+| 2.0 MS/s | 1.536 MHz | 1.536 MHz | no | 0.67 GiB |
+| 3.0-4.0 MS/s | 1.536 MHz | 1.536 MHz | no | 1.01-1.34 GiB |
+| **5.0 MS/s** | **5.000 MHz** | **5.000 MHz** | **yes** | **1.68 GiB** |
+
+## 2a. Storage: recordings are not kept
+
+A campaign cannot keep its raw IQ. Twenty stops at 5 MS/s x 90 s is 33 GiB, and a Pi in the field
+does not have it.
+
+It does not need to. The recording is only required until the survey has extracted its observations
+into SQLite; after that it is 1.68 GiB describing something already measured. So:
+
+- Before every capture the free space is checked against what the capture needs plus headroom. A
+  capture that does not fit is **refused**, with the numbers — filling the card mid-capture costs the
+  stop and can leave the recording unreadable.
+- After a survey **succeeds**, recordings beyond the newest `--keep-recordings` (default 1) are
+  deleted, and each deletion is written to `recordings/retention.json`. A failed stop keeps its IQ.
+- Every capture keeps its `*_capture_report.json` — a few kilobytes recording the settings, frame
+  count, overflow count and timing of exactly what was recorded. A discarded recording leaves
+  evidence, not a gap.
+
+| Policy | Peak disk at 5 MS/s x 90 s |
+|---|---|
+| `--keep-recordings 0` | 1.68 GiB |
+| `--keep-recordings 1` (default) | 3.35 GiB |
+| keeping everything (not offered) | 33 GiB over 20 stops |
+
+The app shows free space, the size of one stop and how many more stops fit; **Free disk** on the
+Sites tab clears the kept recordings mid-campaign.
 
 One capture measures every site's control channel at the same instant with the same receiver state.
 That is why they are comparable at all — never retune between sites within a stop.
@@ -83,7 +121,10 @@ dmr-surveyor web serve --host 0.0.0.0 --token auto \
 Then, at every stop:
 
 1. Stop the vehicle, engine and any inverter off if they raise the noise floor.
-2. Set your position — **Use phone GPS**, or tap the map. Give the stop a name.
+2. Set your position — **Use phone GPS**, or tap the map. Give the stop a name. The readout shows
+   how long ago it was marked; past 20 minutes the app asks you to confirm before recording, because
+   a stop recorded against the *previous* stop's coordinates is the one mistake that silently
+   corrupts a whole campaign.
 3. Check the gain fields still show the campaign value.
 4. Press **Record this stop** and watch it through capture → survey → measurements → solve.
 5. Check the result: a new point should appear on the map, and the site list should update.
@@ -119,6 +160,25 @@ dmr-surveyor geo history BEE00:37D:1:30
 | `weak_geometry` | All detections from one bearing. Add stops on the far side. |
 | `frequency_unknown` | No control channel on record. Nothing to measure until one is found. |
 | `no_measurements` | Every measurement was excluded — usually a shared frequency. |
+
+Individual measurements can also be set aside, always with a reason:
+
+| Exclusion | Meaning |
+|---|---|
+| `not_covered` | Outside the run's measured usable passband. We did not look; not evidence. |
+| `level_unreliable` | Detected outside the measured passband, so the roll-off understates its level. |
+| `receiver_artifact` | Landed on the receiver's own DC/LO spike, whose level is a property of the radio. |
+| `superseded_channel` | The site has two control channels; only one may count per stop. |
+| `run_excluded` | The whole stop was barred — a truncated capture or driver overflows. |
+| `ambiguous` | The frequency is on record for more than one site. |
+
+A stop whose capture was truncated, or which suffered driver overflows, is **excluded automatically**.
+A signal that was there but was not recorded long enough to be detected would otherwise arrive as a
+non-detection, and a non-detection is evidence that pushes the site away from that stop — a confident
+wrong measurement rather than a missing one.
+
+The gain actually applied is stored per stop. If one stop was recorded at a different gain from the
+rest of the campaign, every measurement from it is flagged `gain_differs_from_campaign`.
 
 `geo history` is the campaign's progress report: the 90% area for a site should shrink as sessions
 accumulate. If it stops shrinking, more stops of the same kind will not help — change the geometry.

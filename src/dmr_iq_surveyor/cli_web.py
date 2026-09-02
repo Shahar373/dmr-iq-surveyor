@@ -14,6 +14,8 @@ import typer
 from rich.console import Console
 
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
+from dmr_iq_surveyor.survey.profiles import ProfileError, resolve_band_profile, resolve_site_profile
+from dmr_iq_surveyor.web.recordings import GIB, disk_status
 from dmr_iq_surveyor.web.server import serve_forever
 from dmr_iq_surveyor.web.service import FieldSettings
 
@@ -60,7 +62,16 @@ def web_serve(
     database: Annotated[
         Path | None, typer.Option("--database", help="Persistent inventory SQLite path")
     ] = None,
-    band: Annotated[str, typer.Option(help="Band profile name or path")] = "central_800",
+    band: Annotated[
+        str,
+        typer.Option(
+            help=(
+                "Band profile name or path. The default matches what one 5 MS/s capture at "
+                "867.40625 MHz can actually cover; central_800 asks for 866-870 MHz and would "
+                "report every run as partial coverage"
+            )
+        ),
+    ] = "central_800_narrow",
     site: Annotated[
         str, typer.Option(help="Site profile name or path, providing the fixed equipment context")
     ] = "home",
@@ -76,7 +87,14 @@ def web_serve(
     sample_rate: Annotated[
         float, typer.Option("--sample-rate", help="Default sample rate in samples/s")
     ] = 5_000_000.0,
-    duration: Annotated[float, typer.Option(help="Default capture duration in seconds")] = 120.0,
+    duration: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "Default capture duration in seconds. 90 s at 5 MS/s is 1.68 GiB per stop"
+            )
+        ),
+    ] = 90.0,
     if_gain_reduction: Annotated[
         float,
         typer.Option(
@@ -122,6 +140,18 @@ def web_serve(
             ),
         ),
     ] = True,
+    keep_recordings: Annotated[
+        int,
+        typer.Option(
+            "--keep-recordings",
+            min=0,
+            help=(
+                "How many captured recordings to keep on disk. Each 5 MS/s 120 s stop is about "
+                "2.24 GiB, so a campaign cannot keep them all; the survey has already extracted "
+                "what geolocation needs. 0 keeps none, 1 lets you re-analyse the stop just made"
+            ),
+        ),
+    ] = 1,
     solve_resolution: Annotated[
         float,
         typer.Option(
@@ -154,6 +184,7 @@ def web_serve(
         lna_state=lna_state,
         driver=driver,
         allow_capture=capture_enabled,
+        keep_recordings=keep_recordings,
         solve_after_capture=solve_after_capture,
         solve_resolution_m=solve_resolution,
         tile_url=tile_url,
@@ -162,6 +193,36 @@ def web_serve(
         map_zoom=map_zoom,
         token=resolved_token,
     )
+
+    # Fail here rather than after the operator has driven somewhere and paid
+    # for a 120 s capture.
+    try:
+        resolve_band_profile(band)
+        resolve_site_profile(site)
+    except (ProfileError, FileNotFoundError, OSError) as exc:
+        console.print(f"[bold red]Profile could not be resolved:[/bold red] {exc}")
+        console.print(
+            "Band profiles live in config/bands/, site profiles in config/sites/, "
+            "resolved relative to the current directory."
+        )
+        raise typer.Exit(code=1) from exc
+
+    space = disk_status(
+        settings.recordings_dir,
+        sample_rate_hz=sample_rate,
+        duration_seconds=duration,
+        keep_recordings=keep_recordings,
+    )
+    console.print(
+        f"[bold]Storage[/bold] {space.free_bytes / GIB:.2f} GiB free, "
+        f"{space.per_capture_bytes / GIB:.2f} GiB per stop, keeping {keep_recordings} recording(s)"
+    )
+    if not space.ready:
+        console.print(f"[bold red]Not enough space:[/bold red] {space.reason}")
+    elif keep_recordings and space.captures_that_fit < 3:
+        console.print(
+            "[yellow]Little headroom.[/yellow] Consider --keep-recordings 0 or a shorter --duration."
+        )
 
     suffix = f"?token={resolved_token}" if resolved_token else ""
     console.print("[bold]Field app[/bold]")

@@ -42,10 +42,35 @@ Independently of attribution, each measurement records its **usability**:
 
 | `usability` | Meaning |
 |---|---|
-| `usable` | The frequency was inside this run's *measured* usable passband, and the run has a position |
-| `not_covered` | The frequency fell outside the run's measured usable passband. **This is not evidence.** We did not look there. |
+| `usable` | Inside this run's *measured* usable passband, and the run has a position |
+| `not_covered` | Outside the run's measured usable passband. **This is not evidence.** We did not look there. |
+| `level_unreliable` | Detected, but outside the measured passband, so the roll-off understates its level by an amount nothing here can bound. The solver reads level as distance, so an understated level would place the site further away *with confidence*. |
+| `receiver_artifact` | Landed on the receiver's own DC/LO spike. Its level is a property of the radio, present at every stop, so matching it to a site would inject the same confident wrong measurement into the whole campaign. |
+| `superseded_channel` | The site has more than one control channel on record. Two channels of one site measured from one place are not independent evidence, and the solver multiplies likelihood terms — so only one may count per stop. |
+| `run_excluded` | The whole survey run was barred from geolocation (see below) |
 | `no_position` | The run has no coordinates, so the measurement cannot be placed |
 | `ambiguous` / `frequency_unknown` | Excluded by the attribution ladder above |
+
+`edge_warning` is deliberately *not* an exclusion. It marks a fixed 150 kHz margin from the
+recording's Nyquist edges (`SpectrumSettings.edge_exclusion_hz`) — an absolute width, not a measured
+one, which at low sample rates covers the entire band. The measured usable passband is the honest
+edge test and runs separately.
+
+### Barring a whole run
+
+`geo_run_exclusions` bars one survey run from contributing, with a reason. It is applied
+automatically when a capture delivered materially less than it asked for, or suffered driver
+overflows. The reasoning matters: a signal that was present but was not recorded long enough to be
+detected would arrive as a **non-detection**, and a non-detection is evidence that pushes the site
+*away* from that stop. A short capture would therefore not merely lose a measurement — it would
+manufacture a confident wrong one. The run stays in the database as evidence; it stops counting.
+
+### Gain drift
+
+Levels recorded at different receiver gain are not on one scale, and the method is a comparison of
+levels between places. The gain actually applied is stored per stop (not the site profile's
+placeholder), and measurements from a stop whose gain differs from the campaign's modal value are
+flagged `gain_differs_from_campaign`.
 
 The `not_covered` versus `not_observed` split is the same honesty rule Phase 6A already enforces
 between `NOT_COMPARABLE` and `MISSING_THIS_RUN`, applied to geolocation: *"outside our measured
@@ -114,7 +139,11 @@ entirely.
   answer. A posterior keeps both lobes visible.
 - **It handles censored non-detections natively**, which a least-squares residual cannot.
 - **Its output is already the requested product**: iso-probability contours of the posterior *are*
-  the polygons to draw on the map.
+  the polygons to draw on the map. A region clipped by the edge of the analysed area is closed
+  along that edge, by contouring a surface padded with a below-threshold border — closing an open
+  contour end to end instead draws a chord across the region and understates it (measured: 11.7 km²
+  drawn for a region whose cells cover 29.3 km²), which is exactly the wrong direction for a tool
+  whose job is to report uncertainty honestly.
 - **It is explainable.** Every input is a stored number with a unit; no learned classifier is
   involved, per `CLAUDE.md`.
 
@@ -184,6 +213,7 @@ p25_sites             (system, rfss, site) + observation_status, nac_hex, notes
 p25_site_channels     site -> control-channel frequency, with role and evidence
 geo_measurements      one row per (survey_run, p25_site, frequency): level or censoring level,
                       position, attribution, usability, quality flags
+geo_run_exclusions    a survey run barred from geolocation, and why
 geo_solutions         one row per (solve batch, site): status, mode, credible areas, diagnostics,
                       GeoJSON, and the exact run ids that produced it
 ```
@@ -199,7 +229,9 @@ Rules enforced in code:
   measurements replaces that run's rows; re-solving with the same batch id replaces that batch.
   Same contract as `inventory.replace_run` and `import_survey_run`.
 - Solution history is kept. Solve batches accumulate so the shrinking of a site's region across
-  sessions is inspectable, not overwritten.
+  sessions is inspectable, not overwritten. "Latest" is by insertion order, never by timestamp: a
+  Raspberry Pi has no real-time clock, so a solve run later in the day can carry an earlier
+  timestamp than one run before it.
 
 ## 8. Field web app
 
@@ -232,6 +264,17 @@ with it.
 
 Capture is a real SDR capture through the existing `capture/` module, unchanged. With no SDR
 attached the API reports the device probe error instead of pretending.
+
+**Storage.** A 5 MS/s, 90 s stop writes 1.68 GiB, so a campaign cannot keep its recordings on the
+storage a Pi in the field has. It does not need to: the recording is only required until the survey
+has extracted its observations. Free space is checked *before* every capture and a capture that does
+not fit is refused with the numbers; after a survey succeeds, recordings beyond `keep_recordings`
+(default 1) are deleted and each deletion is written to a ledger, while every capture's
+`*_capture_report.json` stays behind. A failed stop keeps its IQ.
+
+**Preconditions are checked before the operator pays for a capture.** Band and site profiles are
+resolved, disk is checked, and the device is probed at submit time — not inside the job, after the
+90 seconds have already been spent.
 
 ## 9. Scope
 

@@ -187,3 +187,56 @@ def test_stored_solution_geojson_round_trips(tmp_path: Path) -> None:
     payload = json.loads(row["geojson"])
     assert payload["type"] == "FeatureCollection"
     assert payload["features"]
+
+
+def test_latest_solution_survives_a_clock_that_jumps_backwards(tmp_path: Path) -> None:
+    """A Raspberry Pi has no RTC: it boots stale and jumps when NTP arrives.
+
+    A solve run later in the day can therefore carry an earlier timestamp
+    than one run before it, and ranking on that string showed a superseded
+    region on the map.
+    """
+    from dmr_iq_surveyor.geo.store import latest_solutions, store_solution
+
+    database = tmp_path / "db.sqlite3"
+    connection = build_database(database)
+    site_id = int(
+        connection.execute(
+            "SELECT p25_site_id FROM p25_sites WHERE site_key = 'BEE00:37D:1:30'"
+        ).fetchone()["p25_site_id"]
+    )
+    base = {
+        "p25_site_id": site_id,
+        "method": "m",
+        "source_model": "s",
+        "status": "ok",
+        "detection_count": 3,
+        "non_detection_count": 1,
+        "excluded_count": 0,
+        "level_metric": "snr_db",
+        "tool_version": "test",
+    }
+    store_solution(
+        connection,
+        solve_batch_id="earlier_run",
+        row={**base, "solved_at": "2026-09-02T10:00:00+00:00", "area_km2_90": 100.0},
+    )
+    store_solution(
+        connection,
+        solve_batch_id="later_run_stale_clock",
+        row={**base, "solved_at": "2025-01-01T00:00:00+00:00", "area_km2_90": 5.0},
+    )
+    latest = [row for row in latest_solutions(connection) if row["site_key"] == "BEE00:37D:1:30"]
+    assert len(latest) == 1
+    assert latest[0]["solve_batch_id"] == "later_run_stale_clock"
+
+    # Two solves inside the same second must not duplicate the site either.
+    store_solution(
+        connection,
+        solve_batch_id="same_second",
+        row={**base, "solved_at": "2026-09-02T10:00:00+00:00", "area_km2_90": 7.0},
+    )
+    latest = [row for row in latest_solutions(connection) if row["site_key"] == "BEE00:37D:1:30"]
+    assert len(latest) == 1
+    assert latest[0]["solve_batch_id"] == "same_second"
+    connection.close()

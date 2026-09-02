@@ -328,3 +328,56 @@ def test_geojson_shape_is_valid() -> None:
         first = feature["geometry"]["coordinates"][0][0]
         assert first[0] == first[-1], "rings are closed"
         assert -180 <= first[0][0] <= 180 and -90 <= first[0][1] <= 90
+
+
+def test_a_clipped_region_is_outlined_along_the_analysed_edge_not_chorded() -> None:
+    """A region cut off by the edge of the analysed area must be drawn as the
+    region, not as a chord across it.
+
+    Closing an open contour end-to-end drew 11.7 km2 for a region whose cells
+    cover 29.3 km2 -- the map understating the uncertainty by 60%, in exactly
+    the early-campaign case where the operator uses it to choose the next stop.
+    """
+    grid = Grid(x_min=-5000.0, y_min=-5000.0, resolution_m=200.0, nx=51, ny=51)
+    xs, ys = grid.axes()
+    x, y = np.meshgrid(xs, ys)
+    probability = np.exp(-(((x - 4200) ** 2 + (y - 4200) ** 2) / (2 * 2500.0**2)))
+    region = credible_regions(_surface(probability, grid), (0.9,))[0]
+
+    assert region["touches_analysed_edge"] is True
+    assert region["polygons"], "a clipped region must still be drawable"
+
+    def ring_area_km2(ring: list[list[float]]) -> float:
+        points = np.array(ring)
+        longitude, latitude = points[:, 0], points[:, 1]
+        east = longitude * np.cos(np.radians(latitude.mean())) * 111.32
+        north = latitude * 110.57
+        return 0.5 * abs(
+            np.sum(east * np.roll(north, -1) - np.roll(east, -1) * north)
+        )
+
+    drawn = sum(
+        ring_area_km2(ring) if index == 0 else -ring_area_km2(ring)
+        for polygon in region["polygons"]
+        for index, ring in enumerate(polygon)
+    )
+    assert drawn == pytest.approx(region["area_km2"], rel=0.10), (
+        "the drawn outline must agree with the cell-count area to within "
+        "a grid cell's worth, not understate it"
+    )
+
+
+def test_an_undrawable_region_says_why_instead_of_arriving_empty() -> None:
+    grid = Grid(x_min=0.0, y_min=0.0, resolution_m=100.0, nx=3, ny=3)
+    probability = np.zeros(9)
+    probability[4] = 1.0
+    surface = PosteriorSurface(
+        grid=grid, projection=LocalProjection(32.0, 34.8), probability=probability
+    )
+    region = credible_regions(surface, (0.5,))[0]
+    if not region["polygons"]:
+        assert region["note"], "an undrawable region must carry a reason"
+        payload = regions_to_geojson([region], {"site_key": "S"})
+        assert payload["features"], "and must still appear, with a null geometry"
+        assert payload["features"][0]["geometry"] is None
+        assert payload["features"][0]["properties"]["undrawable_reason"]

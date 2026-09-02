@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS geo_solutions (
 );
 CREATE INDEX IF NOT EXISTS idx_geo_solutions_site
     ON geo_solutions(p25_site_id, solved_at);
+CREATE TABLE IF NOT EXISTS geo_run_exclusions (
+    survey_run_id TEXT PRIMARY KEY REFERENCES survey_runs(survey_run_id) ON DELETE CASCADE,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -95,6 +100,38 @@ def connect_geo_database(path: str | Path) -> sqlite3.Connection:
     connection.executescript(GEO_SCHEMA)
     connection.commit()
     return connection
+
+
+def exclude_run(connection: sqlite3.Connection, survey_run_id: str, reason: str) -> None:
+    """Bar one survey run from contributing to geolocation, with a reason.
+
+    A truncated capture is the case that matters: a signal that was there but
+    was not recorded long enough to be detected becomes a *non-detection*,
+    and a non-detection is evidence that pushes the site away from that stop.
+    A short capture would therefore not merely lose a measurement -- it would
+    manufacture a confident wrong one. The run stays in the database as
+    evidence; it just stops counting.
+    """
+    connection.execute(
+        "INSERT OR REPLACE INTO geo_run_exclusions(survey_run_id, reason, created_at) "
+        "VALUES (?, ?, ?)",
+        (survey_run_id, reason, datetime.now(UTC).isoformat()),
+    )
+    connection.commit()
+
+
+def clear_run_exclusion(connection: sqlite3.Connection, survey_run_id: str) -> None:
+    connection.execute(
+        "DELETE FROM geo_run_exclusions WHERE survey_run_id = ?", (survey_run_id,)
+    )
+    connection.commit()
+
+
+def run_exclusion(connection: sqlite3.Connection, survey_run_id: str) -> str | None:
+    row = connection.execute(
+        "SELECT reason FROM geo_run_exclusions WHERE survey_run_id = ?", (survey_run_id,)
+    ).fetchone()
+    return str(row["reason"]) if row is not None else None
 
 
 def replace_run_measurements(
@@ -241,14 +278,21 @@ def latest_solutions(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     History is kept deliberately -- watching a site's region shrink across
     solve batches is the point of accumulating sessions -- so "latest" is a
     query, not a destructive update.
+
+    "Most recent" is by insertion order (`geo_solution_id`), never by
+    `solved_at`. A Raspberry Pi has no real-time clock: it boots with a stale
+    time and jumps when NTP arrives over the phone hotspot, so a solve run
+    later in the day can carry an earlier timestamp than one run before it.
+    Ranking on that string showed a superseded solution and, when two solves
+    landed in the same second, returned the same site twice.
     """
     rows = connection.execute(
         """
         SELECT g.*, s.site_key, s.rfss, s.site, s.observation_status
         FROM geo_solutions g
         JOIN p25_sites s ON s.p25_site_id = g.p25_site_id
-        WHERE g.solved_at = (
-            SELECT MAX(inner_solution.solved_at)
+        WHERE g.geo_solution_id = (
+            SELECT MAX(inner_solution.geo_solution_id)
             FROM geo_solutions inner_solution
             WHERE inner_solution.p25_site_id = g.p25_site_id
         )
@@ -268,7 +312,7 @@ def solution_history(connection: sqlite3.Connection, p25_site_id: int) -> list[d
                    mode_latitude, mode_longitude
             FROM geo_solutions
             WHERE p25_site_id = ?
-            ORDER BY solved_at ASC
+            ORDER BY geo_solution_id ASC
             """,
             (p25_site_id,),
         )
@@ -277,11 +321,14 @@ def solution_history(connection: sqlite3.Connection, p25_site_id: int) -> list[d
 
 __all__ = [
     "GEO_SCHEMA",
+    "clear_run_exclusion",
     "connect_geo_database",
+    "exclude_run",
     "fetch_all_measurements",
     "fetch_site_measurements",
     "latest_solutions",
     "replace_run_measurements",
+    "run_exclusion",
     "solution_history",
     "store_solution",
 ]

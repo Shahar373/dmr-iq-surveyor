@@ -42,10 +42,28 @@ def _point_in_ring(x: float, y: float, ring: np.ndarray) -> bool:
     return inside
 
 
-def _close_ring(points: np.ndarray) -> np.ndarray:
-    if len(points) >= 2 and not np.allclose(points[0], points[-1]):
-        return np.vstack([points, points[:1]])
-    return points
+def _padded(
+    probability: np.ndarray, xs: np.ndarray, ys: np.ndarray, resolution_m: float, floor: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Surround the surface with one ring of below-threshold cells.
+
+    A credible region that reaches the edge of the analysed area produces an
+    *open* polyline from the contourer, because the region is clipped by the
+    grid rather than closed by the data. Joining such a polyline end to end
+    draws a chord across the region and reports a shape that is not the
+    region at all -- measured at 11.7 km2 for a region whose cells cover
+    29.3 km2, i.e. the map understating the uncertainty by 60%.
+
+    Padding with a floor value below any threshold makes every contour close
+    inside the padded array, hugging the grid boundary exactly where the
+    region is clipped. That is the correct shape, and it keeps every ring
+    closed so the hole-nesting below stays valid.
+    """
+    padded = np.full((probability.shape[0] + 2, probability.shape[1] + 2), floor, dtype=float)
+    padded[1:-1, 1:-1] = probability
+    padded_xs = np.concatenate(([xs[0] - resolution_m], xs, [xs[-1] + resolution_m]))
+    padded_ys = np.concatenate(([ys[0] - resolution_m], ys, [ys[-1] + resolution_m]))
+    return padded, padded_xs, padded_ys
 
 
 def _assign_holes(rings: list[np.ndarray]) -> list[list[np.ndarray]]:
@@ -106,18 +124,33 @@ def credible_regions(
             mask[0, :].any() or mask[-1, :].any() or mask[:, 0].any() or mask[:, -1].any()
         )
         rings: list[np.ndarray] = []
+        note = ""
         # A degenerate surface (one cell holding everything, or a threshold
         # equal to the maximum) has no contour to trace; the cell-count area
         # below still describes it truthfully.
         if np.isfinite(threshold) and probability.max() > threshold:
+            padded, padded_xs, padded_ys = _padded(
+                probability, xs, ys, grid.resolution_m, min(float(probability.min()), threshold) - 1.0
+            )
             figure = Figure()
             axes = figure.subplots()
-            contours = axes.contour(xs, ys, probability, levels=[threshold])
+            contours = axes.contour(padded_xs, padded_ys, padded, levels=[threshold])
             for segment in contours.allsegs[0]:
-                if len(segment) >= 3:
-                    rings.append(_close_ring(np.asarray(segment, dtype=float)))
+                points = np.asarray(segment, dtype=float)
+                if len(points) < 3:
+                    continue
+                if not np.allclose(points[0], points[-1]):
+                    # Should not happen once padded; keep it visible rather
+                    # than silently drawing a chord across the region.
+                    note = "an unclosed contour segment was discarded"
+                    continue
+                rings.append(points)
+        else:
+            note = "no contour could be traced at this level; the area comes from the cell count"
 
         polygons = _assign_holes(rings) if rings else []
+        if rings and not polygons:
+            note = "contour rings could not be nested into polygons"
         geographic: list[list[list[list[float]]]] = []
         for polygon in polygons:
             converted: list[list[list[float]]] = []
@@ -145,6 +178,9 @@ def credible_regions(
                 "cell_count": int(mask.sum()),
                 "touches_analysed_edge": touches_edge,
                 "polygons": geographic,
+                # "missing is not null": a region with no drawable outline
+                # says why, instead of arriving as a bare empty list.
+                "note": note,
             }
         )
     return regions
@@ -153,11 +189,30 @@ def credible_regions(
 def regions_to_geojson(
     regions: list[dict[str, Any]], properties: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    """One GeoJSON `FeatureCollection`, one MultiPolygon feature per level."""
+    """One GeoJSON `FeatureCollection`, one MultiPolygon feature per level.
+
+    A region with no drawable polygon still produces a feature -- a null
+    geometry carrying its area, its level and the reason -- so a consumer
+    sees "we have a region we could not outline" rather than nothing at all.
+    """
     base = dict(properties or {})
     features = []
     for region in regions:
         if not region["polygons"]:
+            if region.get("area_km2"):
+                features.append(
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            **base,
+                            "credible_level": region["level"],
+                            "area_km2": region["area_km2"],
+                            "touches_analysed_edge": region["touches_analysed_edge"],
+                            "undrawable_reason": region.get("note") or "no outline available",
+                        },
+                        "geometry": None,
+                    }
+                )
             continue
         feature_properties = dict(base)
         feature_properties.update(
@@ -165,6 +220,7 @@ def regions_to_geojson(
                 "credible_level": region["level"],
                 "area_km2": region["area_km2"],
                 "touches_analysed_edge": region["touches_analysed_edge"],
+                "note": region.get("note", ""),
             }
         )
         features.append(

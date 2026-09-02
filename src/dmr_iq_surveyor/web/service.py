@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,11 +27,22 @@ from dmr_iq_surveyor.geo.pipeline import (
     site_overview,
     solve_all_sites,
 )
-from dmr_iq_surveyor.geo.store import connect_geo_database
+from dmr_iq_surveyor.geo.store import connect_geo_database, exclude_run
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_survey
+from dmr_iq_surveyor.survey.profiles import (
+    ProfileError,
+    SiteProfile,
+    resolve_band_profile,
+    resolve_site_profile,
+)
 from dmr_iq_surveyor.web.jobs import Job, JobRegistry
+from dmr_iq_surveyor.web.recordings import disk_status, enforce_retention, purge_recordings
 
 _SLUG = re.compile(r"[^a-z0-9]+")
+
+
+class PositionStale(RuntimeError):
+    """The marked position is old enough that it must be confirmed."""
 
 POSITION_SOURCE_BROWSER = "browser_gps"
 POSITION_SOURCE_MANUAL = "user"
@@ -52,7 +63,11 @@ class FieldSettings:
     site_profile: str = "home"
     center_frequency_hz: float = 867_406_250.0
     sample_rate_hz: float = 5_000_000.0
-    duration_seconds: float = 120.0
+    # 90 s at 5 MS/s is 1.68 GiB. With one recording kept that peaks at
+    # 3.35 GiB, which fits the ~10 GiB a Pi in the field actually has, and
+    # still yields 18 analysis segments -- enough for persistence to tell a
+    # continuous control channel from a passing burst.
+    duration_seconds: float = 90.0
     if_gain_reduction_db: float = 40.0
     lna_state: int = 2
     driver: str = "sdrplay"
@@ -65,6 +80,18 @@ class FieldSettings:
     solve_after_capture: bool = True
     solve_resolution_m: float = 250.0
     solve_max_cells: int = 40_000
+    # A 5 MS/s, 120 s stop writes ~2.24 GiB, so a campaign cannot keep every
+    # recording on the storage a Pi has in the field. One is kept so the stop
+    # just made can still be re-analysed; older ones go once their survey has
+    # succeeded, and the deletion is written to a ledger.
+    keep_recordings: int = 1
+    # A capture that delivered materially less than it asked for must not
+    # contribute: undetected weak signals would become non-detections, which
+    # is evidence, not absence.
+    min_capture_completeness: float = 0.8
+    # Beyond this, the marked position is presumed stale and the operator has
+    # to confirm it before a stop is recorded against it.
+    position_stale_after_seconds: float = 1_200.0
     tile_url: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
     tile_attribution: str = "(c) OpenStreetMap contributors"
     map_center: tuple[float, float] = (32.0853, 34.7818)
@@ -157,11 +184,35 @@ class FieldService:
             connection.close()
         return [dict(row) for row in rows]
 
+    def disk(self) -> dict[str, Any]:
+        return disk_status(
+            self.settings.recordings_dir,
+            sample_rate_hz=self.settings.sample_rate_hz,
+            duration_seconds=self.settings.duration_seconds,
+            keep_recordings=self.settings.keep_recordings,
+        ).to_dict()
+
+    def purge(self) -> dict[str, Any]:
+        return purge_recordings(self.settings.recordings_dir)
+
+    def position_age_seconds(self) -> float | None:
+        position = self.get_position()
+        set_at = position.get("set_at")
+        if not set_at:
+            return None
+        try:
+            marked = datetime.fromisoformat(set_at)
+        except ValueError:
+            return None
+        return max(0.0, (datetime.now(UTC) - marked).total_seconds())
+
     def state(self) -> dict[str, Any]:
         return {
             "settings": self.settings.to_public_dict(),
             "position": self.get_position(),
+            "position_age_seconds": self.position_age_seconds(),
             "device": self.device_probe(),
+            "disk": self.disk(),
             "sites": site_overview(database_path=self.settings.database_path),
             "runs": self.survey_runs(),
             "jobs": self.jobs.list(),
@@ -181,12 +232,21 @@ class FieldService:
                 "mark your position on the map before recording; a recording with no "
                 "position cannot contribute to geolocation"
             )
-        # Probed before accepting the job so a missing or busy SDR is an
-        # immediate, actionable answer rather than a job that starts, looks
-        # like it is running, and then fails.
-        probe = probe_soapysdr(self.settings.driver)
-        if not probe.available:
-            raise RuntimeError(probe.probe_error or "no SDR device available")
+        # A stop recorded against the previous stop's coordinates is the one
+        # mistake that silently corrupts a whole campaign: everything looks
+        # fine and the posterior is simply wrong. So a position older than the
+        # staleness window has to be confirmed before it is used again.
+        age = self.position_age_seconds()
+        if (
+            age is not None
+            and age > self.settings.position_stale_after_seconds
+            and not payload.get("confirm_position")
+        ):
+            raise PositionStale(
+                f"the marked position is {age / 60:.0f} minutes old "
+                f"({position.get('label') or 'unnamed'}); confirm it is still where you are"
+            )
+
 
         moment = datetime.now(UTC)
         label = str(payload.get("label") or position.get("label") or "").strip()
@@ -208,7 +268,46 @@ class FieldService:
             driver=self.settings.driver,
         )
         capture.validate()
+
+        # Storage is checked BEFORE the SDR is opened. Filling the medium
+        # mid-capture costs the stop and can leave the recording unreadable.
+        space = disk_status(
+            self.settings.recordings_dir,
+            sample_rate_hz=capture.sample_rate_hz,
+            duration_seconds=capture.duration_seconds,
+            keep_recordings=self.settings.keep_recordings,
+        )
+        if not space.ready:
+            raise RuntimeError(space.reason)
+
+        # Probed after the cheap preconditions, so a full card is reported as
+        # a full card rather than being masked by an SDR message, and before
+        # the job is accepted, so a missing or busy device is an immediate
+        # answer rather than a job that starts and then fails.
+        probe = probe_soapysdr(self.settings.driver)
+        if not probe.available:
+            raise RuntimeError(probe.probe_error or "no SDR device available")
+
+        # Profiles are resolved NOW, not inside the job: a typo or a wrong
+        # working directory would otherwise surface only after the full
+        # capture had already been paid for.
         band = str(payload.get("band") or self.settings.band)
+        try:
+            resolve_band_profile(band, base_dir=self.settings.profile_base_dir)
+            site_profile = resolve_site_profile(
+                self.settings.site_profile, base_dir=self.settings.profile_base_dir
+            )
+        except (ProfileError, FileNotFoundError, OSError) as exc:
+            raise ValueError(f"profile could not be resolved: {exc}") from exc
+
+        # Record the gain actually applied at this stop, not the profile's
+        # placeholder. Cross-stop comparability is the method's foundation, so
+        # the number it depends on has to be stored per stop to be checkable.
+        site_profile = replace(
+            site_profile,
+            gain=capture.if_gain_reduction_db,
+            gain_mode="agc" if capture.agc else "manual",
+        )
         solve = bool(payload.get("solve", self.settings.solve_after_capture))
 
         def work(job: Job) -> dict[str, Any]:
@@ -216,6 +315,7 @@ class FieldService:
                 job,
                 capture=capture,
                 band=band,
+                site_profile=site_profile,
                 run_id=run_id,
                 stop_id=stop_id,
                 label=label,
@@ -235,6 +335,7 @@ class FieldService:
         *,
         capture: CaptureSettings,
         band: str,
+        site_profile: SiteProfile,
         run_id: str,
         stop_id: str,
         label: str,
@@ -283,7 +384,7 @@ class FieldService:
             manifest["wav_path"],
             Path(self.settings.output_root).expanduser().resolve() / run_id,
             band=band,
-            site=self.settings.site_profile,
+            site=site_profile,
             run_id=run_id,
             database_path=self.settings.database_path,
             profile_base_dir=self.settings.profile_base_dir,
@@ -302,6 +403,33 @@ class FieldService:
             progress=0.82,
         )
 
+        # A materially short capture cannot be allowed to contribute. Weak
+        # signals it never had time to detect would arrive as non-detections,
+        # and a non-detection actively pushes a site away from this stop.
+        completeness = (
+            manifest["actual_duration_seconds"] / capture.duration_seconds
+            if capture.duration_seconds
+            else 0.0
+        )
+        integrity_reason = ""
+        if completeness < self.settings.min_capture_completeness:
+            integrity_reason = (
+                f"capture delivered {completeness * 100:.0f}% of the requested "
+                f"{capture.duration_seconds:.0f} s; too short to trust a non-detection"
+            )
+        elif manifest["overflow_count"]:
+            integrity_reason = (
+                f"{manifest['overflow_count']} driver overflow(s): the recording has gaps of "
+                "unknown length, so an absent signal may simply be in a gap"
+            )
+        if integrity_reason:
+            connection = connect_geo_database(Path(self.settings.database_path))
+            try:
+                exclude_run(connection, run_id, integrity_reason)
+            finally:
+                connection.close()
+            job.emit("measurements", "stop excluded from geolocation: " + integrity_reason)
+
         job.emit("measurements", "matching observations against the site registry", progress=0.85)
         measurements = materialise_measurements(
             database_path=self.settings.database_path,
@@ -315,6 +443,20 @@ class FieldService:
             f"{summary['not_covered']} outside the measured passband",
             progress=0.88,
         )
+
+        # The recording has done its job: the observations are in SQLite. Only
+        # now, and only after a SUCCESSFUL survey, is it eligible for deletion.
+        retention = enforce_retention(
+            self.settings.recordings_dir,
+            keep=self.settings.keep_recordings,
+            reason=f"survey {run_id} completed",
+        )
+        if retention["deleted_count"]:
+            job.emit(
+                "measurements",
+                f"freed {retention['freed_gib']:.2f} GiB by discarding "
+                f"{retention['deleted_count']} analysed recording(s)",
+            )
 
         solve_report: dict[str, Any] | None = None
         if solve:
@@ -335,6 +477,9 @@ class FieldService:
             },
             "survey": survey,
             "measurements": summary,
+            "excluded_from_geolocation": integrity_reason or None,
+            "retention": retention,
+            "disk": self.disk(),
             "solve": (
                 {
                     "solve_batch_id": solve_report["solve_batch_id"],
@@ -478,4 +623,4 @@ class FieldService:
         return report
 
 
-__all__ = ["FieldService", "FieldSettings", "slugify"]
+__all__ = ["FieldService", "FieldSettings", "PositionStale", "slugify"]

@@ -6,6 +6,7 @@ import json
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
@@ -261,3 +262,104 @@ def test_service_reports_a_missing_position_file_honestly(tmp_path: Path) -> Non
     assert service.get_position()["source"] == "not_set"
     (tmp_path / "position.json").write_text("{not json", encoding="utf-8")
     assert service.get_position()["source"] == "unavailable"
+
+
+def test_state_reports_disk_and_position_age(client: Client) -> None:
+    status, state = client.request("/api/state")
+    assert status == 200
+    disk = state["disk"]
+    assert disk["per_capture_bytes"] > 0
+    assert "captures_that_fit" in disk
+    assert disk["keep_recordings"] == 1
+    assert state["position_age_seconds"] is None
+
+    client.request("/api/position", {"latitude": 32.05, "longitude": 34.8, "label": "Ridge"})
+    assert client.request("/api/state")[1]["position_age_seconds"] is not None
+    assert client.request("/api/disk")[1]["per_capture_bytes"] == disk["per_capture_bytes"]
+
+
+def test_a_capture_that_does_not_fit_on_disk_is_refused_before_the_sdr_is_opened(
+    client: Client,
+) -> None:
+    client.request("/api/position", {"latitude": 32.05, "longitude": 34.8})
+    status, body = client.request(
+        "/api/capture", {"duration_seconds": 10_000_000, "sample_rate_hz": 10_000_000}
+    )
+    assert status == 409
+    assert "free" in body["error"] and "GiB" in body["error"]
+
+
+def test_a_stale_position_must_be_confirmed_before_a_stop_is_recorded(tmp_path: Path) -> None:
+    """Recording a stop against the previous stop's coordinates is the one
+    mistake that silently corrupts a whole campaign."""
+    from dmr_iq_surveyor.web.service import PositionStale
+
+    service = FieldService(
+        FieldSettings(
+            database_path=tmp_path / "db.sqlite3",
+            output_root=tmp_path / "out",
+            recordings_dir=tmp_path / "rec",
+            position_stale_after_seconds=0.0,
+        )
+    )
+    service.set_position({"latitude": 32.05, "longitude": 34.8, "label": "Ridge"})
+    with pytest.raises(PositionStale, match="confirm it is still where you are"):
+        service.start_capture({"duration_seconds": 5})
+    # Confirming gets past the staleness gate and on to the real precondition.
+    with pytest.raises(RuntimeError) as excinfo:
+        service.start_capture({"duration_seconds": 5, "confirm_position": True})
+    assert not isinstance(excinfo.value, PositionStale)
+
+
+def test_purge_frees_recordings_but_keeps_their_capture_reports(client: Client, tmp_path: Path) -> None:
+    recordings = tmp_path / "rec"
+    recordings.mkdir(parents=True, exist_ok=True)
+    (recordings / "stop_a.wav").write_bytes(b"0" * 4096)
+    (recordings / "stop_a_capture_report.json").write_text("{}", encoding="utf-8")
+
+    status, result = client.request("/api/recordings/purge", {})
+    assert status == 200
+    assert result["deleted_count"] == 1
+    assert not (recordings / "stop_a.wav").exists()
+    assert (recordings / "stop_a_capture_report.json").exists(), (
+        "the record of what was captured must outlive the recording"
+    )
+    assert (recordings / "retention.json").is_file()
+
+
+def test_a_negative_sse_cursor_does_not_spin(client: Client) -> None:
+    _, job = client.request("/api/solve", {})
+    events = client.stream(f"/api/jobs/{job['job_id']}/events?token=s3cret&cursor=-5", limit=250)
+    assert events[-1]["stage"] == "closed"
+    assert len(events) < 250, "a negative cursor must not replay events forever"
+
+
+def test_a_non_ascii_token_is_rejected_rather_than_crashing(client: Client) -> None:
+    """`secrets.compare_digest` raises TypeError on non-ASCII strings, and that
+    raise happened before the handler's try block: the connection was dropped
+    with no response at all instead of a 401.
+
+    Sent as a query parameter because an HTTP header cannot carry non-latin-1
+    bytes -- which is exactly how a browser would deliver it.
+    """
+    status, _ = client.request(
+        "/api/state?token=" + urllib.parse.quote("סוד"), token=None
+    )
+    assert status == 401
+
+
+def test_cross_origin_state_changing_requests_are_refused(client: Client) -> None:
+    request = urllib.request.Request(
+        client.base + "/api/position",
+        method="POST",
+        data=json.dumps({"latitude": 32.0, "longitude": 34.0}).encode(),
+    )
+    request.add_header("X-Auth-Token", client.token)
+    request.add_header("Content-Type", "application/json")
+    request.add_header("Origin", "http://evil.example")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            status = response.status
+    except urllib.error.HTTPError as error:
+        status = error.code
+    assert status == 403

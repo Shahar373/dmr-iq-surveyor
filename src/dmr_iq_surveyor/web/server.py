@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, urlparse
 
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.web.jobs import Job
-from dmr_iq_surveyor.web.service import FieldService, FieldSettings
+from dmr_iq_surveyor.web.service import FieldService, FieldSettings, PositionStale
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 
@@ -39,6 +39,14 @@ _MAX_BODY_BYTES = 1_000_000
 class _Handler(BaseHTTPRequestHandler):
     server_version = f"dmr-iq-surveyor/{__version__}"
     protocol_version = "HTTP/1.1"
+    # A phone that drives out of range mid-request leaves its socket open.
+    # Without a timeout the handler thread waits on it forever, and enough of
+    # those over a day's driving exhaust the server.
+    timeout = 60.0
+
+    def setup(self) -> None:
+        super().setup()
+        self._response_started = False
 
     # -- plumbing ----------------------------------------------------------
 
@@ -51,6 +59,14 @@ class _Handler(BaseHTTPRequestHandler):
             super().log_message(format, *args)
 
     def _send_json(self, payload: Any, status: int = 200) -> None:
+        if self._response_started:
+            # Headers or body bytes are already on the wire (a static file, or
+            # an SSE stream). Appending a second HTTP response here would
+            # corrupt the first one; drop the connection instead so the client
+            # sees a clean truncation it can retry.
+            self.close_connection = True
+            return
+        self._response_started = True
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -63,22 +79,64 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json({"error": message}, status=status)
 
     def _read_json(self) -> dict[str, Any]:
+        if (self.headers.get("Transfer-Encoding") or "").lower().strip() == "chunked":
+            # Not supported. Reading zero bytes would leave the chunk framing
+            # in the stream to be parsed as the next request line.
+            self.close_connection = True
+            raise ValueError("chunked request bodies are not supported")
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
             return {}
         if length > _MAX_BODY_BYTES:
+            self.close_connection = True
             raise ValueError("request body is too large")
         try:
             return json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"invalid JSON body: {exc}") from exc
 
+    def _discard_body(self) -> None:
+        """Consume an unread request body so the keep-alive stream stays in
+        sync. Rejecting a request without reading its body leaves those bytes
+        to be parsed as the next request line."""
+        if (self.headers.get("Transfer-Encoding") or "").lower().strip() == "chunked":
+            self.close_connection = True
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return
+        if length > _MAX_BODY_BYTES:
+            self.close_connection = True
+            return
+        try:
+            self.rfile.read(length)
+        except OSError:
+            self.close_connection = True
+
     def _authorised(self, query: dict[str, list[str]]) -> bool:
         token = self.service.settings.token
         if not token:
             return True
         supplied = self.headers.get("X-Auth-Token") or (query.get("token") or [""])[0]
-        return secrets.compare_digest(supplied, token)
+        # Compared as bytes: compare_digest raises TypeError on non-ASCII
+        # strings, and that raise happens before the handler's try block, so a
+        # token with a non-ASCII character dropped the connection with no
+        # response at all instead of returning 401.
+        return secrets.compare_digest(supplied.encode("utf-8"), token.encode("utf-8"))
+
+    def _same_origin(self) -> bool:
+        """Reject a cross-origin state-changing request.
+
+        The API can start an SDR capture and overwrite the marked position.
+        Without this, any web page the operator happens to open on the same
+        phone could POST to the server -- a browser sends the request with the
+        LAN address it can already reach.
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        host = self.headers.get("Host") or ""
+        return urlparse(origin).netloc == host
 
     # -- routing -----------------------------------------------------------
 
@@ -104,6 +162,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"sites": self.service.state()["sites"]})
             elif path == "/api/geojson":
                 self._send_json(self.service.geojson())
+            elif path == "/api/disk":
+                self._send_json(self.service.disk())
             elif path == "/api/jobs":
                 self._send_json({"jobs": self.service.jobs.list()})
             elif path.startswith("/api/jobs/") and path.endswith("/events"):
@@ -112,8 +172,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_job(path.split("/")[3])
             else:
                 self._send_error_json(404, f"no such endpoint: {path}")
-        except BrokenPipeError:
-            pass
+        except (BrokenPipeError, ConnectionResetError):
+            # A phone that walked out of range mid-response. Normal, not an error.
+            self.close_connection = True
         except Exception as exc:  # noqa: BLE001 - one bad request must not stop the server
             self._send_error_json(500, f"{type(exc).__name__}: {exc}")
 
@@ -121,7 +182,12 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         if not self._authorised(query):
+            self._discard_body()
             self._send_error_json(401, "missing or invalid token")
+            return
+        if not self._same_origin():
+            self._discard_body()
+            self._send_error_json(403, "cross-origin requests are not accepted")
             return
         path = parsed.path
         try:
@@ -134,6 +200,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._start(lambda: self.service.start_analysis(payload))
             elif path == "/api/solve":
                 self._start(lambda: self.service.start_solve(payload))
+            elif path == "/api/recordings/purge":
+                self._send_json(self.service.purge())
             elif path.startswith("/api/jobs/") and path.endswith("/cancel"):
                 job = self.service.jobs.get(path.split("/")[3])
                 if job is None:
@@ -145,8 +213,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_error_json(404, f"no such endpoint: {path}")
         except ValueError as exc:
             self._send_error_json(400, str(exc))
-        except BrokenPipeError:
-            pass
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
         except Exception as exc:  # noqa: BLE001 - one bad request must not stop the server
             self._send_error_json(500, f"{type(exc).__name__}: {exc}")
 
@@ -155,6 +223,12 @@ class _Handler(BaseHTTPRequestHandler):
     def _start(self, factory: Callable[[], Job]) -> None:
         try:
             job = factory()
+        except PositionStale as exc:
+            # Distinct from a plain error: the operator can resolve it by
+            # confirming the position, so the client is told exactly that.
+            self._send_json(
+                {"error": str(exc), "needs_position_confirmation": True}, status=409
+            )
         except ValueError as exc:
             self._send_error_json(400, str(exc))
         except RuntimeError as exc:
@@ -176,7 +250,15 @@ class _Handler(BaseHTTPRequestHandler):
         if job is None:
             self._send_error_json(404, "no such job")
             return
-        cursor = int((query.get("cursor") or ["0"])[0])
+        try:
+            cursor = int((query.get("cursor") or ["0"])[0])
+        except ValueError:
+            cursor = 0
+        # A negative cursor made the slice return the tail forever: the
+        # per-event increment never reached len(events), so the loop resent
+        # the same events at full speed, burning a core and flooding the phone.
+        cursor = max(0, min(cursor, job.snapshot()["event_count"]))
+        self._response_started = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -214,6 +296,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         body = candidate.read_bytes()
         content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+        self._response_started = True
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))

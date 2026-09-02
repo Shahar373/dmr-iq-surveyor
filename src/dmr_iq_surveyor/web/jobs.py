@@ -184,17 +184,22 @@ class JobRegistry:
         return [job.snapshot() for job in jobs]
 
     def submit(self, *, kind: str, label: str, work: Callable[[Job], dict[str, Any]]) -> Job:
-        if self.active_job() is not None:
-            raise RuntimeError(
-                "another job is already running; wait for it to finish or cancel it first"
-            )
         job = Job(
             job_id=uuid.uuid4().hex[:12],
             kind=kind,
             label=label,
             created_at=datetime.now(UTC).isoformat(),
         )
+        # The active-job check and the claim happen under ONE lock. Checking
+        # first and claiming after left a window in which two POSTs -- an
+        # impatient double-tap on a phone is enough -- both passed the check
+        # and both opened the one SDR, into the same output path.
         with self._lock:
+            current = self._jobs.get(self._active) if self._active else None
+            if current is not None and not current.is_terminal():
+                raise RuntimeError(
+                    "another job is already running; wait for it to finish or cancel it first"
+                )
             self._jobs[job.job_id] = job
             self._order.append(job.job_id)
             self._active = job.job_id

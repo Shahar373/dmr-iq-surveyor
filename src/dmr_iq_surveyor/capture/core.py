@@ -182,11 +182,27 @@ def run_capture(
         # real data size; until that runs the file declares a data size of
         # zero and inspect_wave_iq() reads it as empty. If closing the device
         # raised before this, a complete recording would be unreadable.
-        writer_summary = writer.close()
+        #
+        # But closing the writer can itself raise -- a full disk fails on the
+        # final flush -- and an unguarded raise here would skip the device
+        # close below, leaving the RSP1B claimed so every later capture in the
+        # session fails to open it until the SDRplay service is restarted. A
+        # full SD card would end the campaign rather than one recording.
+        writer_summary = None
+        writer_close_error: str | None = None
+        try:
+            writer_summary = writer.close()
+        except Exception as exc:  # noqa: BLE001 -- the device must still be released
+            writer_close_error = f"{type(exc).__name__}: {exc}"
         try:
             resolved_device.close()
         except Exception as exc:  # noqa: BLE001 -- never lose a recording over teardown
             device_close_error = f"{type(exc).__name__}: {exc}"
+    if writer_summary is None:
+        raise OSError(
+            f"the recording could not be finalised ({writer_close_error}); "
+            f"{wav_path} is incomplete. The SDR was released, so the next capture can proceed."
+        )
 
     elapsed = time.time() - started
     manifest = {
@@ -206,6 +222,7 @@ def run_capture(
         "overflow_count": getattr(resolved_device, "overflow_count", 0),
         "device_settings_applied": getattr(resolved_device, "applied_settings", {}),
         "device_close_error": device_close_error,
+        "writer_close_error": writer_close_error,
         "start_utc": writer_summary["start_utc"],
         "stop_utc": writer_summary["stop_utc"],
         "elapsed_seconds": elapsed,

@@ -11,7 +11,10 @@
 
 <header id="topbar">
   <div class="brand">P25 site survey</div>
-  <div id="connection" class="pill">connecting…</div>
+  <div class="pills">
+    <div id="disk" class="pill">disk…</div>
+    <div id="connection" class="pill">connecting…</div>
+  </div>
 </header>
 
 <nav id="tabs">
@@ -77,6 +80,7 @@
       <button id="cancel-job" class="danger" hidden>Cancel</button>
     </div>
     <div id="device-status" class="notice" hidden></div>
+    <div id="disk-status" class="notice" hidden></div>
 
     <div id="job" hidden>
       <div class="progress"><div id="progress-bar"></div></div>
@@ -88,6 +92,7 @@
   <div class="panel" data-panel="sites" hidden>
     <div class="row buttons">
       <button id="resolve">Re-solve all sites</button>
+      <button id="purge">Free disk</button>
       <span id="site-summary" class="hint"></span>
     </div>
     <div id="site-list"></div>

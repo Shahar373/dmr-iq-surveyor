@@ -100,21 +100,79 @@ def materialise_measurements(
                     "COALESCE(capture_start_utc, imported_at) ASC"
                 )
             ]
+        gains = _campaign_gains(connection, run_ids)
+        reference_gain = _modal_gain(gains)
         per_run: list[dict[str, Any]] = []
         total: list[dict[str, Any]] = []
         for run_id in run_ids:
             rows = build_run_measurements(connection, run_id, resolved)
+            _flag_gain_drift(rows, gains.get(run_id), reference_gain)
             replace_run_measurements(connection, run_id, rows)
             per_run.append({"survey_run_id": run_id, **summarise(rows)})
             total.extend(rows)
     finally:
         connection.close()
+    drifted = sorted(
+        run_id
+        for run_id, gain in gains.items()
+        if reference_gain is not None and gain is not None and gain != reference_gain
+    )
     return {
         "runs": per_run,
         "run_count": len(per_run),
         "summary": summarise(total),
         "settings": resolved.to_dict(),
+        "reference_gain": reference_gain,
+        "gain_drift_runs": drifted,
     }
+
+
+def _campaign_gains(connection: Any, run_ids: Sequence[str]) -> dict[str, float | None]:
+    rows = connection.execute(
+        """
+        SELECT r.survey_run_id, s.gain
+        FROM survey_runs r LEFT JOIN sites s ON s.site_id = r.site_id
+        """
+    ).fetchall()
+    wanted = set(run_ids)
+    return {
+        str(row["survey_run_id"]): (None if row["gain"] is None else float(row["gain"]))
+        for row in rows
+        if str(row["survey_run_id"]) in wanted
+    }
+
+
+def _modal_gain(gains: dict[str, float | None]) -> float | None:
+    """The gain most of the campaign was recorded at.
+
+    Levels recorded at different receiver gain are not on one scale, and the
+    whole method is a comparison of levels between places. A stop recorded at
+    a different gain is not a slightly worse measurement -- it is a wrong one,
+    and it has to be visible rather than averaged in.
+    """
+    counts: dict[float, int] = {}
+    for gain in gains.values():
+        if gain is None:
+            continue
+        counts[gain] = counts.get(gain, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda item: (item[1], -item[0]))[0]
+
+
+def _flag_gain_drift(
+    rows: list[dict[str, Any]], gain: float | None, reference_gain: float | None
+) -> None:
+    if reference_gain is None:
+        return
+    if gain is None:
+        for row in rows:
+            row["quality_flags"] = [*row["quality_flags"], "gain_not_recorded"]
+        return
+    if gain == reference_gain:
+        return
+    for row in rows:
+        row["quality_flags"] = [*row["quality_flags"], f"gain_differs_from_campaign:{gain:g}"]
 
 
 def _to_geo_measurements(rows: list[dict[str, Any]]) -> list[GeoMeasurement]:

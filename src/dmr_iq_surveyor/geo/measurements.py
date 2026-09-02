@@ -32,6 +32,23 @@ USABILITY_USABLE = "usable"
 USABILITY_NOT_COVERED = "not_covered"
 USABILITY_NO_POSITION = "no_position"
 USABILITY_AMBIGUOUS = "ambiguous"
+# A detection whose level cannot be trusted as a measurement of distance:
+# it sits where the receiver's own response distorts it, so keeping it would
+# feed the solver a number that says more about the radio than the transmitter.
+USABILITY_LEVEL_UNRELIABLE = "level_unreliable"
+# The receiver's LO/DC artifact sits at the tuner centre and is present at
+# every stop with a level set by the radio, not by any transmitter. Matching
+# it to a site would inject a constant, confident, wrong measurement into
+# every single stop -- the worst possible failure for this method.
+USABILITY_RECEIVER_ARTIFACT = "receiver_artifact"
+# A site with more than one control channel on record must contribute at
+# most ONE measurement per stop: two channels of one site measured at one
+# place are not independent evidence, and treating them as such would
+# double-weight that site and shrink its region on fabricated information.
+USABILITY_SUPERSEDED_CHANNEL = "superseded_channel"
+# The whole survey run was barred from geolocation -- see
+# `geo.store.exclude_run`, used when a capture was truncated or unhealthy.
+USABILITY_RUN_EXCLUDED = "run_excluded"
 
 LEVEL_METRIC_AVERAGE_SNR = "snr_db"
 LEVEL_METRIC_P95_SNR = "p95_snr_db"
@@ -149,6 +166,10 @@ def build_run_measurements(
     ).fetchone()
     site = dict(site_row) if site_row is not None else None
 
+    run_excluded = connection.execute(
+        "SELECT reason FROM geo_run_exclusions WHERE survey_run_id = ?", (survey_run_id,)
+    ).fetchone()
+
     latitude, longitude, position_source, accuracy = _resolve_position(run, site)
     detection_settings = json.loads(run["detection_settings_json"] or "{}")
     censor_level = float(detection_settings.get(_CENSOR_SETTING[resolved.level_metric], 0.0))
@@ -218,7 +239,10 @@ def build_run_measurements(
         detected = observation is not None
         covered = _covered(run, frequency_hz, resolved.passband_guard_hz)
 
-        if attribution == ATTRIBUTION_AMBIGUOUS_REUSE:
+        if run_excluded is not None:
+            usability = USABILITY_RUN_EXCLUDED
+            exclusion = str(run_excluded["reason"])
+        elif attribution == ATTRIBUTION_AMBIGUOUS_REUSE:
             usability = USABILITY_AMBIGUOUS
             exclusion = "frequency shared by more than one site"
         elif latitude is None:
@@ -234,10 +258,16 @@ def build_run_measurements(
             usability = USABILITY_USABLE
             exclusion = ""
             if not covered and detected:
-                # Detected outside the measured passband: the detection is
-                # real evidence, but the roll-off makes its level an
-                # understatement, so it is kept and flagged rather than
-                # trusted silently.
+                # Detected outside the measured passband. The detection is
+                # real, but the roll-off understates its level by an amount
+                # nothing here can bound, and the solver reads level as
+                # distance -- so it would place the site further away, with
+                # confidence. Recorded, not used.
+                usability = USABILITY_LEVEL_UNRELIABLE
+                exclusion = (
+                    "detected outside the run's measured usable passband, where the receiver "
+                    "roll-off understates the level by an unknown amount"
+                )
                 flags.append("detected_outside_measured_passband")
 
         if observation is not None:
@@ -245,6 +275,19 @@ def build_run_measurements(
                 flags.append("edge_warning")
             if observation.get("dc_warning"):
                 flags.append("dc_warning")
+            if usability == USABILITY_USABLE and observation.get("dc_warning"):
+                usability = USABILITY_RECEIVER_ARTIFACT
+                exclusion = (
+                    "this detection sits on the receiver's own DC/LO artifact, whose level is a "
+                    "property of the radio rather than of any transmitter"
+                )
+            # `edge_warning` is deliberately NOT an exclusion. It marks a fixed
+            # 150 kHz margin from the recording's Nyquist edges
+            # (`SpectrumSettings.edge_exclusion_hz`), which is an absolute
+            # width rather than anything measured: at a 200 kS/s rate it covers
+            # the entire band and would exclude every detection in the run. The
+            # measured usable passband above is the honest edge test, and it
+            # already runs. This stays a flag.
 
         rows.append(
             {
@@ -288,6 +331,48 @@ def build_run_measurements(
                 "site_id": run.get("site_id"),
             }
         )
+    return _keep_one_channel_per_site(rows)
+
+
+def _keep_one_channel_per_site(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Leave at most one USABLE measurement per site per run.
+
+    Two control channels of one site, measured from one place at one moment,
+    are two views of the same transmitter -- not independent evidence. The
+    solver multiplies likelihood terms, so letting both through would
+    double-weight that site and shrink its credible region on information
+    that was never there. The strongest detection wins (or, with no
+    detection, the first usable non-detection); the rest are kept as rows,
+    marked superseded, so nothing is silently dropped.
+    """
+    best: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if row["usability"] != USABILITY_USABLE:
+            continue
+        site_id = row["p25_site_id"]
+        incumbent = best.get(site_id)
+        if incumbent is None:
+            best[site_id] = row
+            continue
+        # Prefer a detection over a non-detection, then the stronger level.
+        candidate_key = (row["detected"], row["level_db"] if row["level_db"] is not None else -1e9)
+        incumbent_key = (
+            incumbent["detected"],
+            incumbent["level_db"] if incumbent["level_db"] is not None else -1e9,
+        )
+        if candidate_key > incumbent_key:
+            best[site_id] = row
+
+    for row in rows:
+        if row["usability"] != USABILITY_USABLE:
+            continue
+        if best.get(row["p25_site_id"]) is not row:
+            row["usability"] = USABILITY_SUPERSEDED_CHANNEL
+            row["exclusion_reason"] = (
+                "this site has more than one control channel on record; another channel already "
+                "carries this stop's measurement, and two channels of one site at one place are "
+                "not independent evidence"
+            )
     return rows
 
 
@@ -301,6 +386,16 @@ def summarise(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "not_covered": sum(1 for row in rows if row["usability"] == USABILITY_NOT_COVERED),
         "ambiguous": sum(1 for row in rows if row["usability"] == USABILITY_AMBIGUOUS),
         "no_position": sum(1 for row in rows if row["usability"] == USABILITY_NO_POSITION),
+        "run_excluded": sum(1 for row in rows if row["usability"] == USABILITY_RUN_EXCLUDED),
+        "level_unreliable": sum(
+            1 for row in rows if row["usability"] == USABILITY_LEVEL_UNRELIABLE
+        ),
+        "receiver_artifact": sum(
+            1 for row in rows if row["usability"] == USABILITY_RECEIVER_ARTIFACT
+        ),
+        "superseded_channel": sum(
+            1 for row in rows if row["usability"] == USABILITY_SUPERSEDED_CHANNEL
+        ),
     }
 
 
@@ -315,8 +410,12 @@ __all__ = [
     "POSITION_SOURCE_RUN_GPS",
     "POSITION_SOURCE_SITE_PROFILE",
     "USABILITY_AMBIGUOUS",
+    "USABILITY_LEVEL_UNRELIABLE",
     "USABILITY_NOT_COVERED",
     "USABILITY_NO_POSITION",
+    "USABILITY_RECEIVER_ARTIFACT",
+    "USABILITY_RUN_EXCLUDED",
+    "USABILITY_SUPERSEDED_CHANNEL",
     "USABILITY_USABLE",
     "MeasurementSettings",
     "build_run_measurements",

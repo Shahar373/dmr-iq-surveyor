@@ -13,6 +13,7 @@ const state = {
   sites: [],
   picking: false,
   jobId: null,
+  cursor: 0,
   stream: null,
 };
 
@@ -26,11 +27,25 @@ async function api(path, options = {}) {
   const text = await response.text();
   let payload = null;
   try { payload = text ? JSON.parse(text) : null; } catch (_) { payload = { error: text }; }
-  if (!response.ok) throw new Error((payload && payload.error) || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error((payload && payload.error) || `HTTP ${response.status}`);
+    error.status = response.status;
+    error.needsPositionConfirmation = Boolean(payload && payload.needs_position_confirmation);
+    throw error;
+  }
   return payload;
 }
 
 const $ = (selector) => document.querySelector(selector);
+
+/* Popup bodies are assembled as HTML, and their values come from a
+ * user-supplied site snapshot (notes, status reasons) and from job messages.
+ * A stray angle bracket in a CSV note would otherwise break the popup. */
+const escapeHtml = (value) =>
+  String(value === null || value === undefined ? "" : value).replace(
+    /[&<>"']/g,
+    (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch],
+  );
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -42,6 +57,10 @@ function setConnection(text, kind) {
   const node = $("#connection");
   node.textContent = text;
   node.className = "pill" + (kind ? " " + kind : "");
+}
+
+function formatGiB(bytes) {
+  return (bytes / 1073741824).toFixed(2) + " GiB";
 }
 
 function formatArea(value) {
@@ -177,7 +196,8 @@ function measurementPopup(properties) {
     rows.push(["flags", properties.quality_flags.join(", ")]);
   }
   return `<b>${properties.detected ? "Detection" : "Non-detection"}</b><dl>` +
-    rows.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("") + "</dl>";
+    rows.map(([key, value]) => `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd>`).join("") +
+    "</dl>";
 }
 
 function estimatePopup(properties) {
@@ -189,14 +209,21 @@ function estimatePopup(properties) {
     ["90% region", formatArea(properties.area_km2_90)],
     ["azimuth span", properties.azimuth_span_deg ? `${Math.round(properties.azimuth_span_deg)}°` : "-"],
   ];
-  const warnings = (properties.warnings || []).map((w) => `<div class="site warn">${w}</div>`).join("");
-  return `<b>${properties.site_key}</b><dl>` +
-    rows.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("") + "</dl>" +
-    (properties.status_reason ? `<p>${properties.status_reason}</p>` : "") + warnings;
+  const warnings = (properties.warnings || [])
+    .map((w) => `<div class="site warn">${escapeHtml(w)}</div>`)
+    .join("");
+  return `<b>${escapeHtml(properties.site_key)}</b><dl>` +
+    rows.map(([key, value]) => `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd>`).join("") +
+    "</dl>" +
+    (properties.status_reason ? `<p>${escapeHtml(properties.status_reason)}</p>` : "") +
+    warnings;
 }
 
 async function refreshMap() {
   if (!map) return;
+  // Which layers the operator turned off must survive a refresh -- they are
+  // turned off precisely when the map is too busy to read.
+  const hidden = Object.keys(layers).filter((name) => !map.hasLayer(layers[name]));
   const collection = await api("/api/geojson");
   ["regions50", "regions90", "measurements", "nondetections", "estimates"].forEach(
     (name) => layers[name].clearLayers()
@@ -224,16 +251,19 @@ async function refreshMap() {
           dashArray: properties.touches_analysed_edge ? "6 4" : null,
         },
       }).bindPopup(
-        `<b>${properties.site_key}</b><dl>` +
+        `<b>${escapeHtml(properties.site_key)}</b><dl>` +
         `<dt>region</dt><dd>${Math.round(properties.credible_level * 100)}% credible</dd>` +
         `<dt>area</dt><dd>${formatArea(properties.area_km2)}</dd>` +
-        `<dt>status</dt><dd>${properties.status}</dd></dl>`
+        `<dt>status</dt><dd>${escapeHtml(properties.status)}</dd></dl>`
       ).addTo(inner ? layers.regions50 : layers.regions90);
     } else if (properties.kind === "estimate") {
       L.marker([feature.geometry.coordinates[1], feature.geometry.coordinates[0]])
         .bindPopup(estimatePopup(properties))
         .addTo(layers.estimates);
     }
+  }
+  for (const name of hidden) {
+    if (map.hasLayer(layers[name])) map.removeLayer(layers[name]);
   }
 }
 
@@ -293,16 +323,19 @@ function jobLog(message) {
   while (list.children.length > 200) list.lastChild.remove();
 }
 
-function watchJob(jobId) {
+function watchJob(jobId, cursor = 0) {
   state.jobId = jobId;
+  state.cursor = cursor;
   $("#job").hidden = false;
-  $("#job-log").replaceChildren();
+  if (!cursor) $("#job-log").replaceChildren();
   $("#record").disabled = true;
   $("#resolve").disabled = true;
   $("#cancel-job").hidden = false;
   if (state.stream) state.stream.close();
 
-  const url = "/api/jobs/" + jobId + "/events" + (TOKEN ? "?token=" + encodeURIComponent(TOKEN) : "");
+  const query = new URLSearchParams({ cursor: String(cursor) });
+  if (TOKEN) query.set("token", TOKEN);
+  const url = "/api/jobs/" + jobId + "/events?" + query.toString();
   const stream = new EventSource(url);
   state.stream = stream;
   stream.onmessage = (event) => {
@@ -312,11 +345,32 @@ function watchJob(jobId) {
       finishJob(jobId);
       return;
     }
+    state.cursor += 1;
     $("#progress-bar").style.width = Math.round((data.progress || 0) * 100) + "%";
     $("#job-stage").textContent = `${data.stage}: ${data.message}`;
     jobLog(`${(data.at || "").slice(11, 19)} ${data.stage} — ${data.message}`);
   };
-  stream.onerror = () => { stream.close(); finishJob(jobId); };
+  // A phone that loses Wi-Fi mid-capture drops the stream, but the capture
+  // keeps running on the Pi. Reporting it as finished would tell the operator
+  // to drive away from a stop that is still recording, so the client asks the
+  // server what actually happened and resumes from where it left off.
+  stream.onerror = async () => {
+    stream.close();
+    if (state.jobId !== jobId) return;
+    try {
+      const job = await api("/api/jobs/" + jobId);
+      if (job.status === "running" || job.status === "pending") {
+        jobLog("connection lost — the capture is still running, reconnecting…");
+        setTimeout(() => { if (state.jobId === jobId) watchJob(jobId, state.cursor); }, 2000);
+        return;
+      }
+    } catch (_) {
+      jobLog("connection lost — retrying…");
+      setTimeout(() => { if (state.jobId === jobId) watchJob(jobId, state.cursor); }, 4000);
+      return;
+    }
+    finishJob(jobId);
+  };
 }
 
 async function finishJob(jobId) {
@@ -386,23 +440,42 @@ function useDeviceGps() {
   );
 }
 
-async function startCapture() {
+async function startCapture(confirmPosition = false) {
+  const body = {
+    duration_seconds: Number($("#duration").value),
+    center_frequency_hz: Number($("#center").value) * 1e6,
+    sample_rate_hz: Number($("#rate").value) * 1e6,
+    if_gain_reduction_db: Number($("#ifgr").value),
+    lna_state: Number($("#lna").value),
+    label: $("#stop-label").value,
+    solve: true,
+  };
+  if (confirmPosition) body.confirm_position = true;
   try {
-    const job = await api("/api/capture", {
-      method: "POST",
-      body: JSON.stringify({
-        duration_seconds: Number($("#duration").value),
-        center_frequency_hz: Number($("#center").value) * 1e6,
-        sample_rate_hz: Number($("#rate").value) * 1e6,
-        if_gain_reduction_db: Number($("#ifgr").value),
-        lna_state: Number($("#lna").value),
-        label: $("#stop-label").value,
-        solve: true,
-      }),
-    });
+    const job = await api("/api/capture", { method: "POST", body: JSON.stringify(body) });
     watchJob(job.job_id);
   } catch (error) {
+    // A stale marked position is recoverable, and recording a stop against
+    // the PREVIOUS stop's coordinates is the one mistake that silently
+    // corrupts a whole campaign -- so it asks rather than proceeding.
+    if (error.needsPositionConfirmation) {
+      if (confirm(error.message + "\n\nRecord this stop at the marked position anyway?")) {
+        await startCapture(true);
+      }
+      return;
+    }
     alert("Could not start the recording: " + error.message);
+  }
+}
+
+async function purgeRecordings() {
+  if (!confirm("Delete every kept recording? Their measurements are already stored; only the raw IQ goes.")) return;
+  try {
+    const result = await api("/api/recordings/purge", { method: "POST", body: JSON.stringify({}) });
+    alert(`Freed ${result.freed_gib} GiB from ${result.deleted_count} recording(s).`);
+    await refreshState();
+  } catch (error) {
+    alert("Could not free disk: " + error.message);
   }
 }
 
@@ -427,6 +500,34 @@ async function refreshState() {
   state.sites = payload.sites;
   renderPosition();
   renderSites();
+
+  const disk = payload.disk;
+  const diskPill = $("#disk");
+  const diskNotice = $("#disk-status");
+  if (disk) {
+    diskPill.textContent = `${formatGiB(disk.free_bytes)} free · ${disk.captures_that_fit} stop(s)`;
+    diskPill.className = "pill" + (disk.ready ? (disk.captures_that_fit <= 2 ? " bad" : " ok") : " bad");
+    if (!disk.ready) {
+      diskNotice.hidden = false;
+      diskNotice.className = "notice error";
+      diskNotice.textContent = disk.reason;
+    } else if (disk.captures_that_fit <= 2) {
+      diskNotice.hidden = false;
+      diskNotice.className = "notice";
+      diskNotice.textContent =
+        `Only ${disk.captures_that_fit} more stop(s) fit. Each is ${formatGiB(disk.per_capture_bytes)}; ` +
+        `${disk.retained_count} recording(s) are being kept. Use "Free disk" on the Sites tab to clear them.`;
+    } else {
+      diskNotice.hidden = true;
+    }
+  }
+
+  const age = payload.position_age_seconds;
+  if (age !== null && age !== undefined && state.position && state.position.latitude !== null) {
+    const minutes = Math.round(age / 60);
+    const readout = $("#position-readout");
+    readout.textContent += minutes >= 1 ? ` · marked ${minutes} min ago` : " · marked just now";
+  }
 
   const device = payload.device;
   const notice = $("#device-status");
@@ -474,7 +575,8 @@ function wireUi() {
     }
     savePosition(position.latitude, position.longitude, position.accuracy_m, position.source === "browser_gps" ? "device" : "manual");
   });
-  $("#record").addEventListener("click", startCapture);
+  $("#record").addEventListener("click", () => startCapture());
+  $("#purge").addEventListener("click", purgeRecordings);
   $("#resolve").addEventListener("click", startSolve);
   $("#cancel-job").addEventListener("click", async () => {
     if (state.jobId) await api("/api/jobs/" + state.jobId + "/cancel", { method: "POST" });
