@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>P25 Site Survey</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
@@ -115,7 +114,10 @@
   </div>
 </section>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Leaflet is loaded by app.js: a vendored copy first, the CDN as a
+     fallback. See scripts/vendor_leaflet.sh -- with it vendored, losing
+     internet costs only the map tiles, not the measurements and regions
+     drawn on top of them. -->
 <script src="/app.js"></script>
 </body>
 </html>

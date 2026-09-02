@@ -27,3 +27,8 @@ output/
 # Real reference snapshots. config/p25_sites.example.csv is the template;
 # a filled-in operational site list stays out of the repository.
 config/p25_sites.csv
+
+# Vendored map library fetched by scripts/vendor_leaflet.sh. This repository
+# does not carry third-party minified bundles.
+src/dmr_iq_surveyor/web/static/vendor/*
+!src/dmr_iq_surveyor/web/static/vendor/README.md

@@ -68,11 +68,51 @@ function levelColour(db) {
 let map = null;
 const layers = {};
 
+const LEAFLET_SOURCES = [
+  { js: "/vendor/leaflet.js", css: "/vendor/leaflet.css" },
+  {
+    js: "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js",
+    css: "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css",
+  },
+  {
+    js: "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js",
+    css: "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css",
+  },
+];
+
+function loadTag(tag, attributes) {
+  return new Promise((resolve, reject) => {
+    const node = document.createElement(tag);
+    Object.assign(node, attributes);
+    node.onload = resolve;
+    node.onerror = () => reject(new Error("could not load " + (attributes.src || attributes.href)));
+    document.head.appendChild(node);
+  });
+}
+
+/* A vendored copy is tried before the CDN. When Leaflet is local, losing
+ * internet costs only the map tiles -- the measurement points and credible
+ * regions still draw, on a blank background, which is the part that matters. */
+async function ensureLeaflet() {
+  for (const source of LEAFLET_SOURCES) {
+    try {
+      await loadTag("script", { src: source.js, async: false });
+      if (window.L) {
+        loadTag("link", { rel: "stylesheet", href: source.css }).catch(() => {});
+        return true;
+      }
+    } catch (_) {
+      /* try the next source */
+    }
+  }
+  return false;
+}
+
 function initMap() {
   if (typeof L === "undefined") {
     const banner = el("div", "notice error",
-      "The map library could not be loaded. Check the phone's internet connection, " +
-      "or place leaflet.js and leaflet.css in the server's static directory.");
+      "The map library could not be loaded, so the map is unavailable — everything else " +
+      "still works. Run scripts/vendor_leaflet.sh once while online to keep a local copy.");
     $("#sheet").prepend(banner);
     return false;
   }
@@ -489,6 +529,7 @@ async function boot() {
   try {
     const payload = await refreshState();
     applyDefaults();
+    await ensureLeaflet();
     if (initMap()) {
       renderPosition();
       await refreshMap();
