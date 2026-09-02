@@ -159,9 +159,13 @@ def geo_solve(
     ] = 3,
 ) -> None:
     """Estimate a credible region for every site with usable measurements."""
+    # The coarse pass must never be finer than the fine pass. Scaling it with
+    # the requested resolution keeps `--resolution-m 750` working instead of
+    # failing validation after the operator has already asked for a solve.
     settings = SolveSettings(
         sigma_db=sigma_db,
         resolution_m=resolution_m,
+        coarse_resolution_m=max(resolution_m * 5.0, 500.0),
         margin_m=margin_m,
         min_detections=min_detections,
     )

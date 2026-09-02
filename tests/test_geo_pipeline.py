@@ -240,3 +240,64 @@ def test_latest_solution_survives_a_clock_that_jumps_backwards(tmp_path: Path) -
     assert len(latest) == 1
     assert latest[0]["solve_batch_id"] == "same_second"
     connection.close()
+
+
+def test_reimporting_a_corrected_snapshot_rebuilds_stale_measurements(tmp_path: Path) -> None:
+    """A resolved ambiguity must actually take effect.
+
+    Measurements are derived from the frequency map at the time. Leaving them
+    behind would mean a corrected snapshot silently never applied, while the
+    reports went on asserting the old verdict.
+    """
+    from dmr_iq_surveyor.geo.store import connect_geo_database, fetch_all_measurements
+
+    database = tmp_path / "db.sqlite3"
+    _seed(database, STOPS[:4])
+    first = materialise_measurements(database_path=database)
+    assert first["summary"]["ambiguous"] > 0, "site 50 and 82 share a frequency"
+
+    corrected = tmp_path / "corrected.csv"
+    corrected.write_text(
+        SITE_CSV.replace(
+            "BEE00,37D,1,82,NEIGHBOR_ONLY,867.912500,,reuse with site 50",
+            "BEE00,37D,1,82,NEIGHBOR_ONLY,868.437500,,ambiguity resolved",
+        ),
+        encoding="utf-8",
+    )
+    summary = import_reference_sites(
+        corrected, database_path=database, snapshot_id="test_snapshot"
+    )
+    assert "measurements_rebuilt" in summary
+    assert any("rebuilt against the new snapshot" in w for w in summary["warnings"])
+    assert summary["measurements_rebuilt"]["ambiguous"] == 0, (
+        "the frequency is no longer shared, so nothing should still be excluded for it"
+    )
+
+    connection = connect_geo_database(database)
+    frequencies = {
+        row["frequency_hz"] for row in fetch_all_measurements(connection) if row["site_key"].endswith(":82")
+    }
+    connection.close()
+    assert frequencies == {868_437_500.0}
+
+
+def test_a_solution_reports_the_flags_its_evidence_carries(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    connection = build_database(database)
+    for index, (latitude, longitude) in enumerate(STOPS[:5]):
+        seed_run(
+            connection,
+            run_id=f"run_{index:02d}",
+            latitude=latitude,
+            longitude=longitude,
+            transmitters=[SITE30],
+            site_id=f"stop_{index}",
+            gain=40.0 if index else 31.0,
+            capture_start_utc=f"2026-08-01T{8 + index:02d}:00:00+00:00",
+        )
+    connection.close()
+
+    materialise_measurements(database_path=database)
+    report = solve_all_sites(database_path=database, settings=fast_solve_settings())
+    solution = next(row for row in report["solutions"] if row["site_key"] == "BEE00:37D:1:30")
+    assert any("gain_differs_from_campaign" in warning for warning in solution.get("warnings", []))

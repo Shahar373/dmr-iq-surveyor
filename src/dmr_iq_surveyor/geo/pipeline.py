@@ -73,6 +73,23 @@ def import_reference_sites(
     finally:
         connection.close()
     summary["source_path"] = str(source)
+    # Measurements were derived from the PREVIOUS frequency map. Leaving them
+    # would mean a corrected snapshot -- a frequency added, an ambiguity
+    # resolved -- silently never took effect, while the reports went on
+    # asserting the old verdict.
+    connection = connect_geo_database(_database(database_path))
+    try:
+        stale = connection.execute("SELECT COUNT(*) AS n FROM geo_measurements").fetchone()["n"]
+    finally:
+        connection.close()
+    if stale:
+        rebuilt = materialise_measurements(database_path=database_path)
+        summary["measurements_rebuilt"] = rebuilt["summary"]
+        summary["warnings"] = [
+            *summary["warnings"],
+            f"{stale} existing measurement(s) were rebuilt against the new snapshot; "
+            "re-run `geo solve` for the solutions to follow",
+        ]
     return summary
 
 
@@ -276,10 +293,24 @@ def solve_all_sites(
                     reference_level_db=result.reference_level_db,
                     residual_rms_db=result.residual_rms_db,
                     azimuth_span_deg=result.azimuth_span_deg,
-                    warnings=result.warnings,
+                    warnings=list(result.warnings),
                     diagnostics=result.diagnostics,
                     residuals=result.residuals,
                 )
+                # Surface the flags the contributing measurements carry.
+                # Stored-but-unread flags are the same failure as no flags:
+                # the reader never learns that half the evidence came from a
+                # stop whose gain was different.
+                flags: dict[str, int] = {}
+                for measurement in usable:
+                    for flag in json.loads(measurement["quality_flags_json"] or "[]"):
+                        flags[flag] = flags.get(flag, 0) + 1
+                row["measurement_flags"] = flags
+                for flag, count in sorted(flags.items()):
+                    row.setdefault("warnings", [])
+                    row["warnings"].append(
+                        f"{count} of {len(usable)} contributing measurement(s) carry {flag!r}"
+                    )
                 if result.surface is not None:
                     regions = credible_regions(result.surface, resolved.credible_levels)
                     by_level = {region["level"]: region for region in regions}
