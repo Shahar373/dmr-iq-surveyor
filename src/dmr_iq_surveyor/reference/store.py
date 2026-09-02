@@ -208,6 +208,46 @@ def import_snapshot(
             )
             channels += 1
 
+    # A site present in an EARLIER import of this same snapshot_id but absent
+    # from this one is stale: `snapshot_id` on `p25_sites` is only ever set by
+    # whichever import last touched that row, so a row still carrying this
+    # id that this loop did not just process was dropped by the source, not
+    # merely left unchanged. Left in place, it lingers forever -- reported
+    # `frequency_unknown` alongside sites that never had a channel at all,
+    # and clutters `geo sites` and every future solve with rows that no
+    # longer belong.
+    #
+    # It is removed only when nothing has actually measured against it. A
+    # site with real field evidence is never deleted here, even if the
+    # operator's snapshot stopped listing it -- that decision needs a human,
+    # so it is reported instead.
+    touched_site_keys = {record.site_key for record in snapshot.records}
+    protected_site_ids = _site_ids_with_measurements(connection)
+    removed_sites: list[str] = []
+    retained_with_data: list[str] = []
+    for row in connection.execute(
+        "SELECT p25_site_id, site_key FROM p25_sites WHERE snapshot_id = ?", (snapshot_id,)
+    ).fetchall():
+        if row["site_key"] in touched_site_keys:
+            continue
+        if int(row["p25_site_id"]) in protected_site_ids:
+            retained_with_data.append(row["site_key"])
+            continue
+        connection.execute("DELETE FROM p25_sites WHERE p25_site_id = ?", (row["p25_site_id"],))
+        removed_sites.append(row["site_key"])
+
+    warnings = list(snapshot.warnings)
+    if removed_sites:
+        warnings.append(
+            f"{len(removed_sites)} site(s) no longer in this snapshot were removed from the "
+            f"registry (had no measurements): {', '.join(sorted(removed_sites))}"
+        )
+    if retained_with_data:
+        warnings.append(
+            f"{len(retained_with_data)} site(s) no longer in this snapshot were KEPT because "
+            f"they already have measurements: {', '.join(sorted(retained_with_data))}"
+        )
+
     connection.commit()
     return {
         "snapshot_id": snapshot_id,
@@ -215,8 +255,27 @@ def import_snapshot(
         "sites_updated": sites_updated,
         "channels_imported": channels,
         "sites_without_frequency": len(snapshot.records) - channels,
-        "warnings": list(snapshot.warnings),
+        "sites_removed": sorted(removed_sites),
+        "sites_retained_with_data": sorted(retained_with_data),
+        "warnings": warnings,
     }
+
+
+def _site_ids_with_measurements(connection: sqlite3.Connection) -> set[int]:
+    """Site ids already attached to a geo_measurements row, if that table
+    exists.
+
+    `reference/store.py` must not import `geo/store.py` -- geo depends on
+    reference, not the reverse -- so this checks defensively instead of
+    importing its schema. A connection that has never gone through
+    `geo.store.connect_geo_database()` has no such table, which correctly
+    means nothing has measured against any site yet.
+    """
+    try:
+        rows = connection.execute("SELECT DISTINCT p25_site_id FROM geo_measurements")
+    except sqlite3.OperationalError:
+        return set()
+    return {int(row[0]) for row in rows}
 
 
 def list_sites(connection: sqlite3.Connection) -> list[dict[str, Any]]:
