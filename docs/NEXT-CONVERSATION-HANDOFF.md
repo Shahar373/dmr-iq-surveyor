@@ -10,11 +10,24 @@ Repository:
 https://github.com/Shahar373/dmr-iq-surveyor
 ```
 
-Current release after Phase 5.1:
+Current release:
 
 ```text
-0.7.0
+0.10.0
 ```
+
+> **State note (Phase 7).** Sections 1–11 below describe the project as of Phase 5.1 and are kept
+> for the DMR history they record. Since then the repository has also gained Phase 6A (generic
+> protocol-agnostic RF survey), live SoapySDR capture, and Phase 7 (multi-session P25 site
+> geolocation plus a served field app). Read `README.md`, `docs/phase6-design.md`,
+> `docs/phase6a-survey.md`, `docs/phase7-geolocation-design.md` and
+> `docs/PHASE7-FIELD-GEOLOCATION.md` for the current state; the sections below are not a complete
+> inventory of what exists.
+>
+> The most consequential gap is still Phase 6B: no P25 control channel is decoded, so a geolocation
+> measurement is attributed to a site by frequency alone, and a frequency shared by two sites is
+> excluded rather than guessed. A NAC does not identify a site — one NAC is routinely shared by
+> many sites in a system.
 
 The repository implements Phases 1–5.1 of an offline, passive, receive-only DMR survey pipeline. Do not restart the project or replace established commands, formats or tests without evidence.
 

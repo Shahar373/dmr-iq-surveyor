@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>P25 Site Survey</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="map"></div>
+
+<header id="topbar">
+  <div class="brand">P25 site survey</div>
+  <div id="connection" class="pill">connecting…</div>
+</header>
+
+<nav id="tabs">
+  <button data-panel="record" class="active">Record</button>
+  <button data-panel="sites">Sites</button>
+  <button data-panel="legend">Layers</button>
+</nav>
+
+<section id="sheet">
+  <div class="grabber" id="grabber"></div>
+
+  <div class="panel" data-panel="record">
+    <div class="row">
+      <div class="field">
+        <label>Your position</label>
+        <div id="position-readout" class="readout">not set</div>
+      </div>
+    </div>
+    <div class="row buttons">
+      <button id="use-gps" class="primary">Use phone GPS</button>
+      <button id="pick-on-map">Tap map to place</button>
+    </div>
+    <div class="row">
+      <div class="field grow">
+        <label for="stop-label">Stop name</label>
+        <input id="stop-label" type="text" placeholder="e.g. north ridge car park">
+      </div>
+      <button id="save-position">Save</button>
+    </div>
+
+    <hr>
+
+    <div class="row">
+      <div class="field">
+        <label for="duration">Seconds</label>
+        <input id="duration" type="number" min="5" step="5" value="120">
+      </div>
+      <div class="field">
+        <label for="center">Centre (MHz)</label>
+        <input id="center" type="number" step="0.0125">
+      </div>
+      <div class="field">
+        <label for="rate">Rate (MS/s)</label>
+        <input id="rate" type="number" step="0.5">
+      </div>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="ifgr">IF gain reduction (dB)</label>
+        <input id="ifgr" type="number" min="20" max="59" step="1">
+      </div>
+      <div class="field">
+        <label for="lna">LNA state</label>
+        <input id="lna" type="number" min="0" max="9" step="1">
+      </div>
+    </div>
+    <p class="hint" id="gain-hint">
+      Keep gain identical at every stop. Levels measured with different gain are not comparable.
+    </p>
+
+    <div class="row buttons">
+      <button id="record" class="primary big">Record this stop</button>
+      <button id="cancel-job" class="danger" hidden>Cancel</button>
+    </div>
+    <div id="device-status" class="notice" hidden></div>
+
+    <div id="job" hidden>
+      <div class="progress"><div id="progress-bar"></div></div>
+      <div id="job-stage" class="readout"></div>
+      <ul id="job-log"></ul>
+    </div>
+  </div>
+
+  <div class="panel" data-panel="sites" hidden>
+    <div class="row buttons">
+      <button id="resolve">Re-solve all sites</button>
+      <span id="site-summary" class="hint"></span>
+    </div>
+    <div id="site-list"></div>
+  </div>
+
+  <div class="panel" data-panel="legend" hidden>
+    <label class="check"><input type="checkbox" id="layer-measurements" checked> Measurement points</label>
+    <label class="check"><input type="checkbox" id="layer-nondetections" checked> Non-detections</label>
+    <label class="check"><input type="checkbox" id="layer-regions" checked> Credible regions</label>
+    <label class="check"><input type="checkbox" id="layer-estimates" checked> Best estimates</label>
+    <hr>
+    <div class="legend-key">
+      <div><span class="swatch strong"></span> strong signal</div>
+      <div><span class="swatch weak"></span> weak signal</div>
+      <div><span class="swatch none"></span> looked, heard nothing</div>
+      <div><span class="swatch region50"></span> 50% credible region</div>
+      <div><span class="swatch region90"></span> 90% credible region</div>
+    </div>
+    <p class="hint">
+      A credible region is a search area, not a transmitter coordinate. A region marked
+      <em>unbounded</em> extends past the analysed area; a site marked
+      <em>weak geometry</em> was only heard from one direction.
+    </p>
+  </div>
+</section>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

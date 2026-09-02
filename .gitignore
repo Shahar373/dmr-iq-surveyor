@@ -23,3 +23,7 @@ output/
 
 # Keep test fixtures that are intentionally generated in tests
 !tests/fixtures/*.wav
+
+# Real reference snapshots. config/p25_sites.example.csv is the template;
+# a filled-in operational site list stays out of the repository.
+config/p25_sites.csv

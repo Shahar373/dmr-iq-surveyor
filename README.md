@@ -15,6 +15,7 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - Phase 5.1: validated 10m/500k/250k targeted-capture profiles, metadata and standalone-log import
 - Phase 5.2: exact 5m and 62k5 profiles for additional SDRconnect recording modes
 - Phase 6A: protocol-agnostic RF survey (discovery, persistent inventory, run comparison), the first step toward multi-protocol support (P25 in 866-870 MHz)
+- Phase 7: multi-session P25 site geolocation (reference registry, censored-likelihood grid posterior, credible-region polygons) and a field web app
 
 ## Project documentation
 
@@ -26,6 +27,8 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - [`docs/PHASE5-2-ADDITIONAL-RATES.md`](docs/PHASE5-2-ADDITIONAL-RATES.md)
 - [`docs/phase6-design.md`](docs/phase6-design.md)
 - [`docs/phase6a-survey.md`](docs/phase6a-survey.md)
+- [`docs/phase7-geolocation-design.md`](docs/phase7-geolocation-design.md)
+- [`docs/PHASE7-FIELD-GEOLOCATION.md`](docs/PHASE7-FIELD-GEOLOCATION.md)
 - [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md)
 - [`docs/FIELD-RECORDING-GUIDE.md`](docs/FIELD-RECORDING-GUIDE.md)
 - [`docs/TRANSMITTER-LOCATION-STUDY.md`](docs/TRANSMITTER-LOCATION-STUDY.md)
@@ -353,6 +356,99 @@ Runs and observations persist in the same SQLite database as the DMR inventory (
 
 Band profiles (`config/bands/*.yaml`, e.g. `central_800.yaml` for 866-870 MHz, `central_800_recon.yaml` for a short first-look capture) describe where to look; site profiles (`config/sites/*.yaml`, copy `home.example.yaml`) record the fixed measurement context. See [`docs/phase6a-survey.md`](docs/phase6a-survey.md) for the full design, schema and acceptance criteria, [`docs/phase6-design.md`](docs/phase6-design.md) for the overall Phase 6 roadmap toward P25, and [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md) for a field-ready capture procedure at a new site.
 
+## Phase 7 — P25 site geolocation
+
+```bash
+dmr-surveyor geo import-sites config/p25_sites.csv --snapshot-id p25_sites_v1
+dmr-surveyor geo sites
+dmr-surveyor geo measurements
+dmr-surveyor geo solve --output runs/geo
+dmr-surveyor geo history BEE00:37D:1:30
+dmr-surveyor geo export runs/geo/map.geojson
+```
+
+Phase 7 turns the Phase 6A observation inventory into per-site transmitter *location estimates*: a
+posterior probability surface and credible-region polygons for each P25 site, built from several
+passive recording sessions made at different places and improving as sessions accumulate.
+
+### Site attribution is explicit, never assumed
+
+A received level measured on a frequency is not a measurement of a site. Every measurement stores how
+it was attributed:
+
+| `attribution` | Meaning | Used by the solver |
+|---|---|---|
+| `decoded` | RFSS/Site read from control-channel decoder evidence | yes (reserved; nothing emits it yet) |
+| `inferred_unique` | measured, and exactly one registry site uses that frequency | yes, flagged |
+| `ambiguous_reuse` | measured, but more than one site uses that frequency | no — excluded with a reason |
+| `frequency_unknown` | site is known, no control-channel frequency on record | no — nothing to measure |
+
+and separately, whether it can be used at all:
+
+| `usability` | Meaning |
+|---|---|
+| `usable` | inside the run's *measured* usable passband, and the run has a position |
+| `not_covered` | outside the measured passband. **Not evidence** — we did not look there |
+| `no_position` | the run has no coordinates |
+| `ambiguous` | excluded by the ladder above |
+
+A NAC is not a site identifier — one NAC is routinely shared by many sites in a system — so it is
+stored as context and never used to attribute a measurement.
+
+### Detections and non-detections are both evidence
+
+A frequency that was inside the measured passband and produced nothing is a **left-censored**
+measurement, not a missing one, and is often what closes a region. A campaign made entirely of
+detections is reported `unbounded_region`, correctly.
+
+### The estimator
+
+For each site, a grid posterior over position with the log-distance model
+`mu = P0 - 10 n log10(d/d0)`, Gaussian shadow fading, and `P0`/`n` marginalised out. Detections use a
+Gaussian likelihood; non-detections use `Phi((y_threshold - mu)/sigma)`. Evaluation is a bounded
+coarse pass over the whole region followed by a fine pass restricted to where the mass is, chunked
+over cells so peak memory does not scale with the grid. Credible regions are highest-density regions,
+emitted as GeoJSON MultiPolygons with holes where the posterior is annular.
+
+The solver refuses rather than guessing:
+
+| `status` | Raised when |
+|---|---|
+| `ok` | enough evidence and geometry for a bounded region |
+| `insufficient_evidence` | fewer than `--min-detections` (default 3) usable detections |
+| `unbounded_region` | the 90% region reaches the edge of the analysed area |
+| `weak_geometry` | detections span under 90 degrees of azimuth around the estimate |
+
+A region is a search-area reduction, not a transmitter coordinate, and reports never present the
+posterior mode as one. Simulcast — several transmitters keyed together as one logical site — is not
+modelled; every solution records `source_model: single_transmitter_assumed`.
+
+### Field web app
+
+```bash
+dmr-surveyor web serve --host 0.0.0.0 --token auto \
+  --band central_800_narrow --site mobile --output runs/field
+```
+
+A local control surface served by the Pi and opened from a phone on the same hotspot: mark your
+position (phone GPS or a map tap), record a stop with one button, watch capture -> survey ->
+measurements -> solve progress live, and see the measurement points and credible regions on the map.
+Built on the standard library's HTTP server with a dependency-free single-page app — a field tool
+must not fail because a dependency did not install.
+
+It binds to loopback unless `--host` says otherwise, because the API can start a capture; on an open
+network pass `--token auto` and use the printed URL. Browsers only expose GPS over HTTPS or from
+localhost, so over plain HTTP from a phone, tap the map to place your position.
+
+The solve that runs after each stop uses a coarser grid (`--solve-resolution-m`, default 250 m) so it
+finishes in seconds; `--no-solve-after-capture` skips it entirely on a long campaign. Run
+`dmr-surveyor geo solve --resolution-m 100` once at the end of the day.
+
+See [`docs/phase7-geolocation-design.md`](docs/phase7-geolocation-design.md) for the full design and
+schema, [`docs/PHASE7-FIELD-GEOLOCATION.md`](docs/PHASE7-FIELD-GEOLOCATION.md) for the campaign
+procedure, and [`config/p25_sites.example.md`](config/p25_sites.example.md) for the snapshot format.
+
+
 ## Result packaging
 
 Generated runs, reports, metadata and the persistent SQLite database can be archived without including raw IQ files:
@@ -372,7 +468,7 @@ pytest -q
 ruff check .
 ```
 
-The suite covers metadata parsing, spectrum processing, candidate detection, streamed DSP, 10m/5m/500k/250k/62k5 profiles, off-center frequency mixing, peak-safe WAV output, DSD-FME quality parsing, polarity selection, active slots, event parsing, session semantics, capture metadata migration, standalone-log import, idempotent SQLite import and cross-run aggregation, plus Phase 6A band/site profiles, segmented discovery, occupancy vs. persistence, usable-passband measurement, idempotent survey import with capture-time-based history, and protocol-agnostic run comparison — all against synthetic fixtures generated at test time, no real IQ data is committed. An optional real-recording integration test is documented in [`docs/phase6a-survey.md`](docs/phase6a-survey.md).
+The suite covers metadata parsing, spectrum processing, candidate detection, streamed DSP, 10m/5m/500k/250k/62k5 profiles, off-center frequency mixing, peak-safe WAV output, DSD-FME quality parsing, polarity selection, active slots, event parsing, session semantics, capture metadata migration, standalone-log import, idempotent SQLite import and cross-run aggregation, plus Phase 6A band/site profiles, segmented discovery, occupancy vs. persistence, usable-passband measurement, idempotent survey import with capture-time-based history, and protocol-agnostic run comparison, plus Phase 7 reference-snapshot parsing and idempotent import, the measurement attribution and usability ladder, projection/geometry, the grid posterior and its refusal statuses, credible-region contours including annuli and separated modes, the geolocation CLI, and the field web app's routing, authorisation and job lifecycle — all against synthetic fixtures generated at test time, no real IQ data is committed. An optional real-recording integration test is documented in [`docs/phase6a-survey.md`](docs/phase6a-survey.md).
 
 ## Passive scope
 

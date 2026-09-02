@@ -1,0 +1,189 @@
+"""End-to-end Phase 7: registry -> survey runs -> measurements -> solutions."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from fixtures.geo_scenario import (
+    SITE_CSV,
+    Transmitter,
+    build_database,
+    fast_solve_settings,
+    seed_run,
+)
+
+from dmr_iq_surveyor.geo.model import haversine_m
+from dmr_iq_surveyor.geo.pipeline import (
+    STATUS_FREQUENCY_UNKNOWN,
+    STATUS_NO_MEASUREMENTS,
+    build_map_geojson,
+    import_reference_sites,
+    materialise_measurements,
+    site_overview,
+    solve_all_sites,
+)
+from dmr_iq_surveyor.geo.store import connect_geo_database, solution_history
+
+SITE30 = Transmitter(867_762_500.0, 32.050, 34.800, reference_level_db=25.0, path_loss_exponent=3.4)
+SITE33 = Transmitter(866_712_500.0, 32.120, 34.870, reference_level_db=25.0, path_loss_exponent=3.4)
+SHARED = Transmitter(867_912_500.0, 32.050, 34.800, reference_level_db=25.0)
+
+STOPS = [
+    (32.045, 34.795), (32.056, 34.806), (32.041, 34.809), (32.059, 34.791),
+    (32.020, 34.760), (32.085, 34.770), (32.075, 34.855), (32.015, 34.850),
+    (32.115, 34.865), (32.126, 34.876), (32.110, 34.880),
+    (31.950, 34.700), (32.200, 34.700), (32.200, 34.950), (31.950, 34.950),
+]
+
+
+def _seed(database: Path, stops: list[tuple[float, float]], *, prefix: str = "run") -> None:
+    connection = build_database(database)
+    for index, (latitude, longitude) in enumerate(stops):
+        seed_run(
+            connection,
+            run_id=f"{prefix}_{index:02d}",
+            latitude=latitude,
+            longitude=longitude,
+            transmitters=[SITE30, SITE33, SHARED],
+            capture_start_utc=f"2026-08-{1 + index // 12:02d}T{6 + index % 12:02d}:00:00+00:00",
+        )
+    connection.close()
+
+
+def test_full_chain_produces_a_region_for_a_well_observed_site(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    _seed(database, STOPS)
+
+    measurements = materialise_measurements(database_path=database)
+    assert measurements["run_count"] == len(STOPS)
+    assert measurements["summary"]["detections"] > 0
+    assert measurements["summary"]["non_detections"] > 0
+    # Both sites on the reused frequency are excluded, every run.
+    assert measurements["summary"]["ambiguous"] == 2 * len(STOPS)
+
+    report = solve_all_sites(
+        database_path=database, output_root=tmp_path / "out", settings=fast_solve_settings()
+    )
+    solutions = {row["site_key"]: row for row in report["solutions"]}
+
+    site30 = solutions["BEE00:37D:1:30"]
+    assert site30["status"] == "ok"
+    assert haversine_m(
+        site30["mode_latitude"], site30["mode_longitude"], SITE30.latitude, SITE30.longitude
+    ) < 2000.0
+    assert site30["area_km2_90"] > 0
+
+    assert solutions["BEE00:37D:1:81"]["status"] == STATUS_FREQUENCY_UNKNOWN
+    for key in ("BEE00:37D:1:50", "BEE00:37D:1:82"):
+        assert solutions[key]["status"] == STATUS_NO_MEASUREMENTS
+        assert solutions[key]["excluded_count"] == len(STOPS)
+
+
+def test_reports_and_geojson_are_written(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    _seed(database, STOPS)
+    materialise_measurements(database_path=database)
+    report = solve_all_sites(
+        database_path=database,
+        output_root=tmp_path / "out",
+        solve_batch_id="batch_a",
+        settings=fast_solve_settings(),
+    )
+    reports = tmp_path / "out" / "reports"
+    assert (reports / "geolocation_batch_a.json").is_file()
+    assert (reports / "geolocation_batch_a.geojson").is_file()
+    markdown = (reports / "geolocation_batch_a.md").read_text(encoding="utf-8")
+    assert "not a tower coordinate" in markdown
+    assert "BEE00:37D:1:30" in markdown
+    assert "simulcast" in markdown
+    assert report["source_model"] == "single_transmitter_assumed"
+
+
+def test_map_geojson_carries_evidence_alongside_regions(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    _seed(database, STOPS)
+    materialise_measurements(database_path=database)
+    solve_all_sites(
+        database_path=database, output_root=tmp_path / "out", settings=fast_solve_settings()
+    )
+    collection = build_map_geojson(database_path=database)
+    kinds = [feature["properties"]["kind"] for feature in collection["features"]]
+    assert "measurement" in kinds
+    assert "credible_region" in kinds
+    assert "estimate" in kinds
+    measurement = next(
+        feature for feature in collection["features"]
+        if feature["properties"]["kind"] == "measurement"
+    )
+    assert "attribution" in measurement["properties"]
+    assert "usability" in measurement["properties"]
+
+
+def test_solutions_accumulate_as_history(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    _seed(database, STOPS)
+    materialise_measurements(database_path=database)
+    settings = fast_solve_settings()
+    solve_all_sites(database_path=database, solve_batch_id="first", settings=settings)
+    solve_all_sites(database_path=database, solve_batch_id="second", settings=settings)
+    solve_all_sites(database_path=database, solve_batch_id="second", settings=settings)
+
+    connection = connect_geo_database(database)
+    site_id = connection.execute(
+        "SELECT p25_site_id FROM p25_sites WHERE site_key = 'BEE00:37D:1:30'"
+    ).fetchone()["p25_site_id"]
+    history = solution_history(connection, int(site_id))
+    connection.close()
+    assert [row["solve_batch_id"] for row in history] == ["first", "second"]
+
+
+def test_overview_lists_every_site_including_unmeasurable_ones(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    _seed(database, STOPS[:4])
+    materialise_measurements(database_path=database)
+    solve_all_sites(database_path=database, settings=fast_solve_settings())
+    overview = {row["site_key"]: row for row in site_overview(database_path=database)}
+    assert len(overview) == 5
+    assert overview["BEE00:37D:1:81"]["channels"] == []
+    assert overview["BEE00:37D:1:50"]["channels"][0]["sharing_site_count"] == 2
+    assert overview["BEE00:37D:1:30"]["detections"] > 0
+
+
+def test_importing_the_snapshot_from_a_file_matches_the_inline_fixture(tmp_path: Path) -> None:
+    csv_path = tmp_path / "sites.csv"
+    csv_path.write_text(SITE_CSV, encoding="utf-8")
+    summary = import_reference_sites(
+        csv_path, database_path=tmp_path / "db.sqlite3", snapshot_id="snap"
+    )
+    assert summary["sites_created"] == 5
+    assert summary["channels_imported"] == 4
+    assert summary["sites_without_frequency"] == 1
+
+
+def test_solving_a_single_site_leaves_the_others_alone(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    _seed(database, STOPS)
+    materialise_measurements(database_path=database)
+    report = solve_all_sites(
+        database_path=database,
+        site_keys=["BEE00:37D:1:30"],
+        settings=fast_solve_settings(),
+    )
+    assert [row["site_key"] for row in report["solutions"]] == ["BEE00:37D:1:30"]
+
+
+def test_stored_solution_geojson_round_trips(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    _seed(database, STOPS)
+    materialise_measurements(database_path=database)
+    solve_all_sites(database_path=database, settings=fast_solve_settings())
+    connection = connect_geo_database(database)
+    row = connection.execute(
+        "SELECT geojson FROM geo_solutions WHERE p25_site_id = "
+        "(SELECT p25_site_id FROM p25_sites WHERE site_key = 'BEE00:37D:1:30')"
+    ).fetchone()
+    connection.close()
+    payload = json.loads(row["geojson"])
+    assert payload["type"] == "FeatureCollection"
+    assert payload["features"]

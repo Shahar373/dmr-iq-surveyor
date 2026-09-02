@@ -20,10 +20,15 @@ A spectral shape match is a *candidate*, never a confirmation. Phase 6A never ru
 | 6A | Generic RF survey: discovery, persistent inventory, protocol-agnostic run comparison | done |
 | 6B | P25 evidence-based classification via DSD-FME, backend-neutral channel IQ retained | planned |
 | 6C | P25 control-channel role, system/site metadata, channel grants | planned |
-| 6D | Reference snapshot import/matching, evidence-aware comparison statuses | planned |
+| 6D | Reference snapshot import/matching | done, as Phase 7's `reference/` registry |
 | 6E | Explainable round-2 follow-up recommendations (no retuning) | planned |
-| 6F | Standalone HTML dashboard | planned |
-| 6G | Live SoapySDR acquisition feeding the same pipeline | planned |
+| 6F | Dashboard | done, as Phase 7's served field app rather than a standalone HTML file |
+| 6G | Live SoapySDR acquisition feeding the same pipeline | done, `capture/` + `survey capture` |
+| 7 | Multi-session P25 site geolocation and the field web app | done, see `docs/phase7-geolocation-design.md` |
+
+6B remains the most consequential gap. Until a control channel is actually decoded, a site is
+attributed to a measurement by frequency alone, which the 6D registry can only report honestly
+(`inferred_unique`), never confirm — and cannot do at all where two sites share a frequency.
 
 ## Architecture
 
@@ -33,13 +38,15 @@ src/dmr_iq_surveyor/
     survey/                             Phase 6A: profiles, discovery, store, compare, pipeline
     reporting/                          JSON/Markdown report rendering
     protocols/                          Phase 6B+: P25/DMR probe adapters (not yet added)
-    reference/                          Phase 6D+: reference snapshots (not yet added)
+    reference/                          external P25 site snapshots (Phase 7)
+    geo/                                measurements, propagation model, grid posterior (Phase 7)
+    web/                                field control app (Phase 7)
     inventory/                          unchanged (DMR-specific persistent inventory)
     cli.py -> cli_v2 -> cli_v3 -> cli_v4  unchanged additive command chain
     cli_survey.py, cli_app.py           new `survey` sub-app, new console entry point
 ```
 
-`cli_app.py` is the new console entry point (`dmr-surveyor = dmr_iq_surveyor.cli_app:app`). It imports `cli_v4` (which imports the whole `cli` → `cli_v2` → `cli_v3` → `cli_v4` chain) and mounts `survey_app` as a Typer sub-app. `cli_v4:app` still works unchanged for anyone importing it directly; nothing was deleted or renamed.
+`cli_app.py` is the new console entry point (`dmr-surveyor = dmr_iq_surveyor.cli_app:app`). It imports `cli_v4` (which imports the whole `cli` → `cli_v2` → `cli_v3` → `cli_v4` chain) and mounts `survey_app`, `geo_app` and `web_app` as Typer sub-apps. `cli_v4:app` still works unchanged for anyone importing it directly; nothing was deleted or renamed.
 
 ## Database
 

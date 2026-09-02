@@ -1,0 +1,6 @@
+wacn_hex,system_id_hex,rfss,site,observation_status,primary_cc_mhz,nac_hex,notes
+ABCDE,123,1,1,DIRECT,866.012500,4A1,control channel confirmed by the source of this snapshot
+ABCDE,123,1,2,NEIGHBOR_ONLY,866.512500,,advertised by site 1
+ABCDE,123,1,3,NEIGHBOR_ONLY,,,advertised; control channel not yet found
+ABCDE,123,1,4,NEIGHBOR_ONLY,867.212500,,shares a frequency with site 5
+ABCDE,123,1,5,NEIGHBOR_ONLY,867.212500,,shares a frequency with site 4
