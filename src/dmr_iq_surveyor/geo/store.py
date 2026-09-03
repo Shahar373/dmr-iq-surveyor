@@ -98,7 +98,8 @@ CREATE TABLE IF NOT EXISTS geo_plans (
 CREATE TABLE IF NOT EXISTS geo_run_exclusions (
     survey_run_id TEXT PRIMARY KEY REFERENCES survey_runs(survey_run_id) ON DELETE CASCADE,
     reason TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'all'
 );
 """
 
@@ -106,6 +107,15 @@ CREATE TABLE IF NOT EXISTS geo_run_exclusions (
 def connect_geo_database(path: str | Path) -> sqlite3.Connection:
     connection = connect_reference_database(path)
     connection.executescript(GEO_SCHEMA)
+    # CREATE TABLE IF NOT EXISTS leaves an existing table exactly as it was,
+    # so a column added later has to be applied separately. Additive, with a
+    # default, so a database written by an earlier version upgrades in place
+    # and keeps the behaviour it had.
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(geo_run_exclusions)")}
+    if "scope" not in existing:
+        connection.execute(
+            "ALTER TABLE geo_run_exclusions ADD COLUMN scope TEXT NOT NULL DEFAULT 'all'"
+        )
     connection.commit()
     return connection
 
@@ -140,8 +150,17 @@ def latest_plan(connection: sqlite3.Connection) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
-def exclude_run(connection: sqlite3.Connection, survey_run_id: str, reason: str) -> None:
-    """Bar one survey run from contributing to geolocation, with a reason.
+EXCLUSION_SCOPE_ALL = "all"
+EXCLUSION_SCOPE_NON_DETECTIONS = "non_detections"
+
+
+def exclude_run(
+    connection: sqlite3.Connection,
+    survey_run_id: str,
+    reason: str,
+    scope: str = EXCLUSION_SCOPE_ALL,
+) -> None:
+    """Bar a survey run from contributing to geolocation, with a reason.
 
     A truncated capture is the case that matters: a signal that was there but
     was not recorded long enough to be detected becomes a *non-detection*,
@@ -149,11 +168,31 @@ def exclude_run(connection: sqlite3.Connection, survey_run_id: str, reason: str)
     A short capture would therefore not merely lose a measurement -- it would
     manufacture a confident wrong one. The run stays in the database as
     evidence; it just stops counting.
+
+    `scope` says how far that reasoning reaches, because two different things
+    raise an exclusion and they do not mean the same:
+
+    `non_detections`
+        Capture integrity -- driver overflows, a capture that came up short.
+        The recording has gaps, so silence may only mean the receiver was not
+        listening at that moment. A gap cannot invent a signal, though, so
+        what WAS heard stays evidence.
+
+    `all`
+        The operator's own judgement about the stop ("parked under a bridge").
+        That is a claim about the whole receive path, so the levels are as
+        suspect as the silences and nothing from the run counts.
+
+    `all` is the default, and the value existing rows take on upgrade: a
+    stored exclusion whose intent is no longer recoverable is treated as the
+    stricter of the two.
     """
+    if scope not in (EXCLUSION_SCOPE_ALL, EXCLUSION_SCOPE_NON_DETECTIONS):
+        raise ValueError(f"unknown exclusion scope: {scope!r}")
     connection.execute(
-        "INSERT OR REPLACE INTO geo_run_exclusions(survey_run_id, reason, created_at) "
-        "VALUES (?, ?, ?)",
-        (survey_run_id, reason, datetime.now(UTC).isoformat()),
+        "INSERT OR REPLACE INTO geo_run_exclusions(survey_run_id, reason, created_at, scope) "
+        "VALUES (?, ?, ?, ?)",
+        (survey_run_id, reason, datetime.now(UTC).isoformat(), scope),
     )
     connection.commit()
 

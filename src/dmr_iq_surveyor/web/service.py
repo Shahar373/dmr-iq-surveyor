@@ -30,6 +30,7 @@ from dmr_iq_surveyor.geo.pipeline import (
     solve_all_sites,
 )
 from dmr_iq_surveyor.geo.store import (
+    EXCLUSION_SCOPE_NON_DETECTIONS,
     clear_run_exclusion,
     connect_geo_database,
     exclude_run,
@@ -625,10 +626,24 @@ class FieldService:
         if integrity_reason:
             connection = connect_geo_database(Path(self.settings.database_path))
             try:
-                exclude_run(connection, run_id, integrity_reason)
+                # Scoped to non-detections. Both reasons above are about gaps
+                # in the recording, and a gap can hide a signal but cannot
+                # invent one -- so what was heard here is still evidence.
+                # Barring the whole run instead cost two real field stops:
+                # 90 s and 60 s over the full band, 25 and 19 observations,
+                # discarded entirely for 23 and 27 overflows.
+                exclude_run(
+                    connection,
+                    run_id,
+                    integrity_reason,
+                    scope=EXCLUSION_SCOPE_NON_DETECTIONS,
+                )
             finally:
                 connection.close()
-            job.emit("measurements", "stop excluded from geolocation: " + integrity_reason)
+            job.emit(
+                "measurements",
+                "non-detections from this stop excluded from geolocation: " + integrity_reason,
+            )
 
         job.emit("measurements", "matching observations against the site registry", progress=0.85)
         measurements = materialise_measurements(

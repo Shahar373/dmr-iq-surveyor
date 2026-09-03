@@ -167,8 +167,13 @@ def build_run_measurements(
     site = dict(site_row) if site_row is not None else None
 
     run_excluded = connection.execute(
-        "SELECT reason FROM geo_run_exclusions WHERE survey_run_id = ?", (survey_run_id,)
+        "SELECT reason, scope FROM geo_run_exclusions WHERE survey_run_id = ?", (survey_run_id,)
     ).fetchone()
+    # An integrity exclusion bars only the non-detections; an operator's
+    # judgement about the stop bars everything. See geo/store.exclude_run.
+    excludes_detections = (
+        run_excluded is not None and str(run_excluded["scope"]) != "non_detections"
+    )
 
     latitude, longitude, position_source, accuracy = _resolve_position(run, site)
     detection_settings = json.loads(run["detection_settings_json"] or "{}")
@@ -239,7 +244,22 @@ def build_run_measurements(
         detected = observation is not None
         covered = _covered(run, frequency_hz, resolved.passband_guard_hz)
 
-        if run_excluded is not None:
+        # A run excluded for capture integrity loses its NON-detections, not
+        # its detections. Both reasons that raise the exclusion -- driver
+        # overflows, and a capture that came up short -- say the same thing:
+        # the recording has gaps, so "heard nothing" may mean "was not
+        # listening just then". That argument does not run the other way. A
+        # gap cannot manufacture a signal, so a detection through one is still
+        # a detection, and its level is still measured on the samples that
+        # did arrive.
+        #
+        # Dropping the whole run was measured against real field data: two
+        # 90 s and 60 s stops covering the full 865-869 MHz band, with 25 and
+        # 19 observations between them, were discarded in their entirety for
+        # 23 and 27 overflows -- leaving one 15 s stop that happened to be
+        # clean, and a campaign that could not solve anything. The detections
+        # in those runs were never in doubt.
+        if run_excluded is not None and (excludes_detections or not detected):
             usability = USABILITY_RUN_EXCLUDED
             exclusion = str(run_excluded["reason"])
         elif attribution == ATTRIBUTION_AMBIGUOUS_REUSE:
@@ -269,6 +289,12 @@ def build_run_measurements(
                     "roll-off understates the level by an unknown amount"
                 )
                 flags.append("detected_outside_measured_passband")
+
+        # Kept, but never quietly: the level came off a recording with gaps,
+        # so it is noisier than one from a clean capture even though the
+        # detection itself is sound.
+        if run_excluded is not None and detected and not excludes_detections:
+            flags.append("detection_from_excluded_run")
 
         if observation is not None:
             if observation.get("edge_warning"):

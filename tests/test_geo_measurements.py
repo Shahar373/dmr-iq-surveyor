@@ -315,6 +315,73 @@ def test_an_excluded_run_contributes_nothing_but_keeps_its_reason(tmp_path: Path
     connection.close()
 
 
+def test_an_integrity_exclusion_keeps_the_detections_it_did_make(tmp_path: Path) -> None:
+    """Overflows and short captures bar the silences, not what was heard.
+
+    Both reasons say the same thing: the recording has gaps, so "heard
+    nothing" may only mean the receiver was not listening at that moment.
+    A gap cannot invent a signal, so a detection through one is still a
+    detection.
+
+    Measured against real field data: two stops of 90 s and 60 s covering
+    the full 865-869 MHz band, carrying 25 and 19 observations, were
+    discarded whole for 23 and 27 driver overflows -- leaving a campaign
+    that could not solve anything from three stops.
+    """
+    from dmr_iq_surveyor.geo.measurements import USABILITY_RUN_EXCLUDED
+    from dmr_iq_surveyor.geo.store import EXCLUSION_SCOPE_NON_DETECTIONS, exclude_run
+
+    connection = build_database(tmp_path / "db.sqlite3")
+    seed_run(connection, run_id="run", latitude=32.05, longitude=34.80, transmitters=[NEAR, FAR])
+    exclude_run(
+        connection,
+        "run",
+        "23 driver overflow(s): the recording has gaps of unknown length",
+        scope=EXCLUSION_SCOPE_NON_DETECTIONS,
+    )
+
+    rows = build_run_measurements(connection, "run")
+    heard = [row for row in rows if row["detected"]]
+    silent = [row for row in rows if not row["detected"]]
+    assert heard and silent, "the fixture needs both outcomes for this to mean anything"
+
+    assert all(row["usability"] == USABILITY_USABLE for row in heard)
+    assert all("detection_from_excluded_run" in row["quality_flags"] for row in heard), (
+        "a level measured off a gapped recording is usable, but must not be silent about it"
+    )
+    assert all(row["usability"] == USABILITY_RUN_EXCLUDED for row in silent)
+    assert all("overflow" in row["exclusion_reason"] for row in silent)
+    assert summarise(rows)["non_detections"] == 0
+    assert summarise(rows)["usable"] > 0
+    connection.close()
+
+
+def test_an_exclusion_stored_before_scopes_existed_still_bars_everything(
+    tmp_path: Path,
+) -> None:
+    """A database written by an earlier version must not loosen on upgrade.
+
+    The stored intent of an old exclusion cannot be recovered, so it takes
+    the stricter reading -- which is also what the column defaults to.
+    """
+    from dmr_iq_surveyor.geo.measurements import USABILITY_RUN_EXCLUDED
+
+    database = tmp_path / "db.sqlite3"
+    connection = build_database(database)
+    seed_run(connection, run_id="run", latitude=32.05, longitude=34.80, transmitters=[NEAR, FAR])
+    # Written the way the previous schema did, with no scope column value.
+    connection.execute(
+        "INSERT OR REPLACE INTO geo_run_exclusions(survey_run_id, reason, created_at) "
+        "VALUES ('run', 'legacy exclusion', '2026-01-01T00:00:00+00:00')"
+    )
+    connection.commit()
+
+    rows = build_run_measurements(connection, "run")
+    assert rows
+    assert all(row["usability"] == USABILITY_RUN_EXCLUDED for row in rows)
+    connection.close()
+
+
 def test_a_stop_recorded_at_a_different_gain_is_flagged_across_the_campaign(
     tmp_path: Path,
 ) -> None:
