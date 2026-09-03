@@ -597,6 +597,12 @@ function useDeviceGps() {
 }
 
 async function startCapture(confirmPosition = false) {
+  // Disabled on the way IN, not once the POST answers. The server probes the
+  // SDR before it replies, and on a phone that pause is long enough for a
+  // second tap to land: the first request starts the capture, the second is
+  // refused, and the refusal is the only thing the operator sees.
+  const button = $("#record");
+  button.disabled = true;
   const body = {
     duration_seconds: Number($("#duration").value),
     center_frequency_hz: Number($("#center").value) * 1e6,
@@ -609,8 +615,9 @@ async function startCapture(confirmPosition = false) {
   if (confirmPosition) body.confirm_position = true;
   try {
     const job = await api("/api/capture", { method: "POST", body: JSON.stringify(body) });
-    watchJob(job.job_id);
+    watchJob(job.job_id);  // keeps the button disabled until the job ends
   } catch (error) {
+    button.disabled = false;
     // A stale marked position is recoverable, and recording a stop against
     // the PREVIOUS stop's coordinates is the one mistake that silently
     // corrupts a whole campaign -- so it asks rather than proceeding.

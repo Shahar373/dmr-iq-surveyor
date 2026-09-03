@@ -316,6 +316,44 @@ def test_a_stale_position_must_be_confirmed_before_a_stop_is_recorded(tmp_path: 
     assert not isinstance(excinfo.value, PositionStale)
 
 
+def test_a_second_capture_request_names_the_running_job_not_the_sdr(tmp_path: Path) -> None:
+    """Reproduces a field report: a duplicate tap on Record answered with an
+    SDR fault. The SDR probe runs before the job is submitted, and enumerating
+    a device the running capture already holds reports it as missing -- so the
+    operator went looking for broken hardware that was working fine."""
+    service = FieldService(
+        FieldSettings(
+            database_path=tmp_path / "db.sqlite3",
+            output_root=tmp_path / "out",
+            recordings_dir=tmp_path / "rec",
+        )
+    )
+    service.set_position({"latitude": 32.05, "longitude": 34.8, "label": "Ridge"})
+
+    release = threading.Event()
+    started = threading.Event()
+
+    def work(job):
+        job.emit("capture", "recording")
+        started.set()
+        release.wait(5)
+        return {}
+
+    service.jobs.submit(kind="capture", label="first", work=work)
+    assert started.wait(5)
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            service.start_capture({"duration_seconds": 5})
+    finally:
+        release.set()
+    message = str(excinfo.value)
+    assert "already running" in message
+    assert "capture" in message
+    # The point of the fix: it never reached the SDR probe, so it cannot be
+    # reported as a device problem.
+    assert "SoapySDR" not in message
+
+
 def test_purge_frees_recordings_but_keeps_their_capture_reports(client: Client, tmp_path: Path) -> None:
     recordings = tmp_path / "rec"
     recordings.mkdir(parents=True, exist_ok=True)

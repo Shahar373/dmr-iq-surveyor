@@ -401,6 +401,23 @@ class FieldService:
     def start_capture(self, payload: dict[str, Any]) -> Job:
         if not self.settings.allow_capture:
             raise RuntimeError("captures are disabled on this server (--no-capture)")
+
+        # Checked FIRST, ahead of the SDR probe below. A second request while a
+        # capture is running would otherwise reach that probe, which enumerates
+        # a device the running capture already holds and reports it as missing
+        # -- so a duplicate tap on the Record button was answered with an SDR
+        # fault, sending the operator to diagnose hardware that was working.
+        # JobRegistry.submit() keeps its own check: that one is atomic and is
+        # what actually makes two concurrent captures impossible. This one only
+        # makes the answer honest and cheap.
+        running = self.jobs.active_job()
+        if running is not None:
+            raise RuntimeError(
+                f"a {running.kind} job is already running "
+                f"({running.stage or 'starting'}: {running.message or 'no detail yet'}); "
+                "wait for it to finish or cancel it first"
+            )
+
         position = self.get_position()
         if position.get("latitude") is None:
             raise ValueError(
