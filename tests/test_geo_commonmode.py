@@ -276,6 +276,97 @@ def test_the_plan_ranks_places_whose_outcome_is_least_predictable(tmp_path: Path
         assert stop["helps_most"], "a suggestion must say which sites it helps"
 
 
+def test_the_plan_sends_the_operator_to_a_bearing_it_has_not_seen() -> None:
+    """Entropy alone cannot tell an opening bearing from a repeated one.
+
+    A ring at the edge of a site's audible range is uncertain the whole way
+    round, including the arc already driven. Azimuth span is what decides
+    whether a region closes, so the plan has to prefer the part of that ring
+    nobody has stood in yet.
+
+    Built on deliberately clustered stops, which is the case where the two
+    rankings can differ at all: with stops already spread around a site,
+    every bearing is covered and there is nothing left for the term to find.
+    """
+    import numpy as np
+
+    from dmr_iq_surveyor.geo.model import (
+        GeoMeasurement,
+        LocalProjection,
+        bearing_deg,
+    )
+    from dmr_iq_surveyor.geo.model import (
+        haversine_m as distance_m,
+    )
+    from dmr_iq_surveyor.geo.planning import PlanSettings, build_target, plan_next_stops
+    from dmr_iq_surveyor.geo.solver import solve_site
+
+    transmitter = (32.100, 34.850)
+    clustered = [(32.070, 34.800), (32.080, 34.815), (32.075, 34.830)]
+    measurements = []
+    for index, (latitude, longitude) in enumerate(clustered):
+        distance = max(distance_m(latitude, longitude, *transmitter), 50.0)
+        level = 34.0 - 10.0 * 3.0 * math.log10(distance / 1000.0)
+        measurements.append(
+            GeoMeasurement(
+                label=f"stop{index}",
+                latitude=latitude,
+                longitude=longitude,
+                detected=level >= 4.0,
+                level_db=level if level >= 4.0 else None,
+                censor_level_db=4.0,
+            )
+        )
+
+    solve = fast_solve_settings()
+    result = solve_site(measurements, solve)
+    assert result.surface is not None
+    assert result.azimuth_span_deg < 45.0, "the fixture must actually be one-sided"
+
+    projection = LocalProjection(
+        float(np.mean([s[0] for s in clustered])), float(np.mean([s[1] for s in clustered]))
+    )
+    observed = [
+        bearing_deg(result.mode_latitude, result.mode_longitude, latitude, longitude)
+        for latitude, longitude in clustered
+    ]
+
+    def gap_to_nearest_observed_bearing(azimuth_weight: float) -> float:
+        target = build_target(
+            site_key="site",
+            surface=result.surface,
+            projection=projection,
+            reference_level_db=result.reference_level_db,
+            path_loss_exponent=result.path_loss_exponent,
+            threshold_db=4.0,
+            area_km2=500.0,
+            settings=PlanSettings(),
+        )
+        plan = plan_next_stops(
+            targets=[target],
+            projection=projection,
+            visited=list(clustered),
+            solve=solve,
+            settings=PlanSettings(azimuth_weight=azimuth_weight),
+        )
+        best = plan["top_stops"][0]
+        proposed = bearing_deg(
+            result.mode_latitude, result.mode_longitude, best["latitude"], best["longitude"]
+        )
+        return min(abs((proposed - seen + 180.0) % 360.0 - 180.0) for seen in observed)
+
+    entropy_only = gap_to_nearest_observed_bearing(0.0)
+    with_azimuth = gap_to_nearest_observed_bearing(0.6)
+    assert with_azimuth > entropy_only, (
+        f"the angular term should open the geometry further than entropy alone "
+        f"({with_azimuth:.0f} deg vs {entropy_only:.0f} deg off the nearest measured bearing)"
+    )
+    assert with_azimuth > 90.0, (
+        f"with every stop on one side, the next one belongs well away from that arc; "
+        f"got {with_azimuth:.0f} deg"
+    )
+
+
 def test_planning_refuses_before_there_is_anything_to_plan_against(tmp_path: Path) -> None:
     database = tmp_path / "db.sqlite3"
     connect_geo_database(database).close()

@@ -47,6 +47,20 @@ class PlanSettings:
     posterior_cells: int = 1_500
     # A stop this close to an existing one mostly repeats it.
     novelty_scale_m: float = 700.0
+    # How much of a candidate's value is modulated by the angle it adds.
+    #
+    # Entropy alone answers "is the outcome here uncertain?", which is
+    # satisfied all the way around a ring at the edge of a site's audible
+    # range -- including the part of that ring the operator has already
+    # driven to. It cannot distinguish a stop that opens the azimuth span
+    # from one that repeats an existing bearing further out, and azimuth
+    # span is precisely what decides whether a region closes: three stops
+    # spanning 14 degrees produced a 2,513 km2 region from clean data.
+    #
+    # 0 restores pure entropy; 1 makes a candidate on an existing bearing
+    # worthless however uncertain it is. The default keeps entropy in
+    # charge and lets angle break its many near-ties.
+    azimuth_weight: float = 0.6
     # A site whose 90% region is already smaller than this has little left to
     # gain and stops dominating the plan.
     satisfied_area_km2: float = 3.0
@@ -62,6 +76,8 @@ class PlanSettings:
             raise ValueError("posterior_cells must be at least 1")
         if self.top_n < 1:
             raise ValueError("top_n must be at least 1")
+        if not 0.0 <= self.azimuth_weight <= 1.0:
+            raise ValueError("azimuth_weight must be between 0 and 1")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -155,6 +171,35 @@ def _detection_probability(
     return detect @ target.weight_cell
 
 
+def _azimuth_opening(
+    target: SiteTarget,
+    candidate_east: np.ndarray,
+    candidate_north: np.ndarray,
+    visited_east: np.ndarray,
+    visited_north: np.ndarray,
+) -> np.ndarray:
+    """How much new bearing each candidate adds around this site, in 0..1.
+
+    Measured as the angular distance from a candidate's bearing (seen from
+    the site's posterior centroid) to the NEAREST bearing already observed.
+    A candidate on top of an existing bearing scores 0 however far away it
+    is; one on the opposite side of the site scores 1.
+
+    Every visited stop counts, not only the ones that heard the site: a
+    non-detection from a fresh bearing bounds the site from that side, which
+    is the same geometric service a detection performs.
+    """
+    if visited_east.size == 0:
+        return np.ones(candidate_east.size, dtype=float)
+    centre_east = float(target.east_m @ target.weight_cell)
+    centre_north = float(target.north_m @ target.weight_cell)
+    observed = np.arctan2(visited_east - centre_east, visited_north - centre_north)
+    candidate = np.arctan2(candidate_east - centre_east, candidate_north - centre_north)
+    separation = np.abs(candidate[:, None] - observed[None, :])
+    np.minimum(separation, 2.0 * math.pi - separation, out=separation)
+    return separation.min(axis=1) / math.pi
+
+
 def plan_next_stops(
     *,
     targets: list[SiteTarget],
@@ -200,6 +245,9 @@ def plan_next_stops(
     candidate_east = mesh_x.reshape(-1)
     candidate_north = mesh_y.reshape(-1)
 
+    visited_east_array = np.asarray(visited_east, dtype=float)
+    visited_north_array = np.asarray(visited_north, dtype=float)
+
     value = np.zeros(candidate_east.size, dtype=float)
     per_site: dict[str, np.ndarray] = {}
     for target in targets:
@@ -210,6 +258,16 @@ def plan_next_stops(
                 target, candidate_east[start:stop], candidate_north[start:stop], solve
             )
             site_value[start:stop] = _binary_entropy(probability)
+        # Angle modulates entropy rather than replacing it: an outcome that
+        # is already certain teaches nothing from any bearing, so a stop
+        # there is not worth making however much geometry it would add.
+        if resolved.azimuth_weight > 0.0:
+            opening = _azimuth_opening(
+                target, candidate_east, candidate_north, visited_east_array, visited_north_array
+            )
+            site_value = site_value * (
+                (1.0 - resolved.azimuth_weight) + resolved.azimuth_weight * opening
+            )
         per_site[target.site_key] = site_value
         value += target.weight * site_value
 
