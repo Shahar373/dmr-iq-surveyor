@@ -303,7 +303,9 @@ function statusBadge(status) {
   if (status === "ok") return ["ok", "bounded region"];
   if (status === "unbounded_region") return ["warn", "unbounded"];
   if (status === "weak_geometry") return ["warn", "weak geometry"];
-  if (status === "insufficient_evidence") return ["none", "not enough detections"];
+  // Not "not enough detections": the gate counts non-detections too, and a
+  // site refused with four of them would read as though they had not counted.
+  if (status === "insufficient_evidence") return ["none", "not enough evidence"];
   if (status === "frequency_unknown") return ["none", "no control channel known"];
   if (status === "no_measurements") return ["none", "nothing usable"];
   return ["none", status || "not solved"];
