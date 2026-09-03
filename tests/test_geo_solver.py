@@ -192,7 +192,73 @@ def test_too_few_detections_refuses_rather_than_guessing() -> None:
     result = solve_site(_measurements(NEAR_STOPS[:2]), fast_solve_settings())
     assert result.status == STATUS_INSUFFICIENT_EVIDENCE
     assert result.surface is None
-    assert "at least 3" in result.status_reason
+    # Two detections with nothing else give one constraint on two unknowns.
+    # The reason has to say what is short, not merely that something is:
+    # the operator's next decision is whether another stop would help.
+    assert "constraint" in result.status_reason
+    assert "2 detection(s)" in result.status_reason
+
+
+def test_non_detections_count_toward_the_evidence_needed_to_solve() -> None:
+    """Two detections plus non-detections must be allowed to solve.
+
+    The solver has always USED non-detections -- they are the censored terms
+    in the likelihood -- while the gate in front of it counted detections
+    only. Measured on this geometry, that gate was refusing a bounded region
+    the solver could produce and locate to about a kilometre.
+    """
+    stops = NEAR_STOPS[:2] + FAR_STOPS
+    measurements = _measurements(stops)
+    detections = [m for m in measurements if m.detected]
+    censored = [m for m in measurements if not m.detected]
+    assert len(detections) == 2, "the near stops hear it and the far ones do not"
+    assert len(censored) >= 2
+
+    result = solve_site(measurements, fast_solve_settings())
+    assert result.status != STATUS_INSUFFICIENT_EVIDENCE
+    assert result.surface is not None
+    error_km = (
+        haversine_m(result.mode_latitude, result.mode_longitude, TRUE_LATITUDE, TRUE_LONGITUDE)
+        / 1000.0
+    )
+    assert error_km < 5.0, f"mode landed {error_km:.1f} km from the transmitter"
+
+    # The floor still holds where it should: one detection cannot separate
+    # transmit power from distance however many non-detections surround it.
+    single = [detections[0], *censored]
+    assert solve_site(single, fast_solve_settings()).status == STATUS_INSUFFICIENT_EVIDENCE
+
+
+def test_shadow_fading_posterior_follows_the_scatter_in_the_data() -> None:
+    """Sigma is marginalised, not assumed -- and the Gaussian normaliser is
+    carried through.
+
+    Without the `-K log(sigma)` term a wider sigma explains any residual
+    more cheaply, so the largest value on the grid would win every time and
+    the marginalisation would be a fixed choice in disguise. Noisier data
+    must therefore move the posterior upward.
+    """
+    stops = NEAR_STOPS + MID_STOPS
+    settings = fast_solve_settings()
+
+    def posterior_mean(noise_db: float) -> float:
+        # Averaged over draws: one noise realisation should not decide it.
+        totals = []
+        for seed in range(5):
+            result = solve_site(
+                _measurements(stops, noise_db=noise_db, seed=seed), settings
+            )
+            totals.append(result.diagnostics["shadow_fading"]["posterior_mean_db"])
+        return float(np.mean(totals))
+
+    quiet = posterior_mean(1.0)
+    noisy = posterior_mean(10.0)
+    assert quiet < noisy, (
+        f"scatter of 10 dB must not read as calmer than 1 dB (got {quiet:.2f} then {noisy:.2f})"
+    )
+    weights = solve_site(_measurements(stops), settings).diagnostics["shadow_fading"]["posterior"]
+    assert abs(sum(weights.values()) - 1.0) < 1e-6
+    assert len(weights) == len(settings.sigma_db_values)
 
 
 def test_detections_from_one_direction_are_reported_as_weak_geometry() -> None:

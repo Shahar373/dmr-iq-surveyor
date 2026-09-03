@@ -150,7 +150,7 @@ def _log_distance_ratio(
 
 
 def reference_level_offsets(
-    detection_count: int, settings: SolveSettings
+    detection_count: int, settings: SolveSettings, sigma: float | None = None
 ) -> np.ndarray:
     """Offsets from each cell's own best-fit reference level to integrate over.
 
@@ -173,11 +173,16 @@ def reference_level_offsets(
     `sigma`. Trapezoidal integration of a smooth, rapidly decaying integrand
     converges geometrically in the step size, so a modest sample count is
     accurate here rather than merely convenient.
+
+    The window scales with `sigma`, which matters once the solver
+    marginalises over several: the integration step differs per sigma, and
+    that step is part of the measure. `_evaluate_grid` accounts for it.
     """
-    spread = settings.sigma_db / math.sqrt(max(detection_count, 1))
+    resolved_sigma = settings.sigma_db if sigma is None else float(sigma)
+    spread = resolved_sigma / math.sqrt(max(detection_count, 1))
     half_width = (
         settings.reference_level_window_sigma * spread
-        + settings.reference_level_window_sigma * settings.sigma_db
+        + settings.reference_level_window_sigma * resolved_sigma
     )
     return np.linspace(-half_width, half_width, settings.reference_level_samples)
 
@@ -192,39 +197,43 @@ def _evaluate_grid(
     censored_y: np.ndarray,
     censored_levels: np.ndarray,
     settings: SolveSettings,
-) -> tuple[np.ndarray, float, float, int]:
-    """Marginal log posterior per grid cell, plus the best (n, P0, cell).
+) -> tuple[np.ndarray, float, float, float, int, np.ndarray]:
+    """Marginal log posterior per cell, the best (n, sigma, P0, cell), and
+    the log mass each sigma collected.
 
     Chunked over cells so peak memory stays bounded no matter how large the
     grid is: the chunk size comes from `max_working_elements` divided by the
     per-cell working set, so one number bounds memory rather than it varying
     with how many non-detections a site happens to have.
 
-    Constants that do not depend on cell, `n` or `P0` are dropped -- the
-    Gaussian normaliser and the `K delta^2` offset term -- since they cancel
-    in both the marginalisation and the final normalisation.
+    Constants that do not depend on cell, `n`, `sigma` or `P0` are dropped
+    -- the `K delta^2` offset term and the `2 pi` in the Gaussian normaliser
+    -- since they cancel in both the marginalisation and the final
+    normalisation. The parts of the normaliser that DO depend on sigma are
+    kept; see `log_measure` below for why that is not optional.
     """
     xs, ys = grid.axes()
     exponents = np.asarray(settings.path_loss_exponents, dtype=float)
-    sigma = float(settings.sigma_db)
-    two_sigma_squared = 2.0 * sigma * sigma
+    sigmas = np.asarray(settings.sigma_db_values, dtype=float)
     detection_count = int(detection_levels.size)
     censored_count = int(censored_levels.size)
-    offsets = reference_level_offsets(detection_count, settings)
-    scaled_offsets = offsets / sigma
 
     # The largest temporary is (cells x offsets): censored measurements are
     # accumulated one at a time rather than broadcast into a three-axis
     # array, which keeps peak memory independent of how many of them a site
-    # has, at identical total arithmetic.
-    per_cell_elements = max(1, offsets.size)
+    # has, at identical total arithmetic. The offset count is the same for
+    # every sigma -- only the window WIDTH scales -- so the chunk size does
+    # not depend on which sigma is being evaluated.
+    per_cell_elements = max(1, settings.reference_level_samples)
     chunk = int(
         min(settings.chunk_cells, max(1, settings.max_working_elements // per_cell_elements))
     )
 
     log_marginal = np.empty(grid.cell_count, dtype=np.float64)
+    sigma_log_mass = np.full(sigmas.size, -np.inf, dtype=np.float64)
     best_value = -np.inf
     best_exponent = float(exponents[0])
+    best_sigma = float(sigmas[0])
     best_reference = 0.0
     best_cell = 0
 
@@ -240,50 +249,89 @@ def _evaluate_grid(
         censored_ratio = _log_distance_ratio(cell_x, cell_y, censored_x, censored_y, settings)
 
         chunk_accumulator = np.full(stop - start, -np.inf, dtype=np.float64)
-        for exponent in exponents:
-            # a_i: the reference level that would fit detection i exactly if
-            # the transmitter were in this cell with this path-loss exponent.
-            fitted = detection_levels[None, :] + 10.0 * exponent * detection_ratio
-            best_level = fitted.mean(axis=1)
-            residual_sum_squares = np.square(fitted - best_level[:, None]).sum(axis=1)
-            base = -residual_sum_squares / two_sigma_squared
+        for sigma_index, sigma in enumerate(sigmas):
+            sigma = float(sigma)
+            two_sigma_squared = 2.0 * sigma * sigma
+            offsets = reference_level_offsets(detection_count, settings, sigma=sigma)
+            scaled_offsets = offsets / sigma
 
+            # Sigma's own measure, and the reason it cannot be dropped the way
+            # the cell- and exponent-invariant constants are. Two terms:
+            #
+            #   -K log(sigma)   the Gaussian normaliser for K detections.
+            #                   Without it a wider sigma explains ANY residual
+            #                   more cheaply, so the largest sigma on the grid
+            #                   would always win and the marginalisation would
+            #                   be a fixed choice wearing a disguise.
+            #   +log(step)      the `P0` integral is a Riemann sum over the
+            #                   offsets, and the step scales with sigma, so a
+            #                   wider window would otherwise collect more mass
+            #                   purely for being sampled more widely.
+            #
+            # With no censored terms the integral has a closed form,
+            # sigma * sqrt(2 pi / K), whose sigma-dependence is the same
+            # +log(sigma); the constant factor is identical for every sigma
+            # and drops out. Both branches therefore reduce to -(K-1) log
+            # sigma, which is the right power: profiling out the unknown
+            # reference level costs exactly one degree of freedom.
+            log_measure = -detection_count * math.log(sigma)
             if censored_ratio is None:
-                # With no censored terms the offset integral is the same
-                # constant for every cell, so the marginal is the base term.
-                marginal = base
-                peak = base
-                peak_offset = np.zeros_like(base)
+                log_measure += math.log(sigma)
             else:
-                shift = (
-                    censored_levels[None, :] + 10.0 * exponent * censored_ratio
-                    - best_level[:, None]
-                ) / sigma
-                censored_term = np.zeros((stop - start, offsets.size), dtype=np.float64)
-                for column in range(censored_count):
-                    censored_term += tabulated_log_ndtr(
-                        shift[:, column][:, None] - scaled_offsets[None, :]
-                    )
-                joint = (
-                    base[:, None]
-                    - detection_count * np.square(offsets)[None, :] / two_sigma_squared
-                    + censored_term
-                )
-                marginal = np.logaddexp.reduce(joint, axis=1)
-                argument = np.argmax(joint, axis=1)
-                peak = np.take_along_axis(joint, argument[:, None], axis=1).reshape(-1)
-                peak_offset = offsets[argument]
+                log_measure += math.log(float(offsets[1] - offsets[0]))
 
-            np.logaddexp(chunk_accumulator, marginal, out=chunk_accumulator)
-            local = int(np.argmax(peak))
-            if float(peak[local]) > best_value:
-                best_value = float(peak[local])
-                best_exponent = float(exponent)
-                best_reference = float(best_level[local] + peak_offset[local])
-                best_cell = start + local
+            for exponent in exponents:
+                # a_i: the reference level that would fit detection i exactly
+                # if the transmitter were in this cell with this exponent.
+                fitted = detection_levels[None, :] + 10.0 * exponent * detection_ratio
+                best_level = fitted.mean(axis=1)
+                residual_sum_squares = np.square(fitted - best_level[:, None]).sum(axis=1)
+                base = -residual_sum_squares / two_sigma_squared
+
+                if censored_ratio is None:
+                    # With no censored terms the offset integral is the same
+                    # constant for every cell, so the marginal is the base
+                    # term plus sigma's measure.
+                    marginal = base + log_measure
+                    peak = marginal
+                    peak_offset = np.zeros_like(base)
+                else:
+                    shift = (
+                        censored_levels[None, :] + 10.0 * exponent * censored_ratio
+                        - best_level[:, None]
+                    ) / sigma
+                    censored_term = np.zeros((stop - start, offsets.size), dtype=np.float64)
+                    for column in range(censored_count):
+                        censored_term += tabulated_log_ndtr(
+                            shift[:, column][:, None] - scaled_offsets[None, :]
+                        )
+                    joint = (
+                        base[:, None]
+                        - detection_count * np.square(offsets)[None, :] / two_sigma_squared
+                        + censored_term
+                    )
+                    marginal = np.logaddexp.reduce(joint, axis=1) + log_measure
+                    argument = np.argmax(joint, axis=1)
+                    peak = (
+                        np.take_along_axis(joint, argument[:, None], axis=1).reshape(-1)
+                        + log_measure
+                    )
+                    peak_offset = offsets[argument]
+
+                np.logaddexp(chunk_accumulator, marginal, out=chunk_accumulator)
+                sigma_log_mass[sigma_index] = np.logaddexp(
+                    sigma_log_mass[sigma_index], float(np.logaddexp.reduce(marginal))
+                )
+                local = int(np.argmax(peak))
+                if float(peak[local]) > best_value:
+                    best_value = float(peak[local])
+                    best_exponent = float(exponent)
+                    best_sigma = sigma
+                    best_reference = float(best_level[local] + peak_offset[local])
+                    best_cell = start + local
         log_marginal[start:stop] = chunk_accumulator
 
-    return log_marginal, best_exponent, best_reference, best_cell
+    return log_marginal, best_exponent, best_sigma, best_reference, best_cell, sigma_log_mass
 
 
 def _normalise(log_marginal: np.ndarray) -> np.ndarray:
@@ -351,7 +399,27 @@ def solve_site(
             status=STATUS_INSUFFICIENT_EVIDENCE,
             status_reason=(
                 f"{len(detections)} usable detection(s); at least "
-                f"{resolved.min_detections} are required to constrain a position"
+                f"{resolved.min_detections} are required to constrain a position. "
+                "A single level cannot separate a powerful transmitter far away from a "
+                "weak one nearby, so it says nothing about where the site is"
+            ),
+            detection_count=len(detections),
+            non_detection_count=len(censored),
+            warnings=warnings,
+        )
+    # The unknown reference level absorbs one detection: only the ratios
+    # between them locate anything. Non-detections each add a constraint of
+    # their own, and counting them here is the point -- the solver has always
+    # USED them, while the gate in front of it pretended they did not exist.
+    constraints = (len(detections) - 1) + len(censored)
+    if constraints < resolved.min_constraint_count:
+        return SolveResult(
+            status=STATUS_INSUFFICIENT_EVIDENCE,
+            status_reason=(
+                f"{len(detections)} detection(s) and {len(censored)} non-detection(s) give "
+                f"{constraints} independent constraint(s) on a position that needs "
+                f"{resolved.min_constraint_count}. Another stop anywhere adds one, whether or "
+                "not the site is heard from it"
             ),
             detection_count=len(detections),
             non_detection_count=len(censored),
@@ -386,7 +454,7 @@ def solve_site(
         resolved.coarse_resolution_m,
         max_cells=resolved.max_coarse_cells,
     )
-    coarse_log, _, _, _ = _evaluate_grid(
+    coarse_log, _, _, _, _, _ = _evaluate_grid(
         coarse,
         detection_x=detection_x,
         detection_y=detection_y,
@@ -409,7 +477,7 @@ def solve_site(
         target_cells=resolved.target_fine_cells,
         min_resolution_m=resolved.min_resolution_m,
     )
-    fine_log, exponent, reference_level, best_cell = _evaluate_grid(
+    fine_log, exponent, sigma_fit, reference_level, best_cell, sigma_log_mass = _evaluate_grid(
         fine,
         detection_x=detection_x,
         detection_y=detection_y,
@@ -513,6 +581,26 @@ def solve_site(
             "the true value may lie outside it and the region is correspondingly less trustworthy"
         )
 
+    # Which shadow-fading values the evidence actually preferred. Reported
+    # rather than hidden: if the weight piles onto the largest sigma on the
+    # grid, the data is scattered beyond what the grid can express and the
+    # region is optimistic; if it piles onto the smallest, the grid's own
+    # floor -- not the data -- is setting the region's size.
+    sigma_weights = _normalise(sigma_log_mass)
+    sigma_posterior = {
+        f"{value:g}": round(float(weight), 4)
+        for value, weight in zip(resolved.sigma_db_values, sigma_weights, strict=True)
+    }
+    sigma_mean = float(np.dot(np.asarray(resolved.sigma_db_values, dtype=float), sigma_weights))
+    if len(resolved.sigma_db_values) > 1:
+        edge = max(resolved.sigma_db_values)
+        if sigma_posterior.get(f"{edge:g}", 0.0) > 0.5:
+            warnings.append(
+                f"most of the shadow-fading weight sits on the largest value searched "
+                f"({edge:g} dB); the measurements scatter at least that much, so the true "
+                "spread may be larger still and the region correspondingly optimistic"
+            )
+
     diagnostics = {
         "projection": projection.to_dict(),
         "coarse_grid": coarse.to_dict(),
@@ -522,6 +610,12 @@ def solve_site(
             "half_width_db": float(
                 reference_level_offsets(len(detections), resolved).max()
             ),
+        },
+        "shadow_fading": {
+            "values_db": list(resolved.sigma_db_values),
+            "posterior": sigma_posterior,
+            "posterior_mean_db": round(sigma_mean, 3),
+            "best_fit_db": sigma_fit,
         },
         "credible_region_touches_grid_edge": touches_edge,
         "source_model": SOURCE_MODEL,

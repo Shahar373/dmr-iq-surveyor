@@ -144,7 +144,25 @@ class SolveSettings:
 
     # Shadow fading standard deviation. 8 dB is a common suburban value at
     # UHF; wider absorbs outliers at the cost of a larger credible region.
+    # Used directly wherever a single representative value is needed (the
+    # `P0` window, the planner's detection probability); the solver itself
+    # marginalises over `sigma_db_values` instead.
     sigma_db: float = 8.0
+    # Shadow fading values marginalised over, for the same reason the
+    # path-loss exponent is: it is not known, and assuming one value states
+    # a confidence the data does not support. Measured on synthetic data,
+    # the assumed sigma changes the 90% region area by nearly three orders
+    # of magnitude, which makes it the single most influential number here.
+    #
+    # The range is deliberately bounded from BELOW by physics rather than
+    # left to the data. Residual scatter systematically understates sigma
+    # when the fit has few degrees of freedom -- data generated with 6 dB of
+    # shadowing fitted to 3.8 dB of residual over five stops -- and solving
+    # at that understated value produced an 8 km2 region whose centre was
+    # 2.8 km from the true transmitter: small, and wrong. Real outdoor
+    # shadowing is not below a few dB, so the grid does not offer values
+    # that would let a lucky fit claim near-certainty.
+    sigma_db_values: tuple[float, ...] = (4.0, 6.0, 8.0, 10.0, 12.0)
     # Path-loss exponents marginalised over. Deliberately a range, never a
     # single universal value -- see docs/TRANSMITTER-LOCATION-STUDY.md.
     path_loss_exponents: tuple[float, ...] = (2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0)
@@ -169,7 +187,24 @@ class SolveSettings:
     reference_level_samples: int = 25
     reference_level_window_sigma: float = 3.0
     credible_levels: tuple[float, ...] = (0.5, 0.9)
-    min_detections: int = 3
+    # Two detections are the floor for any answer at all: one level alone
+    # cannot separate transmit power from distance, so a single detection
+    # constrains nothing about position.
+    min_detections: int = 2
+    # Independent constraints required, counted as `(detections - 1) +
+    # non_detections`. Detections contribute one fewer than their count
+    # because the unknown reference level absorbs one of them -- only the
+    # RATIOS between detections carry position information. Non-detections
+    # each contribute a constraint of their own ("it is not within this
+    # radius of here"), which is why they are counted here at full weight.
+    #
+    # This replaces a flat minimum on detections alone, which discarded
+    # genuinely good answers: two detections with four non-detections
+    # solved to a bounded 19 km2 region at 173 degrees of azimuth span,
+    # and was being refused outright. Answers that really are poor are not
+    # let through silently -- `unbounded_region` and `weak_geometry` label
+    # them, which is what those statuses are for.
+    min_constraint_count: int = 2
     min_azimuth_span_deg: float = 90.0
     # Grid cells processed per chunk. Bounds peak memory independently of
     # the grid size, the same discipline the IQ stages use for sample data.
@@ -211,6 +246,12 @@ class SolveSettings:
             raise ValueError("credible_levels must be strictly between 0 and 1")
         if self.min_detections < 1:
             raise ValueError("min_detections must be at least 1")
+        if self.min_constraint_count < 1:
+            raise ValueError("min_constraint_count must be at least 1")
+        if not self.sigma_db_values:
+            raise ValueError("at least one shadow-fading value is required")
+        if any(value <= 0 for value in self.sigma_db_values):
+            raise ValueError("shadow-fading values must be positive")
         if self.chunk_cells < 1:
             raise ValueError("chunk_cells must be at least 1")
         if self.max_working_elements < 1:
@@ -220,6 +261,7 @@ class SolveSettings:
         payload = asdict(self)
         payload["path_loss_exponents"] = list(self.path_loss_exponents)
         payload["credible_levels"] = list(self.credible_levels)
+        payload["sigma_db_values"] = list(self.sigma_db_values)
         return payload
 
 

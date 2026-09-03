@@ -124,8 +124,27 @@ path-loss exponent `n`. The forward model is the log-distance model already docu
 mu(p, P0, n; x) = P0 - 10 n log10( max(d(x, p), d_min) / d0 )
 ```
 
-with `d0 = 1000 m` and shadow fading modelled as zero-mean Gaussian with standard deviation `sigma`
-(default 8 dB, a normal suburban 800 MHz value — configurable, never claimed as measured).
+with `d0 = 1000 m` and shadow fading modelled as zero-mean Gaussian with standard deviation `sigma`.
+
+`sigma` is **marginalized over, not assumed**, for exactly the reason `n` is: it is not known, and
+picking one value states a confidence the data does not support. It is also the most influential
+number in the whole estimator — on synthetic measurements, solving the same data at 1 dB rather
+than 8 dB changed the 90% region from 1 km² to 877 km², an 880-fold difference with the mode
+unmoved.
+
+The grid (`sigma_db_values`, default 4/6/8/10/12 dB) is bounded **from below by physics rather
+than by the data**. Residual scatter systematically understates `sigma` when the fit has few
+degrees of freedom: measurements generated with 6 dB of shadowing fitted to 3.8 dB of residual
+across five stops, and solving at that understated value produced an 8 km² region whose centre lay
+2.8 km from the true transmitter — small, and wrong. Fitting `sigma` to the residuals is therefore
+rejected; a floor that real outdoor shadowing does not go below is what keeps a lucky fit from
+claiming near-certainty.
+
+The `-K log(sigma)` Gaussian normalizer must be carried through the marginalization. Without it a
+wider `sigma` explains any residual more cheaply, the largest value on the grid wins every time,
+and the marginalization is a fixed choice in disguise. `geo_solutions.diagnostics_json` records
+the resulting per-value posterior so the assumption can be read back off any result, and a solve
+whose weight piles onto the largest value searched says so in its warnings.
 
 Per measurement `i` at position `x_i`:
 
@@ -200,9 +219,18 @@ solution carries a `status`:
 | `status` | Raised when |
 |---|---|
 | `ok` | Enough evidence and geometry to report a bounded region |
-| `insufficient_evidence` | Fewer than `min_detections` (default 3) usable detections |
+| `insufficient_evidence` | Fewer than `min_detections` (default 2) detections, or fewer than `min_constraint_count` (default 2) independent constraints, counted as `(detections - 1) + non_detections` |
 | `unbounded_region` | The 90% credible region touches the edge of the analysed area — judged on the coarse pass, which spans the whole requested region, since the fine pass is a zoom into where the mass already is and its edges would flag every well-constrained site |
 | `weak_geometry` | The measurement points span less than `min_azimuth_span_deg` (default 90°) in azimuth around the posterior mode — a one-sided view trades position against `P0` and cannot separate them |
+
+Two detections are the floor because a single level cannot separate a powerful transmitter far
+away from a weak one nearby. Beyond that floor the gate counts **constraints, not detections**: the
+unknown `P0` absorbs one detection, so only the ratios between detections locate anything, while
+each non-detection adds a constraint of its own. Counting detections alone contradicted the
+likelihood, which has always used the censored terms — measured on one geometry, two detections
+with four non-detections solve to a bounded 42 km² region 1.1 km from the true position, and were
+being refused outright. Answers that really are poor are not let through silently; that is what
+`unbounded_region` and `weak_geometry` are for.
 
 Additional warnings never suppress a result, they annotate it: `not_gain_comparable` (a contributing
 run has no recorded gain, so its levels are not on the same scale), `ambiguous_frequency_excluded`,
