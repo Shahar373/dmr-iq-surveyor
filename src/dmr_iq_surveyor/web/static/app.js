@@ -312,14 +312,25 @@ function statusBadge(status) {
 function renderPlan() {
   const box = $("#plan-box");
   const list = $("#plan-list");
+  const reason = $("#plan-reason");
   const plan = (state.plan && state.plan.plan) || {};
   const stops = plan.top_stops || [];
   list.replaceChildren();
+  // With no solvable site yet the map has nothing on it but the stops, which
+  // reads as a broken app. The planner already knows why -- "no site has a
+  // posterior to plan against yet" -- so say that instead of hiding the panel
+  // and leaving the operator to guess whether anything is working.
   if (!stops.length) {
-    box.hidden = true;
+    const why = (state.plan && state.plan.reason) || "";
+    box.hidden = !why;
+    $("#plan-hint").hidden = true;
+    reason.hidden = !why;
+    reason.textContent = why;
     return;
   }
   box.hidden = false;
+  reason.hidden = true;
+  $("#plan-hint").hidden = false;
   stops.slice(0, 3).forEach((stop, index) => {
     const item = el("div", "plan-item");
     item.append(el("div", "rank", String(index + 1)));
