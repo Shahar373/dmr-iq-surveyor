@@ -152,8 +152,15 @@ def geo_solve(
         str | None, typer.Option("--batch-id", help="Solve batch id; re-solving replaces it")
     ] = None,
     sigma_db: Annotated[
-        float, typer.Option("--sigma-db", help="Shadow-fading standard deviation")
-    ] = 8.0,
+        float | None,
+        typer.Option(
+            "--sigma-db",
+            help=(
+                "Fix shadow fading at one value instead of marginalising over the default "
+                "range. Narrows the region, and states a confidence the data may not support"
+            ),
+        ),
+    ] = None,
     resolution_m: Annotated[
         float, typer.Option("--resolution-m", help="Target fine grid resolution")
     ] = 100.0,
@@ -161,8 +168,12 @@ def geo_solve(
         float, typer.Option("--margin-m", help="Search margin beyond the measurement extent")
     ] = 25_000.0,
     min_detections: Annotated[
-        int, typer.Option("--min-detections", help="Detections required before solving at all")
-    ] = 3,
+        int | None,
+        typer.Option(
+            "--min-detections",
+            help="Detections required before solving at all (default 2)",
+        ),
+    ] = None,
     common_mode: Annotated[
         bool,
         typer.Option(
@@ -179,12 +190,26 @@ def geo_solve(
     # The coarse pass must never be finer than the fine pass. Scaling it with
     # the requested resolution keeps `--resolution-m 750` working instead of
     # failing validation after the operator has already asked for a solve.
+    #
+    # These options default to None rather than to a repeated copy of the
+    # estimator's own defaults. Restating them here meant that changing a
+    # default in SolveSettings silently did nothing for anyone using the CLI:
+    # `--min-detections` alone still carried the value it had before the gate
+    # was rewritten, so `geo solve` kept refusing sites the field app solved.
+    overrides: dict[str, object] = {}
+    if min_detections is not None:
+        overrides["min_detections"] = min_detections
+    if sigma_db is not None:
+        # Asking for one sigma means one sigma. Setting only the scalar would
+        # leave the solver marginalising over its default range and quietly
+        # ignore the flag, which is worse than not offering it.
+        overrides["sigma_db"] = sigma_db
+        overrides["sigma_db_values"] = (sigma_db,)
     settings = SolveSettings(
-        sigma_db=sigma_db,
         resolution_m=resolution_m,
         coarse_resolution_m=max(resolution_m * 5.0, 500.0),
         margin_m=margin_m,
-        min_detections=min_detections,
+        **overrides,  # type: ignore[arg-type]
     )
     try:
         report = solve_all_sites(
