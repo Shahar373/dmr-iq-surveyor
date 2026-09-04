@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
@@ -38,6 +39,7 @@ from dmr_iq_surveyor.geo.store import (
     run_exclusion,
     solution_history,
 )
+from dmr_iq_surveyor.live.session import LiveSession, LiveSettings, Position
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_survey
 from dmr_iq_surveyor.survey.profiles import (
     ProfileError,
@@ -50,6 +52,13 @@ from dmr_iq_surveyor.web.jobs import Job, JobRegistry
 from dmr_iq_surveyor.web.recordings import disk_status, enforce_retention, purge_recordings
 
 _SLUG = re.compile(r"[^a-z0-9]+")
+
+# How much of a drive the status endpoint carries back. Both are for drawing,
+# not for the record -- the record is in the database -- so they are bounded
+# and the oldest end is dropped. A phone polling this every second should not
+# be handed a growing payload for an hour.
+_LIVE_TRAIL_LIMIT = 1_200
+_LIVE_BIN_LIMIT = 400
 
 
 class PositionStale(RuntimeError):
@@ -175,6 +184,37 @@ class FieldSettings:
     # Beyond this, the marked position is presumed stale and the operator has
     # to confirm it before a stop is recorded against it.
     position_stale_after_seconds: float = 1_200.0
+    # -- live (moving) survey ---------------------------------------------
+    # A drive never writes IQ. Each spatial bin becomes an ordinary survey
+    # run of about 8 KiB, measured, so a whole campaign of driving costs
+    # single-digit megabytes against the gigabytes a handful of stationary
+    # stops cost. That is the reason the mode exists on a Pi at all.
+    live_window_seconds: float = 1.0
+    live_bin_size_m: float = 150.0
+    live_min_windows_per_bin: int = 3
+    live_max_windows_per_bin: int = 10
+    live_max_position_age_seconds: float = 5.0
+    # Analysis size per window. 65536 bins is 76 Hz at 5 MS/s, fine enough to
+    # resolve a 12.5 kHz channel and coarse enough that a Pi finishes the
+    # transforms inside the second that produced them. It also sets what one
+    # window costs to hold -- about 1.7 MB -- so it is the knob to turn when
+    # memory, not resolution, is the binding constraint.
+    live_fft_size: int = 65_536
+    live_frames_per_window: int = 24
+    # Re-solve after this many new bins. Solving is minutes of CPU across a
+    # campaign's sites, so it runs on its own thread while the stream keeps
+    # going; too often and the Pi never finishes one before the next is due.
+    live_solve_every_bins: int = 5
+    # Backstop only, not a plan: a drive normally ends when the operator
+    # stops it. Without a cap a forgotten session holds the SDR and burns
+    # the battery until the Pi is found.
+    live_max_seconds: float = 7_200.0
+    # Origin of the bin grid, a campaign constant. Falls back to the map
+    # centre, which the operator already configured for this campaign, so
+    # two drives on different days land on the SAME grid and the second
+    # pass down a street replaces its measurement instead of adding a
+    # near-identical one beside it.
+    live_anchor: tuple[float, float] | None = None
     tile_url: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
     tile_attribution: str = "(c) OpenStreetMap contributors"
     map_center: tuple[float, float] = (32.0853, 34.7818)
@@ -187,6 +227,7 @@ class FieldSettings:
         for key in ("database_path", "recordings_dir", "output_root", "profile_base_dir"):
             payload[key] = str(payload[key])
         payload["map_center"] = list(self.map_center)
+        payload["live_anchor"] = list(self.live_anchor) if self.live_anchor else None
         payload["tool_version"] = __version__
         return payload
 
@@ -198,6 +239,20 @@ class FieldService:
         self.settings = settings
         self.jobs = JobRegistry()
         self._position_path = Path(settings.output_root).expanduser().resolve() / "position.json"
+        # Live-drive state. Held in memory only: a fix is worth nothing a
+        # minute later, and the measurements it produced are already in the
+        # database by then.
+        self._live_lock = threading.Lock()
+        self._live_fix: Position | None = None
+        self._live_fix_wall: str | None = None
+        self._live_fix_count = 0
+        self._live_trail: list[dict[str, Any]] = []
+        self._live_bins: list[dict[str, Any]] = []
+        self._live_pending_runs: list[str] = []
+        self._live_stats: dict[str, Any] = {}
+        self._live_job_id: str | None = None
+        self._live_solving = False
+        self._live_last_solve: dict[str, Any] | None = None
 
     # -- operator position -------------------------------------------------
 
@@ -301,6 +356,7 @@ class FieldService:
             "stops": self.stops(),
             "plan": self.plan(),
             "jobs": self.jobs.list(),
+            "live": self.live_status(),
         }
 
     def geojson(self) -> dict[str, Any]:
@@ -813,6 +869,362 @@ class FieldService:
             }
 
         return self.jobs.submit(kind="analyse", label=f"analyse {recording.name}", work=work)
+
+    # -- live (moving) survey ---------------------------------------------
+
+    def push_live_position(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Accept one fix from the phone's GPS.
+
+        Held in memory rather than written to `position.json`: fixes arrive
+        about once a second, and the marked position is a deliberate act the
+        operator performs for a stationary stop. Conflating the two would
+        overwrite that mark hundreds of times a drive.
+
+        The timestamp is taken HERE, on the receiving side, from the same
+        monotonic clock the live session reads. A phone's own clock can be
+        wrong by hours, and staleness -- the one check that stops a
+        measurement being placed where the receiver used to be -- has to be
+        measured against something that cannot jump.
+        """
+        try:
+            latitude = float(payload["latitude"])
+            longitude = float(payload["longitude"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("latitude and longitude are required numbers") from exc
+        if not -90.0 <= latitude <= 90.0 or not -180.0 <= longitude <= 180.0:
+            raise ValueError("latitude or longitude is out of range")
+        accuracy = payload.get("accuracy_m")
+        fix = Position(
+            latitude=latitude,
+            longitude=longitude,
+            accuracy_m=float(accuracy) if accuracy is not None else None,
+            at=time.monotonic(),
+        )
+        point = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "accuracy_m": fix.accuracy_m,
+            "speed_mps": (
+                float(payload["speed_mps"]) if payload.get("speed_mps") is not None else None
+            ),
+            "at": datetime.now(UTC).isoformat(),
+        }
+        with self._live_lock:
+            self._live_fix = fix
+            self._live_fix_wall = point["at"]
+            self._live_fix_count += 1
+            self._live_trail.append(point)
+            if len(self._live_trail) > _LIVE_TRAIL_LIMIT:
+                del self._live_trail[: len(self._live_trail) - _LIVE_TRAIL_LIMIT]
+            running = self._live_job_id
+            bins = len(self._live_bins)
+        return {"accepted": True, "fix_count": self._live_fix_count,
+                "drive_running": running is not None, "bins": bins}
+
+    def _live_position(self) -> Position | None:
+        with self._live_lock:
+            return self._live_fix
+
+    def live_position_age_seconds(self) -> float | None:
+        with self._live_lock:
+            fix = self._live_fix
+        return None if fix is None else max(0.0, time.monotonic() - fix.at)
+
+    def live_settings(self, payload: dict[str, Any] | None = None) -> LiveSettings:
+        """The live configuration actually in force, overrides applied."""
+        given = payload or {}
+        anchor = self.settings.live_anchor or self.settings.map_center
+        settings = LiveSettings(
+            band=str(given.get("band") or self.settings.band),
+            site_id=self.settings.site_profile,
+            center_frequency_hz=float(
+                given.get("center_frequency_hz", self.settings.center_frequency_hz)
+            ),
+            sample_rate_hz=float(given.get("sample_rate_hz", self.settings.sample_rate_hz)),
+            if_gain_reduction_db=float(
+                given.get("if_gain_reduction_db", self.settings.if_gain_reduction_db)
+            ),
+            lna_state=int(given.get("lna_state", self.settings.lna_state)),
+            driver=self.settings.driver,
+            window_seconds=float(given.get("window_seconds", self.settings.live_window_seconds)),
+            bin_size_m=float(given.get("bin_size_m", self.settings.live_bin_size_m)),
+            grid_anchor_latitude=float(given.get("anchor_latitude", anchor[0])),
+            grid_anchor_longitude=float(given.get("anchor_longitude", anchor[1])),
+            min_windows_per_bin=int(
+                given.get("min_windows_per_bin", self.settings.live_min_windows_per_bin)
+            ),
+            max_windows_per_bin=int(
+                given.get("max_windows_per_bin", self.settings.live_max_windows_per_bin)
+            ),
+            max_position_age_seconds=float(
+                given.get("max_position_age_seconds", self.settings.live_max_position_age_seconds)
+            ),
+            fft_size=int(given.get("fft_size", self.settings.live_fft_size)),
+            frames_per_window=int(
+                given.get("frames_per_window", self.settings.live_frames_per_window)
+            ),
+        )
+        settings.validate()
+        return settings
+
+    def live_status(self) -> dict[str, Any]:
+        job = self.jobs.get(self._live_job_id) if self._live_job_id else None
+        if job is None or job.is_terminal():
+            # The registry, not the remembered id, is the authority on what is
+            # running. The id is recorded after `submit` has already started
+            # the thread, so the first bin of a drive can land before it is
+            # set -- and the phone would be told, for that moment, that the
+            # drive it just started is not running.
+            active = self.jobs.active_job()
+            if active is not None and active.kind == "live":
+                job = active
+                self._live_job_id = active.job_id
+        running = job is not None and not job.is_terminal()
+        with self._live_lock:
+            payload = {
+                "running": running,
+                "job_id": self._live_job_id,
+                "stats": dict(self._live_stats),
+                "bins": list(self._live_bins[-_LIVE_BIN_LIMIT:]),
+                "bin_count": len(self._live_bins),
+                "trail": list(self._live_trail[-_LIVE_TRAIL_LIMIT:]),
+                "fix_count": self._live_fix_count,
+                "last_fix_utc": self._live_fix_wall,
+                "solving": self._live_solving,
+                "last_solve": self._live_last_solve,
+            }
+        payload["position_age_seconds"] = self.live_position_age_seconds()
+        payload["job"] = job.snapshot() if job is not None else None
+        return payload
+
+    def start_live(self, payload: dict[str, Any]) -> Job:
+        """Begin a moving survey. Nothing is recorded; bins are written as
+        they complete, so an interrupted drive has already contributed
+        everything it measured."""
+        if not self.settings.allow_capture:
+            raise RuntimeError("captures are disabled on this server (--no-capture)")
+        running = self.jobs.active_job()
+        if running is not None:
+            raise RuntimeError(
+                f"a {running.kind} job is already running "
+                f"({running.stage or 'starting'}: {running.message or 'no detail yet'}); "
+                "wait for it to finish or cancel it first"
+            )
+
+        # A drive with no GPS is not a degraded drive, it is no drive at all:
+        # every window would be dropped for want of a position. Refused here,
+        # before the SDR is opened, rather than discovered as a session that
+        # ran for ten minutes and wrote nothing.
+        age = self.live_position_age_seconds()
+        limit = self.settings.live_max_position_age_seconds
+        if age is None:
+            raise ValueError(
+                "no GPS fix has arrived yet; start location sharing in the browser first "
+                "(it needs HTTPS -- run the app with --tls)"
+            )
+        if age > limit * 2:
+            raise ValueError(
+                f"the last GPS fix is {age:.0f} s old, older than the {limit:.0f} s a window "
+                "may be tagged with; check location sharing is still on"
+            )
+
+        live = self.live_settings(payload)
+        probe = probe_soapysdr(self.settings.driver)
+        if not probe.available:
+            raise RuntimeError(probe.probe_error or "no SDR device available")
+        try:
+            band = resolve_band_profile(live.band, base_dir=self.settings.profile_base_dir)
+            site_profile = resolve_site_profile(
+                self.settings.site_profile, base_dir=self.settings.profile_base_dir
+            )
+        except (ProfileError, FileNotFoundError, OSError) as exc:
+            raise ValueError(f"profile could not be resolved: {exc}") from exc
+
+        max_seconds = float(payload.get("max_seconds") or self.settings.live_max_seconds)
+        solve_every = max(1, int(payload.get("solve_every_bins")
+                                 or self.settings.live_solve_every_bins))
+        session_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+
+        # Cleared BEFORE the job is submitted, because submitting starts the
+        # thread: clearing afterwards could wipe the first bins of the drive
+        # that is already running.
+        with self._live_lock:
+            self._live_bins = []
+            self._live_pending_runs = []
+            self._live_stats = {}
+            self._live_last_solve = None
+
+        def work(job: Job) -> dict[str, Any]:
+            return self._run_live(
+                job,
+                live=live,
+                band=band,
+                site_profile=site_profile,
+                session_id=session_id,
+                max_seconds=max_seconds,
+                solve_every=solve_every,
+            )
+
+        job = self.jobs.submit(
+            kind="live",
+            label=(
+                f"live drive at {live.center_frequency_hz / 1e6:.4f} MHz, "
+                f"{live.bin_size_m:.0f} m bins"
+            ),
+            work=work,
+        )
+        self._live_job_id = job.job_id
+        return job
+
+    def _run_live(
+        self,
+        job: Job,
+        *,
+        live: LiveSettings,
+        band: Any,
+        site_profile: SiteProfile,
+        session_id: str,
+        max_seconds: float,
+        solve_every: int,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        job.emit(
+            "live",
+            f"streaming at {live.sample_rate_hz / 1e6:.2f} MS/s; drive on, "
+            f"{live.bin_size_m:.0f} m bins",
+            progress=0.02,
+        )
+
+        def on_bin(info: dict[str, Any]) -> None:
+            with self._live_lock:
+                self._live_bins.append(info)
+                self._live_pending_runs.append(info["survey_run_id"])
+                written = len(self._live_bins)
+            job.emit(
+                "bin",
+                f"bin {written} written at {info['latitude']:.5f}, {info['longitude']:.5f} "
+                f"({info['observations']} observation(s))",
+                progress=min(0.95, 0.02 + written / 200.0),
+                extra={"bin": info},
+            )
+            if written % solve_every == 0:
+                self._start_live_solve(job)
+
+        def stop() -> bool:
+            if job.cancelled:
+                return True
+            return time.monotonic() - started >= max_seconds
+
+        connection = connect_geo_database(Path(self.settings.database_path))
+        # A background solve holds the write lock for short bursts while the
+        # drive keeps writing bins. Five seconds -- the sqlite3 default --
+        # is enough for that in principle and not enough to be sure; losing
+        # the whole drive to one collision is not a trade worth taking.
+        connection.execute("PRAGMA busy_timeout = 30000")
+        session = LiveSession(
+            session_id=session_id,
+            settings=live,
+            band=band,
+            site=site_profile,
+            database_path=self.settings.database_path,
+            position_provider=self._live_position,
+            on_bin=on_bin,
+        )
+        try:
+            stats = session.run(stop=stop, connection=connection)
+        finally:
+            connection.close()
+
+        with self._live_lock:
+            self._live_stats = stats.to_dict()
+        job.emit(
+            "live",
+            f"drive finished: {stats.bins_written} bin(s) from "
+            f"{stats.windows_recorded} window(s)",
+            progress=0.96,
+        )
+        # The final solve runs in the job, not on a side thread: the stream
+        # has stopped, so there is nothing left to starve, and the operator
+        # is waiting to see the regions the drive just bought.
+        pending = self._take_pending_runs()
+        if pending:
+            materialise_measurements(
+                database_path=self.settings.database_path, run_ids=pending
+            )
+        report = self._solve(
+            job, progress_from=0.96, progress_to=0.99,
+            settings=self.field_solve_settings(),
+        )
+        return {
+            "session_id": session_id,
+            "live": stats.to_dict(),
+            "settings": live.to_dict(),
+            "elapsed_seconds": round(time.monotonic() - started, 1),
+            "solutions": len(report["solutions"]),
+        }
+
+    def _take_pending_runs(self) -> list[str]:
+        with self._live_lock:
+            pending, self._live_pending_runs = self._live_pending_runs, []
+        return pending
+
+    def _start_live_solve(self, job: Job) -> None:
+        """Re-solve on a side thread while the drive keeps streaming.
+
+        Not inline: a field solve across a campaign's sites is seconds to
+        minutes, and the SDR is not being read for any of it. A drive that
+        paused to solve would lose that stretch of road outright. Overflows
+        during the solve cost windows instead, which the binning absorbs --
+        and a window stretched past its travel limit is dropped rather than
+        smeared, so the failure mode is fewer bins, never misplaced ones.
+        """
+        with self._live_lock:
+            if self._live_solving:
+                # A solve slower than the interval must not stack; skipping
+                # is right because the next one will include these bins too.
+                return
+            self._live_solving = True
+        pending = self._take_pending_runs()
+
+        def run() -> None:
+            try:
+                if pending:
+                    materialise_measurements(
+                        database_path=self.settings.database_path, run_ids=pending
+                    )
+                report = solve_all_sites(
+                    database_path=self.settings.database_path,
+                    output_root=self.settings.output_root,
+                    settings=self.field_solve_settings(),
+                )
+                solved = sum(1 for row in report["solutions"] if row["status"] == "ok")
+                with self._live_lock:
+                    self._live_last_solve = {
+                        "at": datetime.now(UTC).isoformat(),
+                        "solved": solved,
+                        "sites": len(report["solutions"]),
+                    }
+                job.emit(
+                    "solve",
+                    f"{solved} of {len(report['solutions'])} site(s) bounded",
+                    extra={"live_solve": True},
+                )
+            except Exception as exc:  # noqa: BLE001 - a failed solve must not end the drive
+                # The drive is the irreplaceable part: it is happening on a
+                # road the operator is on now. A solve can be repeated at any
+                # time from the same database, so its failure is reported and
+                # the streaming continues.
+                job.emit(
+                    "solve",
+                    f"background solve failed ({type(exc).__name__}: {exc}); "
+                    "the drive continues and the bins are kept",
+                    extra={"live_solve": True, "failed": True},
+                )
+            finally:
+                with self._live_lock:
+                    self._live_solving = False
+
+        threading.Thread(target=run, name="live-solve", daemon=True).start()
 
     def field_solve_settings(self) -> SolveSettings:
         """Solve settings for the in-field pass: same model, coarser grid."""

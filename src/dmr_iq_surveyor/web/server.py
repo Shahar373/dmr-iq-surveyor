@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.web.jobs import Job
 from dmr_iq_surveyor.web.service import FieldService, FieldSettings, PositionStale
+from dmr_iq_surveyor.web.tls import HANDSHAKE_TIMEOUT_SECONDS, Certificate, build_context
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 
@@ -168,6 +169,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(self.service.plan())
             elif path == "/api/stops":
                 self._send_json({"stops": self.service.stops()})
+            elif path == "/api/live":
+                self._send_json(self.service.live_status())
             elif path == "/api/export":
                 self._send_export((query.get("format") or ["geojson"])[0])
             elif path.startswith("/api/history/"):
@@ -210,6 +213,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._start(lambda: self.service.start_analysis(payload))
             elif path == "/api/solve":
                 self._start(lambda: self.service.start_solve(payload))
+            elif path == "/api/live/start":
+                self._start(lambda: self.service.start_live(payload))
+            elif path == "/api/live/position":
+                # Posted about once a second for a whole drive, so it stays
+                # the cheapest handler here: validate, store, answer.
+                self._send_json(self.service.push_live_position(payload))
             elif path == "/api/recordings/purge":
                 self._send_json(self.service.purge())
             elif path.startswith("/api/stops/") and path.endswith("/exclude"):
@@ -345,24 +354,74 @@ class FieldServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], service: FieldService, *, verbose: bool = False):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        service: FieldService,
+        *,
+        verbose: bool = False,
+        certificate: Certificate | None = None,
+    ):
         super().__init__(address, _Handler)
         self.service = service
         self.verbose = verbose
+        self.certificate = certificate
+        self._tls_context = build_context(certificate) if certificate is not None else None
+
+    @property
+    def scheme(self) -> str:
+        return "https" if self._tls_context is not None else "http"
+
+    def get_request(self) -> tuple[Any, Any]:
+        """Accept a connection, wrapping it in TLS if a certificate is set.
+
+        Each accepted socket is wrapped individually rather than wrapping the
+        listening socket, so a handshake can be given a deadline. A phone that
+        drops off mid-handshake would otherwise hold the accept loop -- and
+        therefore the whole app -- for as long as its socket stayed open.
+        """
+        connection, address = self.socket.accept()
+        if self._tls_context is None:
+            return connection, address
+        connection.settimeout(HANDSHAKE_TIMEOUT_SECONDS)
+        try:
+            secure = self._tls_context.wrap_socket(connection, server_side=True)
+        except OSError:
+            # A plain-HTTP request to the TLS port, or a client that gave up.
+            # Neither is a server fault; socketserver treats the OSError as a
+            # dropped connection and carries on accepting.
+            connection.close()
+            raise
+        secure.settimeout(None)
+        return secure, address
 
 
 def create_server(
-    settings: FieldSettings, *, host: str = "127.0.0.1", port: int = 8765, verbose: bool = False
+    settings: FieldSettings,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    verbose: bool = False,
+    certificate: Certificate | None = None,
 ) -> FieldServer:
     Path(settings.output_root).expanduser().resolve().mkdir(parents=True, exist_ok=True)
     Path(settings.recordings_dir).expanduser().resolve().mkdir(parents=True, exist_ok=True)
-    return FieldServer((host, port), FieldService(settings), verbose=verbose)
+    return FieldServer(
+        (host, port), FieldService(settings), verbose=verbose, certificate=certificate
+    )
 
 
 def serve_forever(
-    settings: FieldSettings, *, host: str = "127.0.0.1", port: int = 8765, verbose: bool = False
+    settings: FieldSettings,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    verbose: bool = False,
+    certificate: Certificate | None = None,
 ) -> None:
-    server = create_server(settings, host=host, port=port, verbose=verbose)
+    server = create_server(
+        settings, host=host, port=port, verbose=verbose, certificate=certificate
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:

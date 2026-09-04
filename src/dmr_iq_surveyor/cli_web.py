@@ -23,6 +23,12 @@ from dmr_iq_surveyor.survey.profiles import (
 from dmr_iq_surveyor.web.recordings import GIB, disk_status
 from dmr_iq_surveyor.web.server import serve_forever
 from dmr_iq_surveyor.web.service import FieldSettings
+from dmr_iq_surveyor.web.tls import (
+    Certificate,
+    TlsUnavailable,
+    ensure_self_signed,
+    load_certificate,
+)
 
 web_app = typer.Typer(
     no_args_is_help=True,
@@ -31,7 +37,7 @@ web_app = typer.Typer(
 console = Console()
 
 
-def _local_addresses(port: int) -> list[str]:
+def _local_addresses(port: int, scheme: str = "http") -> list[str]:
     """Best-effort list of URLs the phone can use.
 
     Uses a UDP socket's chosen source address rather than resolving the
@@ -43,12 +49,12 @@ def _local_addresses(port: int) -> list[str]:
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         probe.connect(("192.0.2.1", 1))  # TEST-NET-1: routed nowhere, never sends a packet
-        addresses.append(f"http://{probe.getsockname()[0]}:{port}")
+        addresses.append(f"{scheme}://{probe.getsockname()[0]}:{port}")
     except OSError:
         pass
     finally:
         probe.close()
-    addresses.append(f"http://localhost:{port}")
+    addresses.append(f"{scheme}://localhost:{port}")
     return addresses
 
 
@@ -225,6 +231,42 @@ def web_serve(
             ),
         ),
     ] = 250.0,
+    tls: Annotated[
+        bool,
+        typer.Option(
+            "--tls/--no-tls",
+            help=(
+                "Serve over HTTPS with a self-signed certificate. Required for the phone's "
+                "GPS: browsers refuse geolocation outside a secure context, so a live drive "
+                "is impossible over plain HTTP"
+            ),
+        ),
+    ] = False,
+    tls_cert: Annotated[
+        Path | None,
+        typer.Option("--tls-cert", help="Use this certificate instead of a self-signed one"),
+    ] = None,
+    tls_key: Annotated[
+        Path | None, typer.Option("--tls-key", help="Private key for --tls-cert")
+    ] = None,
+    tls_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--tls-dir",
+            help="Where the self-signed pair is kept; defaults to <output>/tls",
+        ),
+    ] = None,
+    tls_host: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--tls-host",
+            help=(
+                "Extra name or IP the certificate must cover. Loopback and this machine's "
+                "own addresses are always included; add one if you reach the Pi by another "
+                "name"
+            ),
+        ),
+    ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", help="Log every HTTP request")] = False,
 ) -> None:
     """Serve the field app.
@@ -302,10 +344,43 @@ def web_serve(
             "[yellow]Little headroom.[/yellow] Consider --keep-recordings 0 or a shorter --duration."
         )
 
+    certificate: Certificate | None = None
+    if tls_cert or tls_key:
+        if not (tls_cert and tls_key):
+            console.print("[bold red]--tls-cert and --tls-key must be given together.[/bold red]")
+            raise typer.Exit(code=1)
+        try:
+            certificate = load_certificate(tls_cert, tls_key)
+        except TlsUnavailable as exc:
+            console.print(f"[bold red]TLS could not be configured:[/bold red] {exc}")
+            raise typer.Exit(code=1) from exc
+    elif tls:
+        try:
+            certificate = ensure_self_signed(
+                tls_dir or (output / "tls"), hosts=list(tls_host or [])
+            )
+        except TlsUnavailable as exc:
+            console.print(f"[bold red]TLS could not be configured:[/bold red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+    scheme = "https" if certificate is not None else "http"
     suffix = f"?token={resolved_token}" if resolved_token else ""
     console.print("[bold]Field app[/bold]")
-    for address in _local_addresses(port):
+    for address in _local_addresses(port, scheme):
         console.print(f"  {address}/{suffix}")
+    if certificate is not None:
+        console.print(
+            f"[bold]TLS[/bold] {'issued' if certificate.generated else 'reusing'} "
+            f"{certificate.certificate_path}"
+        )
+        console.print(f"  valid for: {', '.join(certificate.hosts)}")
+        console.print(f"  expires:   {certificate.not_after}")
+        console.print(f"  SHA-256:   {certificate.fingerprint_sha256}")
+        console.print(
+            "[dim]The certificate is self-signed, so the phone shows a warning once per "
+            "device: Advanced -> Proceed. After that the page is a secure context and the "
+            "browser will share GPS.[/dim]"
+        )
     if host == "127.0.0.1":
         console.print(
             "[yellow]Bound to loopback only.[/yellow] Re-run with --host 0.0.0.0 to open it "
@@ -316,12 +391,14 @@ def web_serve(
             "[yellow]No token set.[/yellow] Anyone on this network can start a capture; "
             "pass --token auto on a shared network."
         )
-    console.print(
-        "[dim]The browser only exposes GPS over HTTPS or from localhost. Over plain HTTP from "
-        "a phone, tap the map to place your position.[/dim]"
-    )
+    if certificate is None:
+        console.print(
+            "[dim]The browser only exposes GPS over HTTPS or from localhost. Over plain HTTP "
+            "from a phone, tap the map to place your position -- and a live drive cannot run "
+            "at all. Re-run with --tls to enable it.[/dim]"
+        )
     console.print("Press Ctrl+C to stop.")
-    serve_forever(settings, host=host, port=port, verbose=verbose)
+    serve_forever(settings, host=host, port=port, verbose=verbose, certificate=certificate)
 
 
 __all__ = ["web_app"]

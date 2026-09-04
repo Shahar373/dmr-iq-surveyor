@@ -19,6 +19,7 @@
 
 <nav id="tabs">
   <button data-panel="record" class="active">Record</button>
+  <button data-panel="drive">Drive</button>
   <button data-panel="sites">Sites</button>
   <button data-panel="stops">Stops</button>
   <button data-panel="legend">Layers</button>
@@ -101,6 +102,52 @@
     </div>
   </div>
 
+  <div class="panel" data-panel="drive" hidden>
+    <p class="hint">
+      A drive measures continuously and writes no IQ at all. Every 150 m of road becomes one
+      virtual stop of about 8 KiB, so a whole campaign of driving costs a few megabytes — which
+      is the reason this mode exists on a Pi.
+    </p>
+    <div id="drive-insecure" class="notice error" hidden></div>
+    <div class="row">
+      <div class="field grow">
+        <label>Phone GPS</label>
+        <div id="drive-gps" class="readout">not sharing</div>
+      </div>
+    </div>
+    <div class="row buttons">
+      <button id="drive-share" class="primary">Share my location</button>
+    </div>
+
+    <hr>
+
+    <div class="row">
+      <div class="field">
+        <label for="drive-bin">Bin size (m)</label>
+        <input id="drive-bin" type="number" min="25" step="25" value="150">
+      </div>
+      <div class="field">
+        <label for="drive-minutes">Stop after (min)</label>
+        <input id="drive-minutes" type="number" min="1" step="5" value="60">
+      </div>
+      <div class="field">
+        <label for="drive-solve-every">Re-solve every (bins)</label>
+        <input id="drive-solve-every" type="number" min="1" step="1" value="5">
+      </div>
+    </div>
+    <p class="hint">
+      A bin is measured once. Below about 150 m consecutive measurements stop being independent
+      evidence and the regions shrink faster than the data earns.
+    </p>
+
+    <div class="row buttons">
+      <button id="drive-start" class="primary big">Start drive</button>
+      <button id="drive-stop" class="danger" hidden>Stop drive</button>
+    </div>
+    <div id="drive-status" class="notice" hidden></div>
+    <div id="drive-stats"></div>
+  </div>
+
   <div class="panel" data-panel="sites" hidden>
     <div class="row buttons">
       <button id="resolve">Re-solve all sites</button>
@@ -126,6 +173,8 @@
     <label class="check"><input type="checkbox" id="layer-regions" checked> Credible regions</label>
     <label class="check"><input type="checkbox" id="layer-estimates" checked> Best estimates</label>
     <label class="check"><input type="checkbox" id="layer-plan" checked> Where to go next</label>
+    <label class="check"><input type="checkbox" id="layer-bins" checked> Drive bins</label>
+    <label class="check"><input type="checkbox" id="layer-track" checked> Where you drove</label>
     <hr>
     <div class="legend-key">
       <div><span class="swatch strong"></span> strong signal</div>
@@ -134,6 +183,7 @@
       <div><span class="swatch region50"></span> 50% credible region</div>
       <div><span class="swatch region90"></span> 90% credible region</div>
       <div><span class="swatch plan"></span> a stop here would teach the most</div>
+      <div><span class="swatch bin"></span> a measured drive bin</div>
     </div>
     <p class="hint">
       A credible region is a search area, not a transmitter coordinate. A region marked

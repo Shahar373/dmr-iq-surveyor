@@ -16,6 +16,7 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - Phase 5.2: exact 5m and 62k5 profiles for additional SDRconnect recording modes
 - Phase 6A: protocol-agnostic RF survey (discovery, persistent inventory, run comparison), the first step toward multi-protocol support (P25 in 866-870 MHz)
 - Phase 7: multi-session P25 site geolocation (reference registry, censored-likelihood grid posterior, credible-region polygons) and a field web app
+- Phase 7.1: live (moving) survey — measure while driving, write no IQ, one virtual stop per 150 m
 
 ## Project documentation
 
@@ -487,8 +488,16 @@ Built on the standard library's HTTP server with a dependency-free single-page a
 must not fail because a dependency did not install.
 
 It binds to loopback unless `--host` says otherwise, because the API can start a capture; on an open
-network pass `--token auto` and use the printed URL. Browsers only expose GPS over HTTPS or from
-localhost, so over plain HTTP from a phone, tap the map to place your position.
+network pass `--token auto` and use the printed URL.
+
+Browsers gate `navigator.geolocation` behind a *secure context*: over plain HTTP a phone does not
+merely warn, it refuses to share GPS at all. Pass `--tls` and the app issues a self-signed
+certificate covering loopback and the Pi's own addresses, prints its SHA-256 fingerprint, and serves
+over HTTPS. Accept the warning once per device ("Advanced" -> "Proceed"), or install the certificate
+to trust it permanently — it is issued for 397 days precisely so a phone will accept it as trusted.
+The pair lives in `<output>/tls` and is reused, not reissued, so a phone that has trusted it stays
+trusted; `--tls-cert/--tls-key` take your own instead. Without TLS you can still tap the map to place
+a position, but a **live drive cannot run**.
 
 The solve that runs after each stop uses a coarser grid (`--solve-resolution-m`, default 250 m) so it
 finishes in seconds; `--no-solve-after-capture` skips it entirely on a long campaign. Run
@@ -500,6 +509,52 @@ extracted its observations into SQLite, so free space is checked *before* every 
 that does not fit is refused, with the numbers) and, after a survey succeeds, recordings beyond
 `--keep-recordings` (default 1) are deleted, with each deletion written to a ledger and every
 capture's `*_capture_report.json` left behind. A failed stop keeps its IQ. Peak disk is 3.35 GiB.
+
+### Live (moving) survey
+
+A stationary stop records IQ; a drive does not record anything at all. The receiver streams
+continuously, each second of samples is reduced to a spectrum and tagged with where the phone said
+the car was, and the samples are dropped. Every 150 m square of road becomes one ordinary
+`survey_runs` row with its observations — about **8 KiB, measured** — so a 13 km drive costs under a
+megabyte and a whole campaign of driving costs single-digit megabytes. That is the reason the mode
+exists on a Pi that does not have gigabytes to spare.
+
+Because a bin is written as an ordinary survey run, `geo measurements`, `geo solve`, the stop list,
+the exclusions, the common-mode check and the next-stop planner consume a drive without knowing one
+happened.
+
+Open the app over HTTPS on the phone, go to the **Drive** tab, tap *Share my location*, then *Start
+drive*. Bins appear on the map as they are written and the credible regions are re-solved in the
+background every few bins, so the polygons shrink while you are still driving. Stopping the drive
+runs a final solve.
+
+Two length scales decide the design, and neither is adjustable by taste:
+
+- **A window is one second.** At 50 km/h that is 14 m, about 40 wavelengths at 868 MHz — the
+  drive-test convention for averaging fast (multipath) fading out of a level to recover the local
+  mean, which is the quantity the path-loss model is written in.
+- **A bin is 150 m.** Shadow fading decorrelates over roughly 10–50 m in a city and 100–200 m in
+  suburbs. Feeding the solver a measurement per second would treat a thousand correlated samples as
+  a thousand independent constraints and shrink a region by a factor near 240, almost all of it
+  fabricated. A bin is measured once; driving the same street again lands on the same id and
+  replaces it rather than adding near-identical evidence beside it.
+
+Sampling is therefore **time-triggered, placement is distance-triggered**. Standing still is bounded
+too: a bin closes after `live_max_windows_per_bin` windows (10) instead of accumulating spectra for
+as long as the car sits there, so a red light costs ~17 MB rather than 100 MB a minute, and windows
+after that are dropped before the FFT.
+
+Without a phone — for a stationary measurement that writes no IQ:
+
+```bash
+dmr-surveyor live stop --latitude 32.0500 --longitude 34.7900 --seconds 30 \
+  --band central_800_narrow --site mobile
+```
+
+A 30 s live stop replaces a 560 MiB recording with an 8 KiB row. What is lost is the recording
+itself: a live measurement cannot be re-analysed later with different settings, because the samples
+are gone. That is the trade, and it is the right one when the alternative is not measuring at all
+for want of a card.
 
 See [`docs/phase7-geolocation-design.md`](docs/phase7-geolocation-design.md) for the full design and
 schema, [`docs/PHASE7-FIELD-GEOLOCATION.md`](docs/PHASE7-FIELD-GEOLOCATION.md) for the campaign

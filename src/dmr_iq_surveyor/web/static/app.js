@@ -19,6 +19,22 @@ const state = {
   stream: null,
 };
 
+/* A drive's own state. Kept apart from `state` because none of it survives a
+ * reload: the fixes are worthless a minute later and the measurements they
+ * produced are already in the database. */
+const live = {
+  watchId: null,
+  jobId: null,
+  timer: null,
+  posting: false,
+  fixes: 0,
+  lastFix: null,
+  gpsError: "",
+  postError: "",
+  lastSolveAt: null,
+  binsDrawn: 0,
+};
+
 /* ---------------------------------------------------------------- helpers */
 
 async function api(path, options = {}) {
@@ -147,6 +163,8 @@ function initMap() {
   layers.nondetections = L.layerGroup().addTo(map);
   layers.estimates = L.layerGroup().addTo(map);
   layers.plan = L.layerGroup().addTo(map);
+  layers.bins = L.layerGroup().addTo(map);
+  layers.track = L.layerGroup().addTo(map);
   layers.position = L.layerGroup().addTo(map);
 
   map.on("click", (event) => {
@@ -667,6 +685,261 @@ async function startSolve() {
   }
 }
 
+/* ----------------------------------------------------------------- drive */
+
+/* Browsers refuse geolocation outside a secure context. Said here, in the
+ * one place it stops the operator, with the exact fix rather than a generic
+ * permission complaint -- over plain HTTP the prompt never even appears. */
+function checkSecureContext() {
+  const notice = $("#drive-insecure");
+  if (window.isSecureContext) {
+    notice.hidden = true;
+    return true;
+  }
+  notice.hidden = false;
+  notice.textContent =
+    "This page is not a secure context, so the browser will not share GPS and a drive " +
+    "cannot run. Restart the app with --tls and reload over https://, accepting the " +
+    "certificate warning once.";
+  $("#drive-share").disabled = true;
+  $("#drive-start").disabled = true;
+  return false;
+}
+
+function renderDriveGps() {
+  const readout = $("#drive-gps");
+  if (live.watchId === null) {
+    readout.textContent = live.gpsError || "not sharing";
+    return;
+  }
+  if (!live.lastFix) {
+    readout.textContent = "waiting for a fix…";
+    return;
+  }
+  const age = Math.round((Date.now() - live.lastFix.at) / 1000);
+  const accuracy = live.lastFix.accuracy ? ` ±${Math.round(live.lastFix.accuracy)} m` : "";
+  readout.textContent =
+    `${live.lastFix.latitude.toFixed(5)}, ${live.lastFix.longitude.toFixed(5)}${accuracy}` +
+    ` · ${age} s ago · ${live.fixes} fix(es)` +
+    (live.postError ? ` · not reaching the Pi: ${live.postError}` : "");
+}
+
+async function sendFix(fix) {
+  live.fixes += 1;
+  live.lastFix = {
+    latitude: fix.coords.latitude,
+    longitude: fix.coords.longitude,
+    accuracy: fix.coords.accuracy,
+    at: Date.now(),
+  };
+  renderDriveGps();
+  // One request in flight at a time. Fixes arrive about once a second and the
+  // server keeps only the latest, so dropping one while another is on the
+  // wire loses nothing -- while queueing them on a slow link would deliver
+  // stale positions late, which is the one error that misplaces a measurement.
+  if (live.posting) return;
+  live.posting = true;
+  try {
+    await api("/api/live/position", {
+      method: "POST",
+      body: JSON.stringify({
+        latitude: fix.coords.latitude,
+        longitude: fix.coords.longitude,
+        accuracy_m: fix.coords.accuracy,
+        speed_mps: fix.coords.speed,
+      }),
+    });
+    live.postError = "";
+  } catch (error) {
+    live.postError = error.message;
+  } finally {
+    live.posting = false;
+    renderDriveGps();
+  }
+}
+
+function startLocationSharing() {
+  if (!navigator.geolocation) {
+    alert("This browser does not expose a GPS position.");
+    return;
+  }
+  live.gpsError = "";
+  live.watchId = navigator.geolocation.watchPosition(
+    sendFix,
+    (error) => {
+      live.gpsError = "GPS unavailable: " + error.message;
+      renderDriveGps();
+    },
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 }
+  );
+  $("#drive-share").textContent = "Stop sharing";
+  $("#drive-share").classList.add("armed");
+  renderDriveGps();
+}
+
+function stopLocationSharing() {
+  if (live.watchId !== null) navigator.geolocation.clearWatch(live.watchId);
+  live.watchId = null;
+  $("#drive-share").textContent = "Share my location";
+  $("#drive-share").classList.remove("armed");
+  renderDriveGps();
+}
+
+async function startDrive() {
+  const button = $("#drive-start");
+  button.disabled = true;
+  if (live.watchId === null) startLocationSharing();
+  try {
+    const job = await api("/api/live/start", {
+      method: "POST",
+      body: JSON.stringify({
+        bin_size_m: Number($("#drive-bin").value),
+        max_seconds: Number($("#drive-minutes").value) * 60,
+        solve_every_bins: Number($("#drive-solve-every").value),
+        center_frequency_hz: Number($("#center").value) * 1e6,
+        sample_rate_hz: Number($("#rate").value) * 1e6,
+        if_gain_reduction_db: Number($("#ifgr").value),
+        lna_state: Number($("#lna").value),
+      }),
+    });
+    live.jobId = job.job_id;
+    live.binsDrawn = 0;
+    if (layers.bins) layers.bins.clearLayers();
+    if (layers.track) layers.track.clearLayers();
+    watchJob(job.job_id);
+    pollLive();
+  } catch (error) {
+    button.disabled = false;
+    alert("Could not start the drive: " + error.message);
+  }
+}
+
+async function stopDrive() {
+  if (!live.jobId) return;
+  $("#drive-stop").disabled = true;
+  try {
+    await api("/api/jobs/" + live.jobId + "/cancel", { method: "POST" });
+  } catch (error) {
+    alert("Could not stop the drive: " + error.message);
+  } finally {
+    $("#drive-stop").disabled = false;
+  }
+}
+
+const DRIVE_STATS = [
+  ["bins_written", "bins measured"],
+  ["windows_recorded", "windows used"],
+  ["bins_capped", "bins filled while stopped"],
+  ["windows_dwelled", "windows while parked"],
+  ["windows_revisited", "windows on measured road"],
+  ["windows_too_fast", "windows dropped, too fast"],
+  ["windows_without_position", "windows with no fix"],
+  ["bins_too_short", "bins dropped, too few windows"],
+  ["overflow_count", "driver overflows"],
+];
+
+function renderLive(payload) {
+  if (!payload) return;
+  const running = Boolean(payload.running);
+  $("#drive-start").hidden = running;
+  $("#drive-stop").hidden = !running;
+  if (!running) $("#drive-start").disabled = !window.isSecureContext;
+  if (running && payload.job_id) live.jobId = payload.job_id;
+
+  const status = $("#drive-status");
+  if (running) {
+    status.hidden = false;
+    status.className = "notice";
+    const solve = payload.last_solve;
+    status.textContent =
+      `Driving · ${payload.bin_count} bin(s) written` +
+      (payload.solving ? " · solving in the background" : "") +
+      (solve ? ` · last solve: ${solve.solved} of ${solve.sites} site(s) bounded` : "");
+  } else if (payload.bin_count) {
+    status.hidden = false;
+    status.className = "notice";
+    status.textContent = `Last drive wrote ${payload.bin_count} bin(s).`;
+  } else {
+    status.hidden = true;
+  }
+
+  const stats = payload.stats || {};
+  const box = $("#drive-stats");
+  box.replaceChildren();
+  const shown = { ...stats };
+  if (running) shown.bins_written = payload.bin_count;
+  for (const [key, label] of DRIVE_STATS) {
+    const value = shown[key];
+    if (value === undefined) continue;
+    const row = el("div", "stat" + (value ? "" : " muted"));
+    row.appendChild(el("span", null, label));
+    row.appendChild(el("b", null, String(value)));
+    box.appendChild(row);
+  }
+
+  if (map && layers.bins) {
+    // Redrawn only when there are new bins: a poll every two seconds must not
+    // rebuild the whole layer while the operator is panning the map.
+    const bins = payload.bins || [];
+    if (bins.length !== live.binsDrawn) {
+      layers.bins.clearLayers();
+      for (const bin of bins) {
+        L.circleMarker([bin.latitude, bin.longitude], {
+          radius: 5,
+          weight: 1,
+          color: "#0b7a5f",
+          fillColor: "#10a37f",
+          fillOpacity: 0.75,
+        })
+          .bindPopup(
+            `<b>Drive bin</b><dl>` +
+              `<dt>windows</dt><dd>${bin.windows}</dd>` +
+              `<dt>observations</dt><dd>${bin.observations}</dd>` +
+              `<dt>spread</dt><dd>${bin.spread_m} m</dd></dl>` +
+              "<p>One virtual stop. It contributes exactly as a recorded stop does.</p>"
+          )
+          .addTo(layers.bins);
+      }
+      live.binsDrawn = bins.length;
+    }
+    const trail = payload.trail || [];
+    layers.track.clearLayers();
+    if (trail.length > 1) {
+      L.polyline(trail.map((point) => [point.latitude, point.longitude]), {
+        color: "#10a37f",
+        weight: 3,
+        opacity: 0.5,
+      }).addTo(layers.track);
+    }
+  }
+
+  // A background solve finishing is the only thing that changes the regions
+  // mid-drive, so the map is refetched then and not on every poll.
+  const solvedAt = payload.last_solve ? payload.last_solve.at : null;
+  if (solvedAt && solvedAt !== live.lastSolveAt) {
+    live.lastSolveAt = solvedAt;
+    refreshMap().catch(() => {});
+  }
+}
+
+async function pollLive() {
+  if (live.timer) clearTimeout(live.timer);
+  let payload = null;
+  try {
+    payload = await api("/api/live");
+    renderLive(payload);
+  } catch (_) {
+    /* a dropped link is not a reason to stop polling */
+  }
+  renderDriveGps();
+  if (payload && payload.running) {
+    live.timer = setTimeout(pollLive, 2000);
+  } else {
+    live.timer = null;
+    live.jobId = null;
+  }
+}
+
 /* ----------------------------------------------------------------- setup */
 
 async function refreshState() {
@@ -680,6 +953,7 @@ async function refreshState() {
   renderSites();
   renderStops();
   renderPlan();
+  renderLive(payload.live);
 
   const disk = payload.disk;
   const diskPill = $("#disk");
@@ -757,6 +1031,12 @@ function wireUi() {
   });
   $("#record").addEventListener("click", () => startCapture());
   $("#purge").addEventListener("click", purgeRecordings);
+  $("#drive-share").addEventListener("click", () => {
+    if (live.watchId === null) startLocationSharing();
+    else stopLocationSharing();
+  });
+  $("#drive-start").addEventListener("click", startDrive);
+  $("#drive-stop").addEventListener("click", stopDrive);
   for (const [id, format] of [["#export-kml", "kml"], ["#export-gpx", "gpx"]]) {
     $(id).addEventListener("click", () => {
       const query = new URLSearchParams({ format });
@@ -774,6 +1054,8 @@ function wireUi() {
     "layer-nondetections": "nondetections",
     "layer-estimates": "estimates",
     "layer-plan": "plan",
+    "layer-bins": "bins",
+    "layer-track": "track",
   };
   for (const [id, name] of Object.entries(toggles)) {
     $("#" + id).addEventListener("change", (event) => {
@@ -824,10 +1106,18 @@ async function boot() {
       renderPosition();
       await refreshMap();
     }
+    checkSecureContext();
     const running = (payload.jobs || []).find(
       (job) => job.status === "running" || job.status === "pending"
     );
     if (running) watchJob(running.job_id);
+    // A drive survives the phone locking, the browser being closed, or a
+    // reload: it is running on the Pi. Rejoining it is the difference between
+    // a lost drive and a paused screen.
+    if (payload.live && payload.live.running) {
+      live.jobId = payload.live.job_id;
+      pollLive();
+    }
   } catch (error) {
     setConnection("offline", "bad");
     $("#sheet").prepend(el("div", "notice error", "Could not reach the server: " + error.message));
