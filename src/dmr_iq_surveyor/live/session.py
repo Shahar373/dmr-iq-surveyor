@@ -34,7 +34,7 @@ import numpy as np
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.device import DeviceSettings, IqDevice, SoapyIqDevice
 from dmr_iq_surveyor.geo.model import haversine_m
-from dmr_iq_surveyor.live.bins import DEFAULT_BIN_SIZE_M, BinGrid, BinVisit
+from dmr_iq_surveyor.live.bins import DEFAULT_BIN_SIZE_M, BinGrid, BinKey, BinVisit
 from dmr_iq_surveyor.spectrum.core import SpectrumSettings, fft_frame_count
 from dmr_iq_surveyor.survey.discovery import (
     accumulate_segment_spectrum,
@@ -82,6 +82,17 @@ class LiveSettings:
     # fading out of its level, and the level is what the solver reads as
     # distance.
     min_windows_per_bin: int = 3
+    # Most windows one bin will accumulate before it is written and closed.
+    # This is what makes standing still safe. A bin stays open until the
+    # receiver leaves it, so a red light, a traffic jam or a parked car keeps
+    # appending spectra to the same bin for as long as it sits there; each is
+    # about 1.7 MB at a 65536-point FFT, so a minute of dwell holds ~100 MB
+    # and a quarter of an hour holds over a gigabyte, and the Pi runs out of
+    # memory while apparently doing nothing. Capping bounds that by the cap
+    # alone, never by how long the drive or the dwell lasts. It also makes
+    # dwelling cheap rather than merely survivable: once a bin is complete
+    # the windows that follow it are dropped before the FFT, not after.
+    max_windows_per_bin: int = 10
     # A window can only be placed if the fix that tags it is recent. A stale
     # fix would put the measurement where the receiver used to be, which is
     # the one error that corrupts a campaign without looking wrong.
@@ -117,6 +128,8 @@ class LiveSettings:
             raise ValueError("bin_size_m must be positive")
         if self.min_windows_per_bin < 1:
             raise ValueError("min_windows_per_bin must be at least 1")
+        if self.max_windows_per_bin < self.min_windows_per_bin:
+            raise ValueError("max_windows_per_bin must be at least min_windows_per_bin")
         if self.frames_per_window < 1:
             raise ValueError("frames_per_window must be at least 1")
         if self.sample_rate_hz <= 0 or self.center_frequency_hz <= 0:
@@ -144,7 +157,15 @@ class LiveStats:
     # they filled -- at speed, or because overflows stretched them.
     windows_too_fast: int = 0
     windows_revisited: int = 0
+    # Windows dropped because the receiver was still sitting in a bin that
+    # had already reached its window cap. Counted apart from revisits: one
+    # says the drive retraced its route, the other says it stopped moving,
+    # and an operator reading the summary needs to tell those apart.
+    windows_dwelled: int = 0
     bins_written: int = 0
+    # Of those, the ones closed by reaching the cap rather than by the
+    # receiver leaving them.
+    bins_capped: int = 0
     bins_too_short: int = 0
     observations_written: int = 0
     overflow_count: int = 0
@@ -210,6 +231,9 @@ class LiveSession:
         self.stats = LiveStats()
         self._grid: BinGrid | None = None
         self._visit: BinVisit | None = None
+        # The bin the receiver is currently sitting in after it filled up,
+        # so a dwell is not reported as if the route had been driven twice.
+        self._dwell_key: BinKey | None = None
         self._spectrum_settings = SpectrumSettings(
             fft_size=settings.fft_size, overlap_ratio=settings.overlap_ratio
         )
@@ -318,9 +342,16 @@ class LiveSession:
 
         if self._visit is not None and self._visit.key != key:
             self._close_visit(connection)
+        if key != self._dwell_key:
+            self._dwell_key = None
         if self._grid.already_measured(key):
-            self._grid.note_revisit()
-            self.stats.windows_revisited = self._grid.revisited_windows
+            if self._dwell_key is not None:
+                self.stats.windows_dwelled += 1
+            else:
+                self._grid.note_revisit()
+                self.stats.windows_revisited = self._grid.revisited_windows
+            # Returned before `_analyse`, so a stationary receiver costs no
+            # transforms at all once its bin is complete.
             return
         if self._visit is None:
             self._visit = BinVisit(key=key, started_utc=datetime.now(UTC).isoformat())
@@ -332,6 +363,14 @@ class LiveSession:
         self._visit.latitudes.append(position.latitude)
         self._visit.longitudes.append(position.longitude)
         self.stats.windows_recorded += 1
+        if self._visit.window_count >= self.settings.max_windows_per_bin:
+            # Full. Closed here rather than when the receiver moves off, so
+            # the spectra are released immediately and a stationary operator
+            # sees the measurement land instead of waiting for a departure
+            # that may not come for a quarter of an hour.
+            self._dwell_key = key
+            self.stats.bins_capped += 1
+            self._close_visit(connection)
 
     def _analyse(self, samples: np.ndarray) -> Any:
         starts = _window_frame_starts(samples.size, self.settings)

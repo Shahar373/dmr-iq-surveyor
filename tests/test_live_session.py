@@ -412,3 +412,93 @@ def test_live_settings_reject_impossible_configuration() -> None:
         LiveSettings(bin_size_m=-1.0).validate()
     with pytest.raises(ValueError, match="frames_per_window"):
         LiveSettings(frames_per_window=0).validate()
+    with pytest.raises(ValueError, match="max_windows_per_bin"):
+        LiveSettings(min_windows_per_bin=6, max_windows_per_bin=3).validate()
+
+
+# ------------------------------------------------------------------- dwelling
+
+
+class _ThereAndBack(_Drive):
+    """Drives out along the line and returns down it, at the same speed."""
+
+    def __init__(self, *, turn_seconds: float, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.turn_seconds = turn_seconds
+
+    def position(self) -> Position:
+        elapsed = (
+            self.now if self.now <= self.turn_seconds else 2 * self.turn_seconds - self.now
+        )
+        metres_per_degree = 111_320.0
+        latitude, longitude = self.start
+        longitude += elapsed * self.speed_ms / (
+            metres_per_degree * math.cos(math.radians(latitude))
+        )
+        return Position(latitude=latitude, longitude=longitude, at=self.now)
+
+
+def _session(drive: _Drive, settings: LiveSettings) -> LiveSession:
+    return LiveSession(
+        session_id="drive",
+        settings=settings,
+        band=_band(),
+        site=SiteProfile(site_id="mobile", label="mobile"),
+        database_path=":memory:",
+        position_provider=drive.position,
+        device=drive,
+        clock=drive.clock,
+    )
+
+
+def test_standing_still_writes_its_bin_and_then_holds_nothing(tmp_path: Path) -> None:
+    """A parked receiver must not accumulate spectra for as long as it sits.
+
+    Without a cap the open bin grows by one spectrum per second for the whole
+    dwell -- about 1.7 MB each at the field FFT size -- so a long red light
+    or a parked car eventually exhausts the Pi's memory while the operator
+    sees nothing happening. The cap has to bound what is held, write the
+    measurement instead of waiting for a departure, and stop transforming.
+    """
+    database = tmp_path / "parked.sqlite3"
+    connection = build_database(database)
+    drive = _Drive(start=TRANSMITTER, east_step_m=0.0)
+    settings = _settings(min_windows_per_bin=2, max_windows_per_bin=3)
+    session = _session(drive, settings)
+
+    transforms: list[int] = []
+    analyse = session._analyse
+
+    def counting(samples):
+        held = 0 if session._visit is None else session._visit.window_count
+        # The bound, asserted where it actually has to hold rather than
+        # inferred from the totals afterwards.
+        assert held < settings.max_windows_per_bin
+        transforms.append(held)
+        return analyse(samples)
+
+    session._analyse = counting
+    stats = session.run(stop=lambda: drive.now >= 12.0, connection=connection)
+    connection.close()
+
+    assert stats.bins_written == 1
+    assert stats.bins_capped == 1
+    assert stats.windows_recorded == 3
+    assert len(transforms) == 3, "windows after the cap must be dropped before the FFT"
+    assert stats.windows_dwelled >= 8
+    assert stats.windows_revisited == 0, "sitting still is not driving the route twice"
+
+
+def test_a_dwell_is_reported_apart_from_a_genuine_revisit(tmp_path: Path) -> None:
+    """Both drop windows; they mean opposite things to the operator."""
+    database = tmp_path / "back.sqlite3"
+    connection = build_database(database)
+    drive = _ThereAndBack(start=TRANSMITTER, east_step_m=60.0, turn_seconds=8.0)
+    settings = _settings(min_windows_per_bin=2, max_windows_per_bin=10)
+    stats = _session(drive, settings).run(stop=lambda: drive.now >= 16.0, connection=connection)
+    connection.close()
+
+    assert stats.bins_written >= 2
+    assert stats.bins_capped == 0, "60 m per window never fills a 150 m bin to the cap"
+    assert stats.windows_revisited > 0, "the return leg re-enters bins already measured"
+    assert stats.windows_dwelled == 0, "the receiver never stopped moving"
