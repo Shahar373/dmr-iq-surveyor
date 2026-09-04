@@ -194,12 +194,13 @@ class FieldSettings:
     live_min_windows_per_bin: int = 3
     live_max_windows_per_bin: int = 10
     live_max_position_age_seconds: float = 5.0
-    # Analysis size per window. 65536 bins is 76 Hz at 5 MS/s, fine enough to
-    # resolve a 12.5 kHz channel and coarse enough that a Pi finishes the
-    # transforms inside the second that produced them. It also sets what one
-    # window costs to hold -- about 1.7 MB -- so it is the knob to turn when
-    # memory, not resolution, is the binding constraint.
-    live_fft_size: int = 65_536
+    # Analysis size per window: 305 Hz at 5 MS/s, forty bins across a 12.5 kHz
+    # channel. Measured against 65536 on a synthesised carrier at 35, 20 and
+    # 10 dB, the reported SNR agrees within 0.2 dB -- so a drive's bins and a
+    # stationary stop's offline analysis stay on one scale -- while costing a
+    # quarter of the memory and a third of the detection time, both of which
+    # bind on a Pi.
+    live_fft_size: int = 16_384
     live_frames_per_window: int = 24
     # Re-solve after this many new bins. Solving is minutes of CPU across a
     # campaign's sites, so it runs on its own thread while the stream keeps

@@ -309,3 +309,80 @@ def test_live_settings_take_the_campaign_anchor_not_the_first_fix(tmp_path: Path
     assert (settings.grid_anchor_latitude, settings.grid_anchor_longitude) == (31.5, 34.1)
     fallback = _service(tmp_path / "other", live_anchor=None, map_center=(30.25, 34.9))
     assert fallback.live_settings({}).grid_anchor_latitude == 30.25
+
+
+def test_the_live_endpoints_are_reachable_over_http(tmp_path: Path) -> None:
+    """Routing, not behaviour: a drive is useless if the phone cannot reach
+    it, and the handlers are wired by hand in this server."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    from dmr_iq_surveyor.web.server import create_server
+
+    service_settings = _service(tmp_path).settings
+    server = create_server(service_settings, host="127.0.0.1", port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def post(path: str, body: dict) -> tuple[int, dict]:
+        request = urllib.request.Request(
+            base + path,
+            data=_json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status, _json.loads(response.read().decode() or "{}")
+        except urllib.error.HTTPError as error:
+            return error.code, _json.loads(error.read().decode() or "{}")
+
+    try:
+        status, payload = post("/api/live/position", {"latitude": 32.05, "longitude": 34.8})
+        assert status == 200 and payload["accepted"]
+
+        with urllib.request.urlopen(base + "/api/live", timeout=30) as response:
+            live = _json.loads(response.read().decode())
+        assert live["fix_count"] == 1
+        assert live["running"] is False
+        assert live["position_age_seconds"] is not None
+
+        status, payload = post("/api/live/position", {"latitude": 999.0, "longitude": 34.8})
+        assert status == 400 and "out of range" in payload["error"]
+
+        # The page has to carry the controls, or none of the above is reachable
+        # by the person holding the phone.
+        with urllib.request.urlopen(base + "/", timeout=30) as response:
+            page = response.read().decode()
+        assert 'data-panel="drive"' in page
+        assert 'id="drive-start"' in page
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_starting_a_drive_over_http_without_gps_is_a_client_error(tmp_path: Path) -> None:
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    from dmr_iq_surveyor.web.server import create_server
+
+    server = create_server(_service(tmp_path).settings, host="127.0.0.1", port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    request = urllib.request.Request(
+        base + "/api/live/start",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(request, timeout=30)
+        assert excinfo.value.code == 400
+        assert "no GPS fix" in _json.loads(excinfo.value.read().decode())["error"]
+    finally:
+        server.shutdown()
+        server.server_close()

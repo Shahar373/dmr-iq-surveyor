@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,7 @@ from fixtures.geo_scenario import build_database, fast_solve_settings
 from dmr_iq_surveyor.capture.device import DeviceSettings
 from dmr_iq_surveyor.geo.model import LocalProjection, haversine_m
 from dmr_iq_surveyor.geo.pipeline import materialise_measurements, solve_all_sites
+from dmr_iq_surveyor.geo.store import connect_geo_database
 from dmr_iq_surveyor.live.bins import BinGrid, BinKey, anchor_tag
 from dmr_iq_surveyor.live.session import (
     LiveSession,
@@ -502,3 +504,102 @@ def test_a_dwell_is_reported_apart_from_a_genuine_revisit(tmp_path: Path) -> Non
     assert stats.bins_capped == 0, "60 m per window never fills a 150 m bin to the cap"
     assert stats.windows_revisited > 0, "the return leg re-enters bins already measured"
     assert stats.windows_dwelled == 0, "the receiver never stopped moving"
+
+
+# ------------------------------------------------------- background analysis
+
+
+def _run_session(drive: _Drive, connection, *, windows: int, settings: LiveSettings):
+    session = _session(drive, settings)
+    session.run(stop=lambda: drive.now >= windows * drive.seconds_per_step, connection=connection)
+    return session
+
+
+def _written(database: Path) -> dict[str, int]:
+    connection = connect_geo_database(database)
+    try:
+        return {
+            row["survey_run_id"]: row["n"]
+            for row in connection.execute(
+                "SELECT r.survey_run_id, "
+                "(SELECT COUNT(*) FROM rf_observations o "
+                " WHERE o.survey_run_id = r.survey_run_id) AS n "
+                "FROM survey_runs r WHERE r.survey_run_id LIKE 'live_%'"
+            )
+        }
+    finally:
+        connection.close()
+
+
+def test_analysing_a_bin_off_the_streaming_thread_changes_nothing_it_writes(
+    tmp_path: Path,
+) -> None:
+    """The detector scans the whole band once per window in a bin, and every
+    second of that is a second the SDR is not being read. Moving it off the
+    loop is only allowed if the measurements are identical."""
+    results = {}
+    for background in (False, True):
+        database = tmp_path / f"{background}.sqlite3"
+        connection = build_database(database)
+        drive = _Drive(start=(32.0700, 34.8000), east_step_m=60.0)
+        settings = _settings(min_windows_per_bin=2, background_analysis=background)
+        session = _run_session(drive, connection, windows=14, settings=settings)
+        connection.close()
+        results[background] = (_written(database), session.stats.bins_written)
+
+    assert results[True][1] > 0, "the drive must actually write something"
+    assert results[True] == results[False], (
+        "the same road, analysed on a second thread, must produce the same rows"
+    )
+
+
+def test_analysis_slower_than_the_road_stalls_rather_than_losing_a_bin(
+    tmp_path: Path,
+) -> None:
+    """The queue is one deep on purpose. When it is full the only options are
+    to stall, to grow without bound, or to throw a measurement away -- and a
+    measurement of a place the car has already left cannot be retaken."""
+    database = tmp_path / "slow.sqlite3"
+    connection = build_database(database)
+    drive = _Drive(start=(32.0700, 34.8000), east_step_m=60.0)
+    session = _session(drive, _settings(min_windows_per_bin=2))
+    detect = session._detect
+
+    def slow(visit):
+        time.sleep(0.25)
+        return detect(visit)
+
+    session._detect = slow
+    stats = session.run(stop=lambda: drive.now >= 20.0, connection=connection)
+    connection.close()
+
+    assert stats.bins_analysed_inline > 0, "the fixture must actually saturate the queue"
+    assert stats.bins_failed == 0
+    # Nothing is lost to the back-pressure: every bin that closed was written.
+    assert len(_written(database)) == stats.bins_written
+
+
+def test_one_bin_whose_analysis_fails_does_not_end_the_drive(tmp_path: Path) -> None:
+    """The road is being driven now and cannot be re-driven. A bug in one
+    bin's detection must cost that bin and be named, not the whole session."""
+    database = tmp_path / "boom.sqlite3"
+    connection = build_database(database)
+    drive = _Drive(start=(32.0700, 34.8000), east_step_m=60.0)
+    session = _session(drive, _settings(min_windows_per_bin=2))
+    detect = session._detect
+    calls = {"n": 0}
+
+    def sometimes(visit):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ValueError("synthetic detector failure")
+        return detect(visit)
+
+    session._detect = sometimes
+    stats = session.run(stop=lambda: drive.now >= 20.0, connection=connection)
+    connection.close()
+
+    assert stats.bins_failed == 1
+    assert "synthetic detector failure" in stats.last_error
+    assert stats.bins_written >= 2, "the bins either side of the failure must survive"
+    assert len(_written(database)) == stats.bins_written

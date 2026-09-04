@@ -22,6 +22,8 @@ Which site a detected frequency might belong to is decided afterwards, by
 from __future__ import annotations
 
 import math
+import queue
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, replace
@@ -117,9 +119,24 @@ class LiveSettings:
     # number across the window keeps the analysis real-time and matches the
     # segmented/strided discipline the offline stages already use.
     frames_per_window: int = 24
-    fft_size: int = 65_536
+    # 16384 bins is 305 Hz at 5 MS/s -- forty bins across a 12.5 kHz channel,
+    # which is what the detector integrates over. Measured against 65536 on a
+    # synthesised 12.5 kHz carrier at 35, 20 and 10 dB, the reported channel
+    # SNR agrees to within 0.2 dB, so a bin measured here and a stationary
+    # stop measured offline at 65536 are on the SAME scale -- which they must
+    # be, or the campaign acquires exactly the common-mode offset this project
+    # checks for. What it buys is four times less memory per window (about
+    # 0.43 MB) and roughly a third of the detection cost, both of which bind
+    # on a Pi. 8192 was measured too and loses the weakest signal outright.
+    fft_size: int = 16_384
     overlap_ratio: float = 0.5
     chunk_frames: int = 262_144
+    # Analyse a finished bin on a second thread instead of in the streaming
+    # loop. The detector scans every raster step of the band once PER WINDOW
+    # in the bin -- about 0.11 s per window here, several times that on a Pi
+    # -- and every second of that is a second the SDR is not being read. Off
+    # by default only for tests that want one deterministic thread.
+    background_analysis: bool = True
 
     def validate(self) -> None:
         if self.window_seconds <= 0:
@@ -167,6 +184,15 @@ class LiveStats:
     # receiver leaving them.
     bins_capped: int = 0
     bins_too_short: int = 0
+    # Bins whose detection ran in the streaming loop because the analysis
+    # thread was still busy with the previous one. Not an error -- the
+    # measurement is identical -- but it stalls the stream, so it is counted:
+    # a drive full of these is a drive that wants a coarser --fft-size.
+    bins_analysed_inline: int = 0
+    # Bins lost because their analysis raised. Counted rather than allowed to
+    # end the drive: the road is being driven now and cannot be re-driven.
+    bins_failed: int = 0
+    last_error: str = ""
     observations_written: int = 0
     overflow_count: int = 0
     # True when no campaign anchor was configured and the grid fell back to
@@ -237,6 +263,12 @@ class LiveSession:
         self._spectrum_settings = SpectrumSettings(
             fft_size=settings.fft_size, overlap_ratio=settings.overlap_ratio
         )
+        # Finished bins waiting to be analysed, and analysed bins waiting to
+        # be written. Depth one on the way in: a deeper queue would hold more
+        # spectra than the Pi can spare, and the back-pressure it creates is
+        # handled by analysing inline rather than by dropping a measurement.
+        self._to_analyse: queue.Queue[BinVisit | None] | None = None
+        self._analysed: queue.Queue[tuple[BinVisit, Any] | None] = queue.Queue()
 
     # -- the loop ----------------------------------------------------------
 
@@ -272,6 +304,13 @@ class LiveSession:
         buffer = np.empty(window_frames, dtype=np.complex64)
         filled = 0
         started_at: Position | None = None
+        worker: threading.Thread | None = None
+        if self.settings.background_analysis:
+            self._to_analyse = queue.Queue(maxsize=1)
+            worker = threading.Thread(
+                target=self._analyse_finished_bins, name="live-detect", daemon=True
+            )
+            worker.start()
         try:
             while not stop():
                 if filled == 0:
@@ -290,12 +329,24 @@ class LiveSession:
                 if filled < window_frames:
                     continue
                 self._consume_window(buffer, started_at, connection)
+                # Whatever the analysis thread finished while this window was
+                # filling. Writing here, on the streaming thread, keeps the
+                # database connection in the one thread that opened it.
+                self._write_analysed(connection)
                 filled = 0
                 started_at = None
         finally:
             self.stats.overflow_count = int(getattr(resolved_device, "overflow_count", 0))
             self._close_visit(connection)
+            # The radio is released before the last bins are analysed: holding
+            # it through several seconds of arithmetic would keep it from the
+            # next drive, or from another tool, for no gain.
             resolved_device.close()
+            if worker is not None and self._to_analyse is not None:
+                self._to_analyse.put(None)
+                self._write_analysed(connection, until_finished=True)
+                worker.join(timeout=60.0)
+                self._to_analyse = None
         return self.stats
 
     def _consume_window(
@@ -404,14 +455,78 @@ class LiveSession:
             # should still get its chance.
             self.stats.bins_too_short += 1
             return
+        # Claimed the moment the bin is finished, not when its row is written.
+        # The receiver can re-enter it while the analysis is still queued, and
+        # a second visit to a bin already being measured is exactly the
+        # duplicate the grid exists to prevent.
+        self._grid.mark_measured(visit.key)
 
-        detection = observations_from_segments(
+        if self._to_analyse is not None:
+            try:
+                self._to_analyse.put_nowait(visit)
+                return
+            except queue.Full:
+                # The analysis is slower than the road. Doing it here costs a
+                # stall, which the binning absorbs; queueing without bound
+                # would cost memory a Pi does not have, and dropping the visit
+                # would cost the measurement itself.
+                self.stats.bins_analysed_inline += 1
+        self._write_visit(connection, visit, self._detect(visit))
+
+    def _detect(self, visit: BinVisit) -> dict[str, Any]:
+        return observations_from_segments(
             visit.spectra,
             band_profile=self.band,
             center_frequency_hz=self.settings.center_frequency_hz,
             sample_rate_hz=self.settings.sample_rate_hz,
             spectrum_settings=self._spectrum_settings,
         )
+
+    def _analyse_finished_bins(self) -> None:
+        """Detect on finished bins while the stream keeps running.
+
+        Only arithmetic happens here. The database connection stays in the
+        thread that opened it, and every write is done by `_write_analysed`
+        on the streaming thread.
+        """
+        assert self._to_analyse is not None
+        while True:
+            visit = self._to_analyse.get()
+            if visit is None:
+                self._analysed.put(None)
+                return
+            try:
+                self._analysed.put((visit, self._detect(visit)))
+            except Exception as exc:  # noqa: BLE001 - one bad bin is not the drive
+                self._analysed.put((visit, exc))
+
+    def _write_analysed(self, connection: Any, *, until_finished: bool = False) -> None:
+        while True:
+            try:
+                item = (
+                    self._analysed.get(timeout=120.0)
+                    if until_finished
+                    else self._analysed.get_nowait()
+                )
+            except queue.Empty:
+                return
+            if item is None:
+                return
+            visit, detection = item
+            if isinstance(detection, Exception):
+                # Counted and named rather than raised: the drive is happening
+                # on a road that cannot be re-driven, and every other bin is
+                # still good.
+                self.stats.bins_failed += 1
+                self.stats.last_error = f"{type(detection).__name__}: {detection}"
+                continue
+            self._write_visit(connection, visit, detection)
+
+    def _write_visit(
+        self, connection: Any, visit: BinVisit, detection: dict[str, Any]
+    ) -> None:
+        if self._grid is None:
+            return
         passband = detection["usable_passband"]
         latitude, longitude = visit.centroid()
         analysed = (
@@ -465,7 +580,6 @@ class LiveSession:
             observations=detection["observations"],
             raster_tolerance_hz=self.band.comparison.frequency_tolerance_hz,
         )
-        self._grid.mark_measured(visit.key)
         self.stats.bins_written += 1
         self.stats.observations_written += len(detection["observations"])
         if self.on_bin is not None:

@@ -539,6 +539,16 @@ Two length scales decide the design, and neither is adjustable by taste:
   fabricated. A bin is measured once; driving the same street again lands on the same id and
   replaces it rather than adding near-identical evidence beside it.
 
+The detector scans every raster step of the band once per window in a bin, so closing a bin is
+seconds of arithmetic — and every one of those seconds is a second the SDR is not being read. It
+therefore runs on a second thread while the stream keeps going, with a one-deep queue: when analysis
+falls behind the road the bin is analysed inline (counted as `bins_analysed_inline`) rather than
+queued without bound or thrown away. Live analysis uses a 16384-point FFT, 305 Hz at 5 MS/s;
+measured against 65536 on a synthesised 12.5 kHz carrier at 35, 20 and 10 dB the reported SNR agrees
+to within 0.2 dB, so a drive's bins and a stationary stop's offline analysis stay on **one scale**,
+at a quarter of the memory and a third of the detection cost. End to end, one second of 5 MS/s
+stream costs about 0.22 CPU-seconds across both threads on a development machine.
+
 Sampling is therefore **time-triggered, placement is distance-triggered**. Standing still is bounded
 too: a bin closes after `live_max_windows_per_bin` windows (10) instead of accumulating spectra for
 as long as the car sits there, so a red light costs ~17 MB rather than 100 MB a minute, and windows

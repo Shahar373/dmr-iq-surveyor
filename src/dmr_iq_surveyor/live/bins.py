@@ -125,9 +125,9 @@ class BinGrid:
     A bin is measured ONCE. Driving back down the same road re-enters bins
     that already have a measurement, and those windows are counted and
     dropped rather than merged in: merging would need every earlier
-    spectrum kept in memory (about 1.8 MB each at a 65536-point FFT, so
-    hundreds of megabytes across a drive), and replacing would silently
-    discard the first pass. Skipping is the option that neither grows
+    spectrum kept in memory (0.43 MB each at the default 16384-point FFT,
+    1.7 MB at 65536, so hundreds of megabytes across a drive), and
+    replacing would silently discard the first pass. Skipping is the option that neither grows
     without bound nor quietly loses data, and the count is reported so the
     operator can see how much of the drive retraced itself.
     """
