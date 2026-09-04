@@ -324,6 +324,30 @@ def _solve_one(
         "settings": settings.to_dict(),
         "input_run_ids": sorted({str(item["survey_run_id"]) for item in usable}),
         "warnings": [],
+        # Present on every row, including the ones that never reach the
+        # solver. Filling these in only for solved sites left the report a
+        # list of two different shapes, so a caller looping over it and
+        # reading a mode crashed on the first site that had no frequency on
+        # record -- the values are genuinely absent, and `None` says that
+        # without making the row a different kind of thing.
+        "mode_latitude": None,
+        "mode_longitude": None,
+        "mean_latitude": None,
+        "mean_longitude": None,
+        "path_loss_exponent": None,
+        "reference_level_db": None,
+        "residual_rms_db": None,
+        "azimuth_span_deg": None,
+        "area_km2_50": None,
+        "area_km2_90": None,
+        "detection_count": 0,
+        "non_detection_count": 0,
+        "residuals": [],
+        "diagnostics": {},
+        # `geojson` is deliberately NOT defaulted here. It is stored as a
+        # serialized string, so seeding it with None writes the literal
+        # "null", which reads back as None where every consumer expects a
+        # mapping. Absent means absent for this one.
     }
 
     if not site["channels"]:
