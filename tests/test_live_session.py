@@ -353,6 +353,58 @@ def test_a_window_is_placed_at_its_midpoint_not_its_end(tmp_path: Path) -> None:
     assert max(longitudes) < 34.8100 + 10 * 60.0 / (111_320.0 * math.cos(math.radians(32.07)))
 
 
+class _GappyDrive(_Drive):
+    """A drive whose device drops every Nth read, as an overflow does."""
+
+    def __init__(self, *, overflow_every: int, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.overflow_every = overflow_every
+        self.reads = 0
+        self.overflow_count = 0
+
+    def read_stream_chunk(self, max_frames: int) -> np.ndarray:
+        self.reads += 1
+        if self.reads % self.overflow_every == 0:
+            # The clock and the car keep going; no samples arrive.
+            self.now += max_frames / RATE
+            self.overflow_count += 1
+            return np.empty(0, dtype=np.complex64)
+        return super().read_stream_chunk(max_frames)
+
+
+def test_binning_absorbs_driver_overflows(tmp_path: Path) -> None:
+    """Losing half the windows must not cost half the measurements.
+
+    This is what binning buys beyond decorrelation. At survey speeds a
+    150 m bin collects several windows, so dropping some still leaves
+    enough in each to average -- the redundancy is in the aggregation, not
+    in any one window.
+    """
+
+    def drive_once(name: str, overflow_every: int) -> tuple[int, int]:
+        connection = build_database(tmp_path / f"{name}.sqlite3")
+        drive = (
+            _Drive(start=(32.0700, 34.8100), east_step_m=30.0)
+            if overflow_every == 0
+            else _GappyDrive(
+                overflow_every=overflow_every, start=(32.0700, 34.8100), east_step_m=30.0
+            )
+        )
+        stats = _run(drive, connection, windows=40, settings=_settings())
+        connection.close()
+        return stats.bins_written, getattr(drive, "overflow_count", 0)
+
+    clean_bins, _ = drive_once("clean", 0)
+    gappy_bins, overflows = drive_once("gappy", 2)
+
+    assert clean_bins > 0
+    assert overflows > 0, "the fixture must actually drop reads"
+    assert gappy_bins >= clean_bins * 0.7, (
+        f"half the reads dropped cost {clean_bins - gappy_bins} of {clean_bins} bins; "
+        "the aggregation is supposed to absorb that"
+    )
+
+
 def test_live_settings_reject_impossible_configuration() -> None:
     with pytest.raises(ValueError, match="window_seconds"):
         LiveSettings(window_seconds=0.0).validate()
