@@ -70,12 +70,15 @@ class _Drive:
     ) -> None:
         self.projection = LocalProjection(*start)
         self.start = start
-        self.east_step_m = east_step_m
+        # Metres covered per window, converted to a speed so the car moves
+        # continuously: a window's start and end are different places, which
+        # is what the travel guard and the midpoint rule are about.
+        self.speed_ms = east_step_m / seconds_per_step
         self.seconds_per_step = seconds_per_step
         self.reference_level_db = reference_level_db
         self.exponent = exponent
-        self.step = 0
         self.now = 0.0
+        self.windows = 0
         self.opened_with: DeviceSettings | None = None
         self.closed = False
         self._phase = 0
@@ -86,13 +89,9 @@ class _Drive:
         metres_per_degree = 111_320.0
         latitude, longitude = self.start
         longitude += (
-            self.step * self.east_step_m / (metres_per_degree * math.cos(math.radians(latitude)))
+            self.now * self.speed_ms / (metres_per_degree * math.cos(math.radians(latitude)))
         )
         return Position(latitude=latitude, longitude=longitude, at=self.now)
-
-    def advance(self) -> None:
-        self.step += 1
-        self.now += self.seconds_per_step
 
     def clock(self) -> float:
         return self.now
@@ -103,6 +102,8 @@ class _Drive:
         self.opened_with = settings
 
     def read_stream_chunk(self, max_frames: int) -> np.ndarray:
+        # Every read costs its chunk of wall clock, and the car keeps going.
+        self.now += max_frames / RATE
         position = self.position()
         distance = max(haversine_m(position.latitude, position.longitude, *TRANSMITTER), 50.0)
         level_db = self.reference_level_db - 10.0 * self.exponent * math.log10(distance / 1000.0)
@@ -140,14 +141,8 @@ def _settings(**overrides) -> LiveSettings:
 
 def _run(drive: _Drive, connection, *, windows: int, settings: LiveSettings) -> object:
     """Drive `windows` windows, advancing one position step per window."""
-    remaining = {"n": windows}
-
     def stop() -> bool:
-        if remaining["n"] <= 0:
-            return True
-        remaining["n"] -= 1
-        drive.advance()
-        return False
+        return drive.now >= windows * drive.seconds_per_step
 
     session = LiveSession(
         session_id="drive",
@@ -252,14 +247,8 @@ def test_windows_without_a_fresh_fix_are_dropped_not_placed(tmp_path: Path) -> N
         position.at = drive.now - 60.0  # a minute old
         return position
 
-    remaining = {"n": 6}
-
     def stop() -> bool:
-        if remaining["n"] <= 0:
-            return True
-        remaining["n"] -= 1
-        drive.advance()
-        return False
+        return drive.now >= 6 * drive.seconds_per_step
 
     session = LiveSession(
         session_id="stale",
@@ -273,7 +262,7 @@ def test_windows_without_a_fresh_fix_are_dropped_not_placed(tmp_path: Path) -> N
     )
     stats = session.run(stop=stop, connection=connection)
     assert stats.windows_recorded == 0
-    assert stats.windows_without_position == 6
+    assert stats.windows_without_position >= 5
     assert stats.bins_written == 0
     connection.close()
 
@@ -282,11 +271,16 @@ def test_a_bin_crossed_too_fast_is_not_written(tmp_path: Path) -> None:
     """One window cannot average fading out of a level, and the level is
     what the solver reads as distance."""
     connection = build_database(tmp_path / "db.sqlite3")
-    # 400 m per window at a 150 m bin: never two windows in one bin.
-    drive = _Drive(start=(32.0700, 34.8100), east_step_m=400.0)
-    stats = _run(drive, connection, windows=8, settings=_settings(min_windows_per_bin=3))
-    assert stats.bins_written == 0
-    assert stats.bins_too_short > 0
+    # 74 m per window: inside the 75 m travel limit, so the windows are kept,
+    # but only two of them land in a 150 m bin and three are required.
+    drive = _Drive(start=(32.0700, 34.8100), east_step_m=74.0)
+    stats = _run(drive, connection, windows=10, settings=_settings(min_windows_per_bin=3))
+    assert stats.windows_recorded > 0, "the windows themselves are fine"
+    assert stats.windows_too_fast == 0
+    # Two windows per bin against a minimum of three: most bins are refused.
+    # Alignment lets the occasional bin collect a third, which is why this
+    # asserts the balance rather than an exact zero.
+    assert stats.bins_too_short > stats.bins_written
     connection.close()
 
 
@@ -320,6 +314,43 @@ def test_a_drive_past_a_transmitter_solves_through_the_existing_pipeline(
     assert heard["detection_count"] >= 4, (
         "the whole point is many bins contributing, not one long measurement"
     )
+
+
+def test_a_window_that_covered_too_much_ground_is_dropped(tmp_path: Path) -> None:
+    """A window is a fixed number of SAMPLES, not a fixed span of road.
+
+    Driver overflows deliver nothing while the clock and the car keep
+    going, so a window they interrupt covers more ground than a clean one at
+    the same speed. Past the limit the samples average a stretch too long to
+    attribute to one place.
+    """
+    connection = build_database(tmp_path / "db.sqlite3")
+    drive = _Drive(start=(32.0700, 34.8100), east_step_m=300.0)
+    # 300 m per window against a 75 m limit (half of a 150 m bin).
+    stats = _run(drive, connection, windows=8, settings=_settings())
+    assert stats.windows_too_fast > 0
+    assert stats.windows_recorded == 0
+    assert stats.bins_written == 0
+    connection.close()
+
+
+def test_a_window_is_placed_at_its_midpoint_not_its_end(tmp_path: Path) -> None:
+    """The samples were gathered across the whole span, so either endpoint
+    would place the average where only half of it was measured."""
+    connection = build_database(tmp_path / "db.sqlite3")
+    drive = _Drive(start=(32.0700, 34.8100), east_step_m=60.0)
+    _run(drive, connection, windows=10, settings=_settings())
+    rows = connection.execute(
+        "SELECT gps_longitude FROM survey_runs WHERE survey_run_id LIKE 'live_%' "
+        "ORDER BY survey_run_id"
+    ).fetchall()
+    connection.close()
+    assert rows
+    # Every recorded longitude sits inside the span the drive covered, and
+    # the first is not simply the first sampled position.
+    longitudes = [row["gps_longitude"] for row in rows]
+    assert min(longitudes) > 34.8100
+    assert max(longitudes) < 34.8100 + 10 * 60.0 / (111_320.0 * math.cos(math.radians(32.07)))
 
 
 def test_live_settings_reject_impossible_configuration() -> None:

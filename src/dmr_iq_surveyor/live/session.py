@@ -33,6 +33,7 @@ import numpy as np
 
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.device import DeviceSettings, IqDevice, SoapyIqDevice
+from dmr_iq_surveyor.geo.model import haversine_m
 from dmr_iq_surveyor.live.bins import DEFAULT_BIN_SIZE_M, BinGrid, BinVisit
 from dmr_iq_surveyor.spectrum.core import SpectrumSettings, fft_frame_count
 from dmr_iq_surveyor.survey.discovery import (
@@ -85,6 +86,20 @@ class LiveSettings:
     # fix would put the measurement where the receiver used to be, which is
     # the one error that corrupts a campaign without looking wrong.
     max_position_age_seconds: float = 5.0
+    # How far the receiver may travel while one window fills. A window is a
+    # fixed number of SAMPLES, not a fixed span of road: driver overflows
+    # deliver nothing while the clock and the car keep going, so a window
+    # interrupted by them covers more ground than a clean one at the same
+    # speed. Past this the samples are an average over a stretch too long to
+    # attribute to one place, and the window is dropped rather than smeared
+    # across it. `None` derives it from the bin size, which is the length
+    # scale the whole aggregation is built on.
+    max_window_travel_m: float | None = None
+
+    def travel_limit_m(self) -> float:
+        if self.max_window_travel_m is not None:
+            return float(self.max_window_travel_m)
+        return self.bin_size_m / 2.0
     # FFT frames analysed per window. Not every frame: a 65536-point FFT
     # over a full second at 5 MS/s is about 150 transforms, which a Pi
     # cannot finish inside the second it took to record. Spreading a bounded
@@ -125,6 +140,9 @@ class LiveSettings:
 class LiveStats:
     windows_recorded: int = 0
     windows_without_position: int = 0
+    # Windows dropped because the receiver covered too much ground while
+    # they filled -- at speed, or because overflows stretched them.
+    windows_too_fast: int = 0
     windows_revisited: int = 0
     bins_written: int = 0
     bins_too_short: int = 0
@@ -229,8 +247,13 @@ class LiveSession:
         # length, never by how long the drive lasts.
         buffer = np.empty(window_frames, dtype=np.complex64)
         filled = 0
+        started_at: Position | None = None
         try:
             while not stop():
+                if filled == 0:
+                    # Where the window began. Its measurement belongs midway
+                    # between here and where it ends, not at either end.
+                    started_at = self.position_provider()
                 chunk = np.asarray(
                     resolved_device.read_stream_chunk(
                         min(self.settings.chunk_frames, window_frames - filled)
@@ -242,24 +265,45 @@ class LiveSession:
                     filled += take
                 if filled < window_frames:
                     continue
-                self._consume_window(buffer, connection)
+                self._consume_window(buffer, started_at, connection)
                 filled = 0
+                started_at = None
         finally:
             self.stats.overflow_count = int(getattr(resolved_device, "overflow_count", 0))
             self._close_visit(connection)
             resolved_device.close()
         return self.stats
 
-    def _consume_window(self, samples: np.ndarray, connection: Any) -> None:
-        position = self.position_provider()
-        if position is None or (
-            self.clock() - position.at > self.settings.max_position_age_seconds
+    def _consume_window(
+        self, samples: np.ndarray, started_at: Position | None, connection: Any
+    ) -> None:
+        ended_at = self.position_provider()
+        if (
+            ended_at is None
+            or started_at is None
+            or self.clock() - ended_at.at > self.settings.max_position_age_seconds
         ):
             # Recorded, not guessed at. A window with no fresh fix cannot be
             # placed, and placing it at the last known position is exactly
             # how a drive would smear measurements onto a spot it had left.
             self.stats.windows_without_position += 1
             return
+
+        travelled = haversine_m(
+            started_at.latitude, started_at.longitude, ended_at.latitude, ended_at.longitude
+        )
+        if travelled > self.settings.travel_limit_m():
+            self.stats.windows_too_fast += 1
+            return
+
+        # The midpoint, because the samples were gathered across the whole
+        # span. Either endpoint would place the average where only half of
+        # it was measured.
+        position = Position(
+            latitude=(started_at.latitude + ended_at.latitude) / 2.0,
+            longitude=(started_at.longitude + ended_at.longitude) / 2.0,
+            at=ended_at.at,
+        )
 
         if self._grid is None:
             anchor_lat = self.settings.grid_anchor_latitude
