@@ -793,9 +793,7 @@ async function startDrive() {
     const job = await api("/api/live/start", {
       method: "POST",
       body: JSON.stringify({
-        bin_size_m: Number($("#drive-bin").value),
         max_seconds: Number($("#drive-minutes").value) * 60,
-        solve_every_bins: Number($("#drive-solve-every").value),
         center_frequency_hz: Number($("#center").value) * 1e6,
         sample_rate_hz: Number($("#rate").value) * 1e6,
         if_gain_reduction_db: Number($("#ifgr").value),
@@ -814,6 +812,19 @@ async function startDrive() {
   }
 }
 
+async function solveNow() {
+  const button = $("#drive-solve");
+  button.disabled = true;
+  try {
+    const result = await api("/api/live/solve", { method: "POST", body: "{}" });
+    if (!result.started) jobLog("solve not started: " + result.reason);
+  } catch (error) {
+    alert("Could not solve: " + error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function stopDrive() {
   if (!live.jobId) return;
   $("#drive-stop").disabled = true;
@@ -829,6 +840,8 @@ async function stopDrive() {
 const DRIVE_STATS = [
   ["bins_written", "bins measured"],
   ["windows_recorded", "windows used"],
+  ["bins_analysed_inline", "bins that stalled the stream"],
+  ["bins_failed", "bins lost to an error"],
   ["bins_capped", "bins filled while stopped"],
   ["windows_dwelled", "windows while parked"],
   ["windows_revisited", "windows on measured road"],
@@ -843,6 +856,8 @@ function renderLive(payload) {
   const running = Boolean(payload.running);
   $("#drive-start").hidden = running;
   $("#drive-stop").hidden = !running;
+  $("#drive-solve").hidden = !running;
+  $("#drive-solve").disabled = Boolean(payload.solving);
   if (!running) $("#drive-start").disabled = !window.isSecureContext;
   if (running && payload.job_id) live.jobId = payload.job_id;
 
@@ -864,6 +879,14 @@ function renderLive(payload) {
   }
 
   const stats = payload.stats || {};
+  const span = $("#drive-span");
+  if (stats.bin_size_m) {
+    span.textContent =
+      `${Math.round(stats.bin_size_m)} m per measurement` +
+      (stats.speed_kmh ? ` · ${Math.round(stats.speed_kmh)} km/h` : "");
+  } else if (!running) {
+    span.textContent = "follows your speed";
+  }
   const box = $("#drive-stats");
   box.replaceChildren();
   const shown = { ...stats };
@@ -1036,6 +1059,7 @@ function wireUi() {
     else stopLocationSharing();
   });
   $("#drive-start").addEventListener("click", startDrive);
+  $("#drive-solve").addEventListener("click", solveNow);
   $("#drive-stop").addEventListener("click", stopDrive);
   for (const [id, format] of [["#export-kml", "kml"], ["#export-gpx", "gpx"]]) {
     $(id).addEventListener("click", () => {

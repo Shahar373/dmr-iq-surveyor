@@ -36,7 +36,16 @@ import numpy as np
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.device import DeviceSettings, IqDevice, SoapyIqDevice
 from dmr_iq_surveyor.geo.model import haversine_m
-from dmr_iq_surveyor.live.bins import DEFAULT_BIN_SIZE_M, BinGrid, BinKey, BinVisit
+from dmr_iq_surveyor.live.bins import (
+    DEFAULT_BIN_SIZE_M,
+    DEFAULT_LEDGER_CELL_M,
+    MAX_ADAPTIVE_BIN_M,
+    MIN_ADAPTIVE_BIN_M,
+    BinGrid,
+    BinKey,
+    BinVisit,
+    adaptive_bin_size_m,
+)
 from dmr_iq_surveyor.spectrum.core import SpectrumSettings, fft_frame_count
 from dmr_iq_surveyor.survey.discovery import (
     accumulate_segment_spectrum,
@@ -108,11 +117,37 @@ class LiveSettings:
     # across it. `None` derives it from the bin size, which is the length
     # scale the whole aggregation is built on.
     max_window_travel_m: float | None = None
+    # Let the measurement span follow the speed instead of being one fixed
+    # size. A 150 m bin is a compromise between a town, where it is most of a
+    # street and the drive could afford twice the detail, and an open road,
+    # where a car crosses it in five windows. With this on, the span is the
+    # road it takes to gather `max_windows_per_bin` windows -- so a
+    # measurement always averages the same amount of signal -- clamped to
+    # [min_bin_size_m, max_bin_size_m] because the fading physics does not
+    # care how fast the car is going.
+    #
+    # `bin_size_m` then stops being the grid: the grid becomes a fixed ledger
+    # of `ledger_cell_m` squares recording which road has been measured, and a
+    # measurement claims every cell its windows fell in. That is what keeps
+    # variable spans from overlapping -- two measurements can never cover the
+    # same ground, at any speed, on any day.
+    adaptive_bin_size: bool = False
+    ledger_cell_m: float = DEFAULT_LEDGER_CELL_M
+    min_bin_size_m: float = MIN_ADAPTIVE_BIN_M
+    max_bin_size_m: float = MAX_ADAPTIVE_BIN_M
 
     def travel_limit_m(self) -> float:
         if self.max_window_travel_m is not None:
             return float(self.max_window_travel_m)
-        return self.bin_size_m / 2.0
+        # Half the smallest measurement the configuration can produce: a
+        # window that covered more than that cannot be attributed to one
+        # place whichever span the speed happens to have chosen.
+        smallest = self.min_bin_size_m if self.adaptive_bin_size else self.bin_size_m
+        return smallest / 2.0
+
+    def grid_cell_m(self) -> float:
+        """The square the ledger is kept in -- fine when spans vary."""
+        return self.ledger_cell_m if self.adaptive_bin_size else self.bin_size_m
     # FFT frames analysed per window. Not every frame: a 65536-point FFT
     # over a full second at 5 MS/s is about 150 transforms, which a Pi
     # cannot finish inside the second it took to record. Spreading a bounded
@@ -143,6 +178,15 @@ class LiveSettings:
             raise ValueError("window_seconds must be positive")
         if self.bin_size_m <= 0:
             raise ValueError("bin_size_m must be positive")
+        if self.adaptive_bin_size:
+            if self.ledger_cell_m <= 0:
+                raise ValueError("ledger_cell_m must be positive")
+            if not 0 < self.min_bin_size_m <= self.max_bin_size_m:
+                raise ValueError("min_bin_size_m must be positive and at most max_bin_size_m")
+            if self.ledger_cell_m > self.min_bin_size_m:
+                # Otherwise the smallest measurement would not even fill one
+                # ledger cell, and the ledger could not tell two of them apart.
+                raise ValueError("ledger_cell_m must not exceed min_bin_size_m")
         if self.min_windows_per_bin < 1:
             raise ValueError("min_windows_per_bin must be at least 1")
         if self.max_windows_per_bin < self.min_windows_per_bin:
@@ -193,6 +237,10 @@ class LiveStats:
     # end the drive: the road is being driven now and cannot be re-driven.
     bins_failed: int = 0
     last_error: str = ""
+    # The span the speed last asked for, and the speed it was asked at, so an
+    # operator can see the adaptation working rather than infer it.
+    bin_size_m: float = 0.0
+    speed_kmh: float = 0.0
     observations_written: int = 0
     overflow_count: int = 0
     # True when no campaign anchor was configured and the grid fell back to
@@ -267,6 +315,10 @@ class LiveSession:
         # be written. Depth one on the way in: a deeper queue would hold more
         # spectra than the Pi can spare, and the back-pressure it creates is
         # handled by analysing inline rather than by dropping a measurement.
+        # Smoothed ground speed, from the positions themselves rather than
+        # from whatever the phone reports: `coords.speed` is often null, and
+        # a single window's estimate jumps around with GPS noise.
+        self._speed_ms: float | None = None
         self._to_analyse: queue.Queue[BinVisit | None] | None = None
         self._analysed: queue.Queue[tuple[BinVisit, Any] | None] = queue.Queue()
 
@@ -387,15 +439,24 @@ class LiveSession:
                 anchor_lat, anchor_lon = position.latitude, position.longitude
                 self.stats.anchor_from_first_fix = True
             self._grid = BinGrid(
-                anchor_lat, anchor_lon, bin_size_m=self.settings.bin_size_m
+                anchor_lat, anchor_lon, bin_size_m=self.settings.grid_cell_m()
             )
+        self._note_speed(travelled, ended_at.at - started_at.at)
         key = self._grid.key_for(position.latitude, position.longitude)
 
-        if self._visit is not None and self._visit.key != key:
-            self._close_visit(connection)
+        # Fixed spans close when the receiver leaves the square. Adaptive ones
+        # close on distance travelled instead, so the square is only a ledger
+        # of measured road and a measurement may span several of them.
+        if self._visit is not None and not self.settings.adaptive_bin_size:
+            if self._visit.key != key:
+                self._close_visit(connection)
         if key != self._dwell_key:
             self._dwell_key = None
         if self._grid.already_measured(key):
+            # Measured road. Whatever is open ends here rather than reaching
+            # across it, so a measurement never straddles ground that already
+            # has one.
+            self._close_visit(connection)
             if self._dwell_key is not None:
                 self.stats.windows_dwelled += 1
             else:
@@ -405,7 +466,12 @@ class LiveSession:
             # transforms at all once its bin is complete.
             return
         if self._visit is None:
-            self._visit = BinVisit(key=key, started_utc=datetime.now(UTC).isoformat())
+            self._visit = BinVisit(
+                key=key,
+                started_utc=datetime.now(UTC).isoformat(),
+                origin=(position.latitude, position.longitude),
+                span_target_m=self._span_target_m(),
+            )
 
         spectrum = self._analyse(samples)
         if spectrum is None:
@@ -413,6 +479,7 @@ class LiveSession:
         self._visit.spectra.append(spectrum)
         self._visit.latitudes.append(position.latitude)
         self._visit.longitudes.append(position.longitude)
+        self._visit.cells.add(key)
         self.stats.windows_recorded += 1
         if self._visit.window_count >= self.settings.max_windows_per_bin:
             # Full. Closed here rather than when the receiver moves off, so
@@ -422,6 +489,46 @@ class LiveSession:
             self._dwell_key = key
             self.stats.bins_capped += 1
             self._close_visit(connection)
+        elif (
+            self.settings.adaptive_bin_size
+            and self._visit.travelled_m() >= self._visit.span_target_m
+        ):
+            # Enough road for one measurement at this speed.
+            self._close_visit(connection)
+
+    def _note_speed(self, travelled_m: float, seconds: float) -> None:
+        # The interval between a window's first and last fix is supposed to be
+        # one window. Much shorter than that and the fixes are not what they
+        # claim -- two readings stamped at the same moment, a clock that
+        # jumped, a phone replaying a cached position -- and dividing by it
+        # yields the speed of a car that does not exist. Skipped rather than
+        # smoothed in: one absurd sample would choose the span for the bins
+        # after it too.
+        if seconds < self.settings.window_seconds * 0.5:
+            return
+        instant = travelled_m / seconds
+        # Exponential smoothing over roughly five windows. A single window's
+        # estimate swings with GPS noise, and the span it would choose would
+        # swing with it -- producing measurements of wildly different lengths
+        # along one steady stretch of road.
+        self._speed_ms = (
+            instant if self._speed_ms is None else 0.8 * self._speed_ms + 0.2 * instant
+        )
+        self.stats.speed_kmh = round(self._speed_ms * 3.6, 1)
+
+    def _span_target_m(self) -> float:
+        if not self.settings.adaptive_bin_size:
+            self.stats.bin_size_m = self.settings.bin_size_m
+            return self.settings.bin_size_m
+        span = adaptive_bin_size_m(
+            self._speed_ms or 0.0,
+            window_seconds=self.settings.window_seconds,
+            windows_per_bin=self.settings.max_windows_per_bin,
+            minimum_m=self.settings.min_bin_size_m,
+            maximum_m=self.settings.max_bin_size_m,
+        )
+        self.stats.bin_size_m = round(span, 1)
+        return span
 
     def _analyse(self, samples: np.ndarray) -> Any:
         starts = _window_frame_starts(samples.size, self.settings)
@@ -458,8 +565,10 @@ class LiveSession:
         # Claimed the moment the bin is finished, not when its row is written.
         # The receiver can re-enter it while the analysis is still queued, and
         # a second visit to a bin already being measured is exactly the
-        # duplicate the grid exists to prevent.
-        self._grid.mark_measured(visit.key)
+        # duplicate the grid exists to prevent. EVERY cell the windows fell in
+        # is claimed, not just the one the id is built from: a measurement
+        # spanning 200 m of road has measured all 200 m of it.
+        self._grid.mark_all_measured(visit.cells or {visit.key})
 
         if self._to_analyse is not None:
             try:
@@ -566,7 +675,10 @@ class LiveSession:
                 "grid_anchor": list(self._grid.anchor),
                 "bin_x": visit.key.x,
                 "bin_y": visit.key.y,
-                "bin_size_m": self.settings.bin_size_m,
+                "bin_size_m": round(visit.span_target_m or self.settings.bin_size_m, 1),
+                "adaptive_bin_size": self.settings.adaptive_bin_size,
+                "ledger_cell_m": self._grid.bin_size_m,
+                "cells": len(visit.cells) or 1,
                 "window_seconds": self.settings.window_seconds,
                 "position_spread_m": round(visit.spread_m(), 1),
             },

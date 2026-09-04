@@ -14,7 +14,15 @@ from dmr_iq_surveyor.capture.device import DeviceSettings
 from dmr_iq_surveyor.geo.model import LocalProjection, haversine_m
 from dmr_iq_surveyor.geo.pipeline import materialise_measurements, solve_all_sites
 from dmr_iq_surveyor.geo.store import connect_geo_database
-from dmr_iq_surveyor.live.bins import BinGrid, BinKey, anchor_tag
+from dmr_iq_surveyor.live.bins import (
+    DEFAULT_BIN_SIZE_M,
+    MAX_ADAPTIVE_BIN_M,
+    MIN_ADAPTIVE_BIN_M,
+    BinGrid,
+    BinKey,
+    adaptive_bin_size_m,
+    anchor_tag,
+)
 from dmr_iq_surveyor.live.session import (
     LiveSession,
     LiveSettings,
@@ -603,3 +611,127 @@ def test_one_bin_whose_analysis_fails_does_not_end_the_drive(tmp_path: Path) -> 
     assert "synthetic detector failure" in stats.last_error
     assert stats.bins_written >= 2, "the bins either side of the failure must survive"
     assert len(_written(database)) == stats.bins_written
+
+
+# --------------------------------------------------------- adaptive spans
+
+
+def test_the_span_follows_the_speed_between_its_two_limits() -> None:
+    """The road it takes to gather ten windows -- clamped, because the fading
+    physics does not care how fast the car is going."""
+    def span(kmh, low=50.0, high=400.0):
+        return adaptive_bin_size_m(
+            kmh / 3.6, window_seconds=1.0, windows_per_bin=10,
+            minimum_m=low, maximum_m=high,
+        )
+
+    assert span(30.0) == pytest.approx(83.3, abs=0.5)
+    assert span(50.0) == pytest.approx(138.9, abs=0.5)
+    assert span(110.0) == pytest.approx(305.6, abs=0.5)
+    assert span(30.0, low=100.0) == 100.0, "the floor holds: closer would not be independent"
+    assert span(110.0, high=150.0) == 150.0, "the ceiling holds"
+    assert span(0.0, low=100.0) == 100.0, "standing still asks for the smallest legal span"
+
+
+def test_the_shipped_limits_never_measure_over_more_road_than_the_fixed_mode() -> None:
+    """Adapting DOWN in a town buys detail; adapting UP on a motorway costs
+    measurements over the same road, measured. So the ceiling is the size the
+    fixed mode was validated at, and the adaptation only ever shortens."""
+    assert MIN_ADAPTIVE_BIN_M == 100.0
+    assert MAX_ADAPTIVE_BIN_M == DEFAULT_BIN_SIZE_M == 150.0
+
+
+def test_an_adaptive_drive_makes_bigger_bins_when_it_goes_faster(tmp_path: Path) -> None:
+    slow, fast = {}, {}
+    for speed_ms, into in ((9.0, slow), (28.0, fast)):
+        database = tmp_path / f"{speed_ms}.sqlite3"
+        connection = build_database(database)
+        drive = _Drive(start=(32.0700, 34.8000), east_step_m=speed_ms)
+        settings = _settings(
+            min_windows_per_bin=2,
+            max_windows_per_bin=10,
+            adaptive_bin_size=True,
+            ledger_cell_m=50.0,
+        )
+        stats = _run(drive, connection, windows=40, settings=settings)
+        connection.close()
+        into["stats"] = stats
+        into["spans"] = _spans(database)
+
+    assert slow["spans"] and fast["spans"]
+    assert max(slow["spans"]) < min(fast["spans"]), (
+        f"slow drive spans {sorted(set(slow['spans']))}, fast {sorted(set(fast['spans']))} -- "
+        "the faster drive must measure over more road, not less"
+    )
+    assert min(slow["spans"]) >= 100.0 and max(fast["spans"]) <= 150.0
+
+
+def _spans(database: Path) -> list[float]:
+    import json
+
+    connection = connect_geo_database(database)
+    try:
+        return [
+            json.loads(row["settings_json"] or "{}")["bin_size_m"]
+            for row in connection.execute(
+                "SELECT settings_json FROM survey_runs WHERE survey_run_id LIKE 'live_%'"
+            )
+        ]
+    finally:
+        connection.close()
+
+
+def test_variable_spans_never_measure_the_same_road_twice(tmp_path: Path) -> None:
+    """The whole reason the grid became a fine ledger. With spans that change
+    with speed, two measurements of different lengths could otherwise overlap
+    -- and two measurements of one place are the correlated evidence the
+    binning exists to keep out of the posterior."""
+    database = tmp_path / "there_and_back.sqlite3"
+    connection = build_database(database)
+    drive = _ThereAndBack(start=(32.0700, 34.8000), east_step_m=25.0, turn_seconds=20.0)
+    settings = _settings(
+        min_windows_per_bin=2, max_windows_per_bin=10, adaptive_bin_size=True
+    )
+    session = _session(drive, settings)
+    stats = session.run(stop=lambda: drive.now >= 40.0, connection=connection)
+    connection.close()
+
+    assert stats.bins_written >= 2
+    assert stats.windows_revisited > 0, "the return leg must actually re-enter measured road"
+    # Every ledger cell is claimed by exactly one measurement: the grid's own
+    # set is the proof, since a cell can only be added once.
+    grid = session._grid
+    assert grid is not None
+    claimed = grid.measured_count
+    assert claimed >= stats.bins_written
+    positions = _positions(database)
+    for i, (lat_a, lon_a) in enumerate(positions):
+        for lat_b, lon_b in positions[i + 1 :]:
+            assert haversine_m(lat_a, lon_a, lat_b, lon_b) > 40.0, (
+                "two measurements landed on top of each other"
+            )
+
+
+def _positions(database: Path) -> list[tuple[float, float]]:
+    connection = connect_geo_database(database)
+    try:
+        return [
+            (row["gps_latitude"], row["gps_longitude"])
+            for row in connection.execute(
+                "SELECT gps_latitude, gps_longitude FROM survey_runs "
+                "WHERE survey_run_id LIKE 'live_%'"
+            )
+        ]
+    finally:
+        connection.close()
+
+
+def test_a_fixed_span_drive_is_unchanged_by_the_adaptive_code(tmp_path: Path) -> None:
+    """Adaptive spans are opt-in. With them off, the grid is still the bin."""
+    database = tmp_path / "fixed.sqlite3"
+    connection = build_database(database)
+    drive = _Drive(start=(32.0700, 34.8000), east_step_m=60.0)
+    stats = _run(drive, connection, windows=14, settings=_settings(min_windows_per_bin=2))
+    connection.close()
+    assert stats.bins_written > 0
+    assert set(_spans(database)) == {150.0}

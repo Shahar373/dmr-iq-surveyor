@@ -524,20 +524,44 @@ the exclusions, the common-mode check and the next-stop planner consume a drive 
 happened.
 
 Open the app over HTTPS on the phone, go to the **Drive** tab, tap *Share my location*, then *Start
-drive*. Bins appear on the map as they are written and the credible regions are re-solved in the
-background every few bins, so the polygons shrink while you are still driving. Stopping the drive
-runs a final solve.
+drive*. Bins appear on the map as they are written. **Solve now** refreshes the credible regions
+when you ask for it — bins are written the whole time either way, and a solve only decides when the
+map catches up with them, at the cost of CPU the receiver is competing for. Stopping the drive runs
+a final solve. Set `live_solve_every_bins` above zero to have it happen on its own.
 
 Two length scales decide the design, and neither is adjustable by taste:
 
 - **A window is one second.** At 50 km/h that is 14 m, about 40 wavelengths at 868 MHz — the
   drive-test convention for averaging fast (multipath) fading out of a level to recover the local
   mean, which is the quantity the path-loss model is written in.
-- **A bin is 150 m.** Shadow fading decorrelates over roughly 10–50 m in a city and 100–200 m in
-  suburbs. Feeding the solver a measurement per second would treat a thousand correlated samples as
-  a thousand independent constraints and shrink a region by a factor near 240, almost all of it
-  fabricated. A bin is measured once; driving the same street again lands on the same id and
-  replaces it rather than adding near-identical evidence beside it.
+- **A measurement spans 100–150 m, chosen by speed.** Shadow fading decorrelates over roughly
+  10–50 m in a city and 100–200 m in suburbs. Feeding the solver a measurement per second would
+  treat a thousand correlated samples as a thousand independent constraints and shrink a region by
+  a factor near 240, almost all of it fabricated. The span is the road it takes to gather ten
+  windows, clamped: 100 m below about 36 km/h, 150 m above about 54 km/h. The adaptation only ever
+  *shortens*, and that is measured rather than assumed — on the Route 471 corridor (6.9 km,
+  40–110 km/h), raising the ceiling costs measurements over the same road and the region grows with
+  it:
+
+  | span | bins | 90% region | error |
+  |---|---|---|---|
+  | fixed 150 m | 54 | 7.19 km² | 40 m |
+  | adaptive 100–150 m | 40 | 17.55 km² | 40 m |
+  | adaptive 100–200 m | 36 | 20.58 km² | 40 m |
+  | adaptive 100–250 m | 33 | 29.91 km² | 40 m |
+
+  Nothing here is biased — the location error is 40 m throughout — but that simulation cannot say
+  which region is *calibrated*, because its levels are a deterministic function of distance plus
+  white noise, with no spatially correlated fading. In it every extra measurement is genuinely
+  independent, so more of them legitimately means a smaller region; real fading is correlated, so
+  some of the fixed mode's advantage is bought from neighbours that are not. That is an argument for
+  the floor, which is set on the physics — not a licence to widen the ceiling past a size that
+  demonstrably costs geometry.
+
+  Underneath, the grid is a fixed 50 m ledger of measured road, not the measurement size. That is
+  what lets spans vary without ever overlapping: a measurement claims every cell its windows fell
+  in, and road that has been measured is never measured again — at any speed, on any day. Set
+  `live_adaptive_bins: false` for one fixed size.
 
 The detector scans every raster step of the band once per window in a bin, so closing a bin is
 seconds of arithmetic — and every one of those seconds is a second the SDR is not being read. It

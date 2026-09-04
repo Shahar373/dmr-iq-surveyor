@@ -215,6 +215,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._start(lambda: self.service.start_solve(payload))
             elif path == "/api/live/start":
                 self._start(lambda: self.service.start_live(payload))
+            elif path == "/api/live/solve":
+                self._send_json(self.service.request_live_solve())
             elif path == "/api/live/position":
                 # Posted about once a second for a whole drive, so it stays
                 # the cheapest handler here: validate, store, answer.

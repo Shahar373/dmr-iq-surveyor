@@ -123,21 +123,20 @@
 
     <div class="row">
       <div class="field">
-        <label for="drive-bin">Bin size (m)</label>
-        <input id="drive-bin" type="number" min="25" step="25" value="150">
-      </div>
-      <div class="field">
         <label for="drive-minutes">Stop after (min)</label>
         <input id="drive-minutes" type="number" min="1" step="5" value="60">
       </div>
-      <div class="field">
-        <label for="drive-solve-every">Re-solve every (bins)</label>
-        <input id="drive-solve-every" type="number" min="1" step="1" value="5">
+      <div class="field grow">
+        <label>Measurement span</label>
+        <div id="drive-span" class="readout">follows your speed</div>
       </div>
     </div>
     <p class="hint">
-      A bin is measured once. Below about 150 m consecutive measurements stop being independent
-      evidence and the regions shrink faster than the data earns.
+      Each measurement covers the road it takes to gather ten windows — about 100 m crawling
+      through a town, about 250 m on an open road — so every one averages the same amount of
+      signal. It is clamped at both ends: below ~100 m two measurements are the same measurement,
+      above ~250 m one measurement covers more ground than it can be pinned to. Road that has been
+      measured is never measured again.
     </p>
     <p class="hint">
       Centre frequency and gain come from the <b>Record</b> tab — deliberately the same numbers a
@@ -147,8 +146,14 @@
 
     <div class="row buttons">
       <button id="drive-start" class="primary big">Start drive</button>
+      <button id="drive-solve" hidden>Solve now</button>
       <button id="drive-stop" class="danger" hidden>Stop drive</button>
     </div>
+    <p class="hint">
+      Bins are written the whole time you drive. <b>Solve now</b> only decides when the map catches
+      up with them — it costs the Pi a few seconds to a few minutes of CPU, which the receiver is
+      competing with, so ask for it at a red light rather than mid-overtake.
+    </p>
     <div id="drive-status" class="notice" hidden></div>
     <div id="drive-stats"></div>
   </div>

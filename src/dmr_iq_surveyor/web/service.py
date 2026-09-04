@@ -202,10 +202,21 @@ class FieldSettings:
     # bind on a Pi.
     live_fft_size: int = 16_384
     live_frames_per_window: int = 24
-    # Re-solve after this many new bins. Solving is minutes of CPU across a
-    # campaign's sites, so it runs on its own thread while the stream keeps
-    # going; too often and the Pi never finishes one before the next is due.
-    live_solve_every_bins: int = 5
+    # Re-solve automatically after this many new bins. Zero -- the default --
+    # means never: the operator asks for a solve when they want one. Solving
+    # is seconds to minutes of CPU across a campaign's sites, and although it
+    # runs on its own thread while the stream keeps going, it still competes
+    # for the Pi's cores and every core it takes is overflows on the stream.
+    # Bins are being written the whole time either way; what a solve buys is
+    # only seeing them, and that is a decision worth leaving to the person in
+    # the car. Set it above zero to have it happen on its own.
+    live_solve_every_bins: int = 0
+    # Let the measurement span follow the speed: about 100 m crawling through
+    # a town, about 250 m on an open road, so every measurement averages the
+    # same number of windows instead of five on a motorway and eighteen in
+    # traffic. The grid underneath becomes a fixed 50 m ledger of measured
+    # road, which is what stops variable spans from ever overlapping.
+    live_adaptive_bins: bool = True
     # Backstop only, not a plan: a drive normally ends when the operator
     # stops it. Without a cap a forgotten session holds the SDR and burns
     # the battery until the Pi is found.
@@ -960,6 +971,9 @@ class FieldService:
             max_position_age_seconds=float(
                 given.get("max_position_age_seconds", self.settings.live_max_position_age_seconds)
             ),
+            adaptive_bin_size=bool(
+                given.get("adaptive_bin_size", self.settings.live_adaptive_bins)
+            ),
             fft_size=int(given.get("fft_size", self.settings.live_fft_size)),
             frames_per_window=int(
                 given.get("frames_per_window", self.settings.live_frames_per_window)
@@ -1042,8 +1056,11 @@ class FieldService:
             raise ValueError(f"profile could not be resolved: {exc}") from exc
 
         max_seconds = float(payload.get("max_seconds") or self.settings.live_max_seconds)
-        solve_every = max(1, int(payload.get("solve_every_bins")
-                                 or self.settings.live_solve_every_bins))
+        # Zero means "only when asked". Kept as zero rather than clamped to
+        # one, or the default would silently become "solve after every bin".
+        solve_every = max(0, int(
+            payload.get("solve_every_bins", self.settings.live_solve_every_bins) or 0
+        ))
         session_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
 
         # Cleared BEFORE the job is submitted, because submitting starts the
@@ -1108,7 +1125,7 @@ class FieldService:
                 progress=min(0.95, 0.02 + written / 200.0),
                 extra={"bin": info},
             )
-            if written % solve_every == 0:
+            if solve_every and written % solve_every == 0:
                 self._start_live_solve(job)
 
         def stop() -> bool:
@@ -1168,6 +1185,26 @@ class FieldService:
         with self._live_lock:
             pending, self._live_pending_runs = self._live_pending_runs, []
         return pending
+
+    def request_live_solve(self) -> dict[str, Any]:
+        """Solve now, on the operator's word, while the drive keeps running.
+
+        The counterpart to `live_solve_every_bins = 0`: bins are written
+        continuously whatever happens here, and this only decides when the
+        map catches up with them.
+        """
+        job = self.jobs.active_job()
+        if job is None or job.kind != "live":
+            raise ValueError(
+                "no drive is running; use the ordinary re-solve, which reads the same "
+                "measurements"
+            )
+        with self._live_lock:
+            already = self._live_solving
+        if already:
+            return {"started": False, "reason": "a solve is already running"}
+        self._start_live_solve(job)
+        return {"started": True, "reason": ""}
 
     def _start_live_solve(self, job: Job) -> None:
         """Re-solve on a side thread while the drive keeps streaming.

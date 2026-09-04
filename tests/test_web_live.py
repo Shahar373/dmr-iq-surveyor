@@ -386,3 +386,72 @@ def test_starting_a_drive_over_http_without_gps_is_a_client_error(tmp_path: Path
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_solving_is_asked_for_rather_than_automatic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bins are written the whole drive either way; a solve only decides when
+    the map catches up. It competes with the receiver for the Pi's cores, so
+    the default is to leave the timing to the person in the car."""
+    service = _service(tmp_path)
+    assert service.settings.live_solve_every_bins == 0
+
+    with pytest.raises(ValueError, match="no drive is running"):
+        service.request_live_solve()
+
+    solves: list[str] = []
+    real = service._start_live_solve
+    monkeypatch.setattr(
+        service, "_start_live_solve", lambda job: (solves.append(job.job_id), real(job))[1]
+    )
+    _rig, snapshot = _drive(service, monkeypatch, want_bins=3, payload={})
+    assert snapshot["status"] in {"succeeded", "cancelled"}
+    assert service.live_status()["bin_count"] >= 3
+    assert solves == [], "nothing may solve on its own while the drive is running"
+
+
+def test_a_solve_can_be_asked_for_mid_drive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path)
+    rig = _Rig(service, start=(32.0400, 34.7800), speed_ms=20.0)
+    monkeypatch.setattr(live_session, "SoapyIqDevice", lambda: rig)
+    monkeypatch.setattr(web_service, "probe_soapysdr", lambda driver: _Probe())
+    service.push_live_position({"latitude": 32.0400, "longitude": 34.7800, "accuracy_m": 6.0})
+    job = service.start_live(
+        {"max_seconds": 60.0, "fft_size": 4096, "frames_per_window": 8}
+    )
+    deadline = time.monotonic() + 90.0
+    while service.live_status()["bin_count"] < 2 and time.monotonic() < deadline:
+        if job.is_terminal():
+            break
+        time.sleep(0.02)
+
+    result = service.request_live_solve()
+    assert result["started"] or result["reason"] == "a solve is already running"
+    job.request_cancel()
+    while not job.is_terminal() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    while service.live_status()["solving"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not service.live_status()["solving"]
+
+
+def test_the_app_drives_with_adaptive_spans_inside_their_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """That a faster drive measures over more road is pinned at the session
+    level, where the fixture controls the clock. This fixture cannot: it posts
+    fixes through the real endpoint, which stamps them on arrival precisely so
+    a phone's own clock cannot be trusted, and its stream is instantaneous. So
+    what is checked here is that the app turns the mode on and that the span
+    it chooses stays inside the limits whatever the timing looks like."""
+    service = _service(tmp_path)
+    assert service.settings.live_adaptive_bins
+    assert service.live_settings({}).adaptive_bin_size
+
+    _drive(service, monkeypatch, speed_ms=28.0, want_bins=3)
+    status = service.live_status()
+    assert status["bin_count"] >= 3
+    assert 100.0 <= status["stats"]["bin_size_m"] <= 250.0

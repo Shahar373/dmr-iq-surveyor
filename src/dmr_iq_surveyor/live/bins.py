@@ -62,6 +62,42 @@ class BinKey:
         return f"live_{anchor_tag}_{self.x:+06d}_{self.y:+06d}"
 
 
+# Ledger cell for the adaptive mode. A measurement may span several of these;
+# the cells exist only to record which road has already been measured, so no
+# two measurements -- at any speed, on any day -- can cover the same ground
+# twice. Small enough that even a 100 m measurement is two cells, large enough
+# that a set of them stays small across a long drive.
+DEFAULT_LEDGER_CELL_M = 50.0
+
+# Bounds on how much road one adaptive measurement covers.
+#
+# The floor is the urban end of the shadow-fading decorrelation distance:
+# below it, consecutive measurements are not independent evidence and the
+# posterior would shrink faster than the drive earned.
+#
+# The ceiling is 150 m because that is the value the fixed mode was validated
+# at, and a longer span costs measurements over the same road. Measured on the
+# Route 471 corridor (6.9 km, 40-110 km/h), same route, same solver:
+#
+#     fixed 150 m        54 bins   area90  7.19 km2
+#     adaptive 100-150   40 bins   area90 17.55 km2
+#     adaptive 100-200   36 bins   area90 20.58 km2
+#     adaptive 100-250   33 bins   area90 29.91 km2
+#
+# The location error was 40 m in every case, so nothing here is biased -- what
+# changes is only how much the region claims. That simulation cannot say which
+# claim is CALIBRATED, because its levels are a deterministic function of
+# distance plus white noise, with no spatially correlated fading at all; in it,
+# every extra measurement is genuinely independent and more of them legitimately
+# means a smaller region. Real shadow fading is correlated, so some of the fixed
+# mode's advantage is bought from neighbours that are not independent -- but
+# that is an argument for the floor, which is set on the physics, not a licence
+# to widen the ceiling past a value that demonstrably costs geometry. Adapting
+# downward in a town is a gain; adapting upward on a motorway is not.
+MIN_ADAPTIVE_BIN_M = 100.0
+MAX_ADAPTIVE_BIN_M = 150.0
+
+
 @dataclass(slots=True)
 class BinVisit:
     """One bin being accumulated, held only while the receiver is inside it."""
@@ -71,6 +107,13 @@ class BinVisit:
     longitudes: list[float] = field(default_factory=list)
     spectra: list[Any] = field(default_factory=list)
     started_utc: str | None = None
+    # Every ledger cell this visit's windows fell in. Marked measured together
+    # when the visit closes, so a measurement spanning 200 m of road claims all
+    # 200 m of it and a later pass cannot measure part of it again.
+    cells: set[BinKey] = field(default_factory=set)
+    # Where the visit began, for deciding when it has covered enough road.
+    origin: tuple[float, float] | None = None
+    span_target_m: float = 0.0
 
     @property
     def window_count(self) -> int:
@@ -85,6 +128,17 @@ class BinVisit:
         return (
             sum(self.latitudes) / len(self.latitudes),
             sum(self.longitudes) / len(self.longitudes),
+        )
+
+    def travelled_m(self) -> float:
+        """How far the receiver has come since this visit started."""
+        if self.origin is None or not self.latitudes:
+            return 0.0
+        metres_per_degree = 111_320.0
+        cos_lat = math.cos(math.radians(self.origin[0]))
+        return math.hypot(
+            (self.longitudes[-1] - self.origin[1]) * metres_per_degree * cos_lat,
+            (self.latitudes[-1] - self.origin[0]) * metres_per_degree,
         )
 
     def spread_m(self) -> float:
@@ -167,6 +221,9 @@ class BinGrid:
     def mark_measured(self, key: BinKey) -> None:
         self._measured.add(key)
 
+    def mark_all_measured(self, keys: set[BinKey]) -> None:
+        self._measured.update(keys)
+
     def note_revisit(self) -> None:
         self.revisited_windows += 1
 
@@ -175,8 +232,34 @@ class BinGrid:
         return len(self._measured)
 
 
+def adaptive_bin_size_m(
+    speed_ms: float,
+    *,
+    window_seconds: float,
+    windows_per_bin: int,
+    minimum_m: float = MIN_ADAPTIVE_BIN_M,
+    maximum_m: float = MAX_ADAPTIVE_BIN_M,
+) -> float:
+    """How much road one measurement should cover, at this speed.
+
+    The span is simply the road it takes to gather the wanted number of
+    windows: crawling through a town that is a short stretch, and on an open
+    road it is a long one, and either way the measurement is averaged over
+    the same number of samples. Clamped at both ends because the physics does
+    not care how fast the car is going -- below the floor two measurements are
+    the same measurement, and above the ceiling one measurement is an average
+    over ground it cannot be pinned to.
+    """
+    wanted = max(speed_ms, 0.0) * window_seconds * max(windows_per_bin, 1)
+    return min(max(wanted, minimum_m), maximum_m)
+
+
 __all__ = [
     "DEFAULT_BIN_SIZE_M",
+    "DEFAULT_LEDGER_CELL_M",
+    "MAX_ADAPTIVE_BIN_M",
+    "MIN_ADAPTIVE_BIN_M",
+    "adaptive_bin_size_m",
     "BinGrid",
     "BinKey",
     "BinVisit",
