@@ -154,6 +154,19 @@ class FieldSettings:
     # tighter, since a gap really could swallow the only transmission. That
     # is a different measurement than the one this system makes.
     #
+    # On what an overflow actually costs, measured rather than assumed: a
+    # 90 s capture reporting 23 overflows spanned 137 s of wall clock, and a
+    # 60 s capture reporting 27 spanned 153 s. That is seconds per event,
+    # not the milliseconds the FIFO is deep -- because the depth is the
+    # buffer, while the loss is however long the stall lasted, and the
+    # driver goes on overflowing throughout it. So 0.95 admits a couple of
+    # brief stalls in a 90 s capture, not the dozens a naive
+    # milliseconds-per-event reading would suggest.
+    #
+    # Those two recordings covered under half the span they occupied. Their
+    # non-detections were rightly refused, and the fix for that was to stop
+    # the stalls (see throttle_capture_progress), never to widen this.
+    #
     # What it is deliberately NOT is a count of overflows: a stop recorded
     # 8 km east of every other one -- the geometry the campaign most needed
     # -- was discarded over a single overflow, because one event and
