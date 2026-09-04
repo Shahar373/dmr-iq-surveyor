@@ -385,6 +385,81 @@ def test_progress_callback_reports_monotonic_advance(tmp_path: Path) -> None:
     assert seen[-1][0] == seen[-1][1] == round(0.5 * SAMPLE_RATE_HZ)
 
 
+class GappyIqDevice:
+    """Delivers data, but drops a buffer now and then like a real driver.
+
+    `empty_every` reads come back empty, which is what SoapySDR returns on an
+    overflow, and each costs `gap_seconds` of wall clock that no sample
+    accounts for.
+    """
+
+    def __init__(self, *, empty_every: int = 4, gap_seconds: float = 0.02) -> None:
+        self.reads = 0
+        self.overflow_count = 0
+        self._empty_every = empty_every
+        self._gap_seconds = gap_seconds
+
+    def open(self, settings: DeviceSettings) -> None:
+        settings.validate()
+
+    def read_stream_chunk(self, max_frames: int) -> np.ndarray:
+        self.reads += 1
+        if self.reads % self._empty_every == 0:
+            self.overflow_count += 1
+            time.sleep(self._gap_seconds)
+            return np.empty(0, dtype=np.complex64)
+        return np.zeros(max_frames, dtype=np.complex64)
+
+    def close(self) -> None:
+        pass
+
+
+def test_the_manifest_reports_time_lost_not_only_overflow_count(tmp_path: Path) -> None:
+    """How much time went missing is the number that matters downstream.
+
+    A count says how often the driver dropped its FIFO, not how much was lost
+    with it, and those differ by orders of magnitude: one overflow in a 30 s
+    capture discards a buffer measured in milliseconds. Deciding whether a
+    non-detection can be trusted needs the duration.
+    """
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=0.2,
+        if_gain_reduction_db=20.0,
+        chunk_frames=4096,
+    )
+    device = GappyIqDevice(empty_every=3, gap_seconds=0.05)
+    manifest = run_capture(tmp_path, settings=settings, device=device)
+
+    assert manifest["overflow_count"] > 0
+    assert manifest["gap_seconds"] > 0.0, "sleeping through reads must register as lost time"
+    assert 0.0 < manifest["time_coverage"] < 1.0
+    # The span covers the samples plus the gaps, so the two must agree.
+    assert manifest["stream_span_seconds"] >= manifest["actual_duration_seconds"]
+    assert manifest["gap_seconds"] == pytest.approx(
+        manifest["stream_span_seconds"] - manifest["actual_duration_seconds"], abs=1e-6
+    )
+
+
+def test_a_clean_capture_reports_full_time_coverage(tmp_path: Path) -> None:
+    """The case the field stop was wrongly failed on.
+
+    A capture with no gaps must not read as though it had any, or every
+    non-detection it made is set aside for nothing.
+    """
+    settings = CaptureSettings(
+        center_frequency_hz=CENTER_HZ,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        duration_seconds=0.2,
+        if_gain_reduction_db=20.0,
+    )
+    manifest = run_capture(tmp_path, settings=settings, device=FakeIqDevice())
+    assert manifest["overflow_count"] == 0
+    assert manifest["time_coverage"] > 0.98, manifest["time_coverage"]
+    assert manifest["gap_seconds"] < 0.05
+
+
 def test_completed_capture_is_marked_complete_and_not_timed_out(tmp_path: Path) -> None:
     settings = CaptureSettings(
         center_frequency_hz=CENTER_HZ,

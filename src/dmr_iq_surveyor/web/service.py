@@ -139,6 +139,17 @@ class FieldSettings:
     # contribute: undetected weak signals would become non-detections, which
     # is evidence, not absence.
     min_capture_completeness: float = 0.8
+    # Fraction of the recorded wall-clock span the samples actually account
+    # for. Below this the gaps are wide enough that "heard nothing" might
+    # mean "was not listening", and the stop's non-detections are set aside.
+    #
+    # 0.98 leaves room for the millisecond-scale buffer a healthy capture
+    # occasionally drops without that saying anything about the band. What it
+    # is deliberately NOT is a count of overflows: a stop recorded 8 km east
+    # of every other one -- the geometry the campaign most needed -- was
+    # discarded over a single overflow, because one event and twenty-seven
+    # events were treated identically.
+    min_time_coverage: float = 0.98
     # Beyond this, the marked position is presumed stale and the operator has
     # to confirm it before a stop is recorded against it.
     position_stale_after_seconds: float = 1_200.0
@@ -612,16 +623,26 @@ class FieldService:
             if capture.duration_seconds
             else 0.0
         )
+        # Gaps are judged by how much time they cost, not by how many times
+        # the driver dropped its FIFO. Those are very different numbers: one
+        # overflow in a 30 s capture discards a buffer measured in
+        # milliseconds. Counting events instead of duration threw away a
+        # whole field stop -- with the new position the campaign most needed
+        # -- over a single overflow, treating it exactly like a recording
+        # with twenty-seven.
+        coverage = float(manifest.get("time_coverage", 1.0))
+        gap_seconds = float(manifest.get("gap_seconds", 0.0))
         integrity_reason = ""
         if completeness < self.settings.min_capture_completeness:
             integrity_reason = (
                 f"capture delivered {completeness * 100:.0f}% of the requested "
                 f"{capture.duration_seconds:.0f} s; too short to trust a non-detection"
             )
-        elif manifest["overflow_count"]:
+        elif coverage < self.settings.min_time_coverage:
             integrity_reason = (
-                f"{manifest['overflow_count']} driver overflow(s): the recording has gaps of "
-                "unknown length, so an absent signal may simply be in a gap"
+                f"{gap_seconds:.1f} s of the recorded span is missing "
+                f"({coverage * 100:.1f}% covered, {manifest['overflow_count']} driver "
+                "overflow(s)); a signal absent from this stop may simply have been in a gap"
             )
         if integrity_reason:
             connection = connect_geo_database(Path(self.settings.database_path))
