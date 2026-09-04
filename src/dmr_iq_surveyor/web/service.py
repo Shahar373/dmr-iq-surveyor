@@ -143,13 +143,22 @@ class FieldSettings:
     # for. Below this the gaps are wide enough that "heard nothing" might
     # mean "was not listening", and the stop's non-detections are set aside.
     #
-    # 0.98 leaves room for the millisecond-scale buffer a healthy capture
-    # occasionally drops without that saying anything about the band. What it
-    # is deliberately NOT is a count of overflows: a stop recorded 8 km east
-    # of every other one -- the geometry the campaign most needed -- was
-    # discarded over a single overflow, because one event and twenty-seven
-    # events were treated identically.
-    min_time_coverage: float = 0.98
+    # 0.95 is set against what these measurements actually are. A registry
+    # channel here is a P25 CONTROL channel, which transmits continuously --
+    # so a site audible from a stop is audible across the whole recording,
+    # not in one window that a gap might straddle. Losing a few percent of
+    # the span costs a little averaging, and leaves a non-detection saying
+    # exactly what it said before: nothing was there.
+    #
+    # A threshold appropriate to intermittent traffic would have to be far
+    # tighter, since a gap really could swallow the only transmission. That
+    # is a different measurement than the one this system makes.
+    #
+    # What it is deliberately NOT is a count of overflows: a stop recorded
+    # 8 km east of every other one -- the geometry the campaign most needed
+    # -- was discarded over a single overflow, because one event and
+    # twenty-seven events were treated identically.
+    min_time_coverage: float = 0.95
     # Beyond this, the marked position is presumed stale and the operator has
     # to confirm it before a stop is recorded against it.
     position_stale_after_seconds: float = 1_200.0
