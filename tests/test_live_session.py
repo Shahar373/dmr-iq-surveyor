@@ -633,15 +633,19 @@ def test_the_span_follows_the_speed_between_its_two_limits() -> None:
     assert span(0.0, low=100.0) == 100.0, "standing still asks for the smallest legal span"
 
 
-def test_the_shipped_limits_never_measure_over_more_road_than_the_fixed_mode() -> None:
-    """Adapting DOWN in a town buys detail; adapting UP on a motorway costs
-    measurements over the same road, measured. So the ceiling is the size the
-    fixed mode was validated at, and the adaptation only ever shortens."""
-    assert MIN_ADAPTIVE_BIN_M == 100.0
-    assert MAX_ADAPTIVE_BIN_M == DEFAULT_BIN_SIZE_M == 150.0
+def test_the_shipped_span_is_the_one_that_does_not_over_claim() -> None:
+    """Shortening the span in a city looks free -- urban fading decorrelates
+    over 10-50 m -- and is not. Under correlated fading, a 90% region built
+    from 50 m measurements contained the truth 60% of the time, and from 80 m
+    or 100 m measurements 80% of the time; only at 150 m did it contain it
+    90% of the time. A region that over-claims is worse than a large one, so
+    the span does not vary. See bins.py for the table."""
+    assert MIN_ADAPTIVE_BIN_M == MAX_ADAPTIVE_BIN_M == DEFAULT_BIN_SIZE_M == 150.0
 
 
-def test_an_adaptive_drive_makes_bigger_bins_when_it_goes_faster(tmp_path: Path) -> None:
+def test_an_adaptive_drive_keeps_one_span_at_every_speed(tmp_path: Path) -> None:
+    """The span is fixed at the only length that does not over-claim, so what
+    changes with speed is how many windows fall inside it -- not its size."""
     slow, fast = {}, {}
     for speed_ms, into in ((9.0, slow), (28.0, fast)):
         database = tmp_path / f"{speed_ms}.sqlite3"
@@ -659,11 +663,16 @@ def test_an_adaptive_drive_makes_bigger_bins_when_it_goes_faster(tmp_path: Path)
         into["spans"] = _spans(database)
 
     assert slow["spans"] and fast["spans"]
-    assert max(slow["spans"]) < min(fast["spans"]), (
-        f"slow drive spans {sorted(set(slow['spans']))}, fast {sorted(set(fast['spans']))} -- "
-        "the faster drive must measure over more road, not less"
+    assert set(slow["spans"]) == set(fast["spans"]) == {150.0}
+    assert slow["stats"].bins_written < fast["stats"].bins_written, (
+        "over the same number of windows the slower drive covers less road, so it must "
+        "produce fewer measurements -- not shorter ones"
     )
-    assert min(slow["spans"]) >= 100.0 and max(fast["spans"]) <= 150.0
+    assert slow["stats"].windows_held_apart > 0, (
+        "crawling, windows must be held back to keep measurements a full span apart"
+    )
+    assert fast["stats"].windows_held_apart == 0, "at speed nothing needs holding back"
+    assert min(slow["spans"]) >= 150.0 and max(fast["spans"]) <= 150.0
 
 
 def _spans(database: Path) -> list[float]:
@@ -735,3 +744,34 @@ def test_a_fixed_span_drive_is_unchanged_by_the_adaptive_code(tmp_path: Path) ->
     connection.close()
     assert stats.bins_written > 0
     assert set(_spans(database)) == {150.0}
+
+
+def test_slow_traffic_does_not_pack_measurements_inside_one_fading_length(
+    tmp_path: Path,
+) -> None:
+    """Crawling, a bin fills its window cap long before it has covered its
+    span: ten one-second windows at 15 km/h is 42 m. Without a hold, the next
+    measurement would start there -- two measurements inside one shadow-fading
+    correlation length, which the solver would count as two independent
+    constraints. That is the exact error the binning exists to prevent, and it
+    only appears in traffic."""
+    database = tmp_path / "traffic.sqlite3"
+    connection = build_database(database)
+    drive = _Drive(start=(32.0700, 34.8000), east_step_m=4.2)  # 15 km/h
+    settings = _settings(
+        min_windows_per_bin=2, max_windows_per_bin=10, adaptive_bin_size=True
+    )
+    stats = _run(drive, connection, windows=120, settings=settings)
+    connection.close()
+
+    assert stats.bins_written >= 3, "the drive must produce several measurements"
+    assert stats.bins_capped >= 3, "the fixture must actually hit the cap before the span"
+    assert stats.windows_held_apart > 0, "windows must be held back, not measured"
+    positions = _positions(database)
+    for i, (lat_a, lon_a) in enumerate(positions):
+        for lat_b, lon_b in positions[i + 1 :]:
+            gap = haversine_m(lat_a, lon_a, lat_b, lon_b)
+            assert gap >= 80.0, (
+                f"two measurements {gap:.0f} m apart at 15 km/h -- inside the distance "
+                "over which urban shadow fading is still correlated"
+            )

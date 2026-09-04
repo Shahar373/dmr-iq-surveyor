@@ -220,7 +220,7 @@ def web_serve(
                 "what geolocation needs. 0 keeps none, 1 lets you re-analyse the stop just made"
             ),
         ),
-    ] = 1,
+    ] = 0,
     solve_resolution: Annotated[
         float,
         typer.Option(

@@ -845,6 +845,7 @@ const DRIVE_STATS = [
   ["bins_capped", "bins filled while stopped"],
   ["windows_dwelled", "windows while parked"],
   ["windows_revisited", "windows on measured road"],
+  ["windows_held_apart", "windows held back in traffic"],
   ["windows_too_fast", "windows dropped, too fast"],
   ["windows_without_position", "windows with no fix"],
   ["bins_too_short", "bins dropped, too few windows"],

@@ -69,32 +69,46 @@ class BinKey:
 # that a set of them stays small across a long drive.
 DEFAULT_LEDGER_CELL_M = 50.0
 
-# Bounds on how much road one adaptive measurement covers.
+# Bounds on how much road one adaptive measurement covers. Both are 150 m, and
+# both were set by measurement after an argument said otherwise.
 #
-# The floor is the urban end of the shadow-fading decorrelation distance:
-# below it, consecutive measurements are not independent evidence and the
-# posterior would shrink faster than the drive earned.
+# THE FLOOR. It is tempting to shorten the span in a city -- shadow fading
+# decorrelates over 10-50 m there, so 150 m looks wastefully conservative and
+# a shorter span would buy more measurements over the same streets. That
+# reasoning is wrong, and the way to see it is to ask the only question that
+# matters about a credible region: does it contain the transmitter as often as
+# it says? Simulating a city drive under CORRELATED fading (Gudmundson,
+# exponential autocorrelation, sigma 6 dB, decorrelation 20 m), 20 trials per
+# spacing, counting how often the 90% region actually contained the truth:
 #
-# The ceiling is 150 m because that is the value the fixed mode was validated
-# at, and a longer span costs measurements over the same road. Measured on the
-# Route 471 corridor (6.9 km, 40-110 km/h), same route, same solver:
+#     spacing   measurements   90% region contained the truth   median area
+#       50 m        146                    60%                    151 km2
+#       80 m         91                    80%                    218 km2
+#      100 m         73                    80%                    261 km2
+#      150 m         48                    90%                    370 km2
 #
-#     fixed 150 m        54 bins   area90  7.19 km2
-#     adaptive 100-150   40 bins   area90 17.55 km2
-#     adaptive 100-200   36 bins   area90 20.58 km2
-#     adaptive 100-250   33 bins   area90 29.91 km2
+# A 90% region that contains the truth 60% of the time is not a smaller region,
+# it is a false one. Measurements do not merely need a gap wider than the
+# decorrelation distance; adjacent spans AVERAGE neighbouring ground, and the
+# residual correlation between those averages accumulates across a whole drive.
+# 150 m is where the arithmetic stops over-claiming. (The regions in that run
+# all touched the analysed edge, so the absolute areas are inflated; it is the
+# coverage column that carries the result. Twenty trials put roughly +/-10
+# points of sampling error on each figure -- enough to separate 60% from 90%,
+# not enough to separate 80% from 90%.)
 #
-# The location error was 40 m in every case, so nothing here is biased -- what
-# changes is only how much the region claims. That simulation cannot say which
-# claim is CALIBRATED, because its levels are a deterministic function of
-# distance plus white noise, with no spatially correlated fading at all; in it,
-# every extra measurement is genuinely independent and more of them legitimately
-# means a smaller region. Real shadow fading is correlated, so some of the fixed
-# mode's advantage is bought from neighbours that are not independent -- but
-# that is an argument for the floor, which is set on the physics, not a licence
-# to widen the ceiling past a value that demonstrably costs geometry. Adapting
-# downward in a town is a gain; adapting upward on a motorway is not.
-MIN_ADAPTIVE_BIN_M = 100.0
+# THE CEILING. Measured on the Route 471 corridor (6.9 km, 40-110 km/h), same
+# road, same solver, 40 m location error throughout: a longer span costs
+# measurements over the same road and the region grows with it -- 54 bins and
+# 7.19 km2 at 150 m against 33 bins and 29.91 km2 at 250 m.
+#
+# So the span does not vary. What the adaptive mode is still for is the PITCH:
+# a measurement every 150 m of road travelled, with the next one held back
+# until that distance has been covered. The fixed grid cannot do that -- a bin
+# ends when the receiver leaves a square, whoever it entered it, so it emits
+# short bins at cell boundaries whose neighbours sit inside one correlation
+# length. That is the 50 m row above, arriving by accident.
+MIN_ADAPTIVE_BIN_M = 150.0
 MAX_ADAPTIVE_BIN_M = 150.0
 
 

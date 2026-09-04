@@ -96,6 +96,10 @@ def client(tmp_path: Path) -> Iterator[Client]:
         output_root=tmp_path / "out",
         recordings_dir=tmp_path / "rec",
         token="s3cret",
+        # Set explicitly, not left to the default, so the disk assertions
+        # below test that the setting reaches the API rather than pinning
+        # whatever the default happens to be.
+        keep_recordings=1,
     )
     server = create_server(settings, host="127.0.0.1", port=0)
     threading.Thread(target=server.serve_forever, daemon=True).start()

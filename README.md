@@ -507,8 +507,10 @@ finishes in seconds; `--no-solve-after-capture` skips it entirely on a long camp
 33 GiB — more than a Pi in the field has. The recording is only needed until the survey has
 extracted its observations into SQLite, so free space is checked *before* every capture (a capture
 that does not fit is refused, with the numbers) and, after a survey succeeds, recordings beyond
-`--keep-recordings` (default 1) are deleted, with each deletion written to a ledger and every
-capture's `*_capture_report.json` left behind. A failed stop keeps its IQ. Peak disk is 3.35 GiB.
+`--keep-recordings` (default 0) are deleted, with each deletion written to a ledger and every
+capture's `*_capture_report.json` left behind. A failed stop keeps its IQ. Pass
+`--keep-recordings 1` to hold the last one back for re-analysis; `live stop` is usually the better
+answer, since it measures the same thing without writing IQ at all.
 
 ### Live (moving) survey
 
@@ -534,34 +536,35 @@ Two length scales decide the design, and neither is adjustable by taste:
 - **A window is one second.** At 50 km/h that is 14 m, about 40 wavelengths at 868 MHz — the
   drive-test convention for averaging fast (multipath) fading out of a level to recover the local
   mean, which is the quantity the path-loss model is written in.
-- **A measurement spans 100–150 m, chosen by speed.** Shadow fading decorrelates over roughly
-  10–50 m in a city and 100–200 m in suburbs. Feeding the solver a measurement per second would
-  treat a thousand correlated samples as a thousand independent constraints and shrink a region by
-  a factor near 240, almost all of it fabricated. The span is the road it takes to gather ten
-  windows, clamped: 100 m below about 36 km/h, 150 m above about 54 km/h. The adaptation only ever
-  *shortens*, and that is measured rather than assumed — on the Route 471 corridor (6.9 km,
-  40–110 km/h), raising the ceiling costs measurements over the same road and the region grows with
-  it:
+- **A measurement covers 150 m of road, at every speed.** Feeding the solver a measurement per
+  second would treat a thousand correlated samples as a thousand independent constraints and shrink
+  a region by a factor near 240, almost all of it fabricated. 150 m is not a compromise between
+  detail and caution — it is the shortest span that does not over-claim, and that was measured. A
+  simulated city drive under *correlated* shadow fading (Gudmundson, σ = 6 dB, decorrelation 20 m),
+  20 trials per spacing, asking the only question that matters about a credible region — does it
+  contain the transmitter as often as it says?
 
-  | span | bins | 90% region | error |
+  | spacing | measurements | 90% region contained the truth | median area |
   |---|---|---|---|
-  | fixed 150 m | 54 | 7.19 km² | 40 m |
-  | adaptive 100–150 m | 40 | 17.55 km² | 40 m |
-  | adaptive 100–200 m | 36 | 20.58 km² | 40 m |
-  | adaptive 100–250 m | 33 | 29.91 km² | 40 m |
+  | 50 m | 146 | **60%** | 151 km² |
+  | 80 m | 91 | 80% | 218 km² |
+  | 100 m | 73 | 80% | 261 km² |
+  | 150 m | 48 | **90%** | 370 km² |
 
-  Nothing here is biased — the location error is 40 m throughout — but that simulation cannot say
-  which region is *calibrated*, because its levels are a deterministic function of distance plus
-  white noise, with no spatially correlated fading. In it every extra measurement is genuinely
-  independent, so more of them legitimately means a smaller region; real fading is correlated, so
-  some of the fixed mode's advantage is bought from neighbours that are not. That is an argument for
-  the floor, which is set on the physics — not a licence to widen the ceiling past a size that
-  demonstrably costs geometry.
+  Urban fading decorrelates over 10–50 m, so shortening the span in a city looks free. It is not: a
+  90% region that contains the truth 60% of the time is not a smaller region, it is a false one.
+  Adjacent spans *average* neighbouring ground, and the residual correlation between those averages
+  accumulates across a drive. (Those regions all touched the analysed edge, so the areas are
+  inflated; the coverage column carries the result. Twenty trials put about ±10 points on each
+  figure — enough to separate 60% from 90%, not 80% from 90%.)
 
-  Underneath, the grid is a fixed 50 m ledger of measured road, not the measurement size. That is
-  what lets spans vary without ever overlapping: a measurement claims every cell its windows fell
-  in, and road that has been measured is never measured again — at any speed, on any day. Set
-  `live_adaptive_bins: false` for one fixed size.
+  What speed does change is the **pitch discipline**. A measurement starts only once the receiver
+  has travelled a full span from where the last one began — because crawling in traffic a bin fills
+  its ten-window cap in 40 m, and without the hold the next measurement would start there, which is
+  the 50 m row above arriving by accident. Underneath, the grid is a fixed 50 m ledger of measured
+  road rather than the measurement size, so no two measurements can ever cover the same ground — at
+  any speed, on any day. Set `live_adaptive_bins: false` for the plain grid, which has no such
+  guarantee at its cell boundaries.
 
 The detector scans every raster step of the band once per window in a bin, so closing a bin is
 seconds of arithmetic — and every one of those seconds is a second the SDR is not being read. It

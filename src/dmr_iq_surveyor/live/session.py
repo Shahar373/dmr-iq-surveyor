@@ -241,6 +241,12 @@ class LiveStats:
     # operator can see the adaptation working rather than infer it.
     bin_size_m: float = 0.0
     speed_kmh: float = 0.0
+    # Windows dropped to keep consecutive measurements at least one span
+    # apart. Crawling in traffic a bin fills its window cap long before it has
+    # covered its span, and without this the next measurement would begin
+    # metres from the last one -- inside the distance over which shadow fading
+    # is still correlated, which is the one thing the binning exists to stop.
+    windows_held_apart: int = 0
     observations_written: int = 0
     overflow_count: int = 0
     # True when no campaign anchor was configured and the grid fell back to
@@ -319,6 +325,10 @@ class LiveSession:
         # from whatever the phone reports: `coords.speed` is often null, and
         # a single window's estimate jumps around with GPS noise.
         self._speed_ms: float | None = None
+        # Where the last measurement began and how much road it was entitled
+        # to. Until the receiver has covered that, no new measurement starts.
+        self._hold_origin: tuple[float, float] | None = None
+        self._hold_span_m: float = 0.0
         self._to_analyse: queue.Queue[BinVisit | None] | None = None
         self._analysed: queue.Queue[tuple[BinVisit, Any] | None] = queue.Queue()
 
@@ -465,6 +475,21 @@ class LiveSession:
             # Returned before `_analyse`, so a stationary receiver costs no
             # transforms at all once its bin is complete.
             return
+        if self._hold_origin is not None:
+            # Fresh road, but too close to where the last measurement began.
+            # This is what a window cap reached in slow traffic would otherwise
+            # cost: ten windows can fill a bin in 40 m at 15 km/h, and the next
+            # measurement would start there -- twice inside one shadow-fading
+            # correlation length, counted by the solver as two independent
+            # constraints. Also returned before `_analyse`, so crawling costs
+            # no transforms it cannot use.
+            if (
+                haversine_m(*self._hold_origin, position.latitude, position.longitude)
+                < self._hold_span_m
+            ):
+                self.stats.windows_held_apart += 1
+                return
+            self._hold_origin = None
         if self._visit is None:
             self._visit = BinVisit(
                 key=key,
@@ -569,6 +594,12 @@ class LiveSession:
         # is claimed, not just the one the id is built from: a measurement
         # spanning 200 m of road has measured all 200 m of it.
         self._grid.mark_all_measured(visit.cells or {visit.key})
+        if self.settings.adaptive_bin_size and visit.origin is not None:
+            # Set only for a measurement that was actually taken: a visit
+            # dropped for being too short has claimed nothing and must not
+            # keep the next one from trying again over the same road.
+            self._hold_origin = visit.origin
+            self._hold_span_m = visit.span_target_m
 
         if self._to_analyse is not None:
             try:

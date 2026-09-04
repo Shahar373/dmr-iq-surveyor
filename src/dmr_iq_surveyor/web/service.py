@@ -140,10 +140,14 @@ class FieldSettings:
     solve_resolution_m: float = 250.0
     solve_max_cells: int = 40_000
     # A 5 MS/s, 120 s stop writes ~2.24 GiB, so a campaign cannot keep every
-    # recording on the storage a Pi has in the field. One is kept so the stop
-    # just made can still be re-analysed; older ones go once their survey has
-    # succeeded, and the deletion is written to a ledger.
-    keep_recordings: int = 1
+    # recording on the storage a Pi has in the field. None are kept: the
+    # survey has already extracted everything geolocation needs into SQLite,
+    # and `live stop` now takes a stationary measurement without writing IQ at
+    # all, so the case for holding one back -- re-analysing the stop just made
+    # with different settings -- costs 1.68 GiB for something the operator can
+    # instead just measure again. A failed stop still keeps its IQ, and every
+    # deletion is written to a ledger. Set it to 1 to keep the last one.
+    keep_recordings: int = 0
     # A capture that delivered materially less than it asked for must not
     # contribute: undetected weak signals would become non-detections, which
     # is evidence, not absence.
