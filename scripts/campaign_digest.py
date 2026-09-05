@@ -148,8 +148,18 @@ def solutions(connection: sqlite3.Connection) -> None:
         latest["solve_batch_id"],
     )
     solved = [r for r in rows if r["status"] == "ok"]
-    print(f"  batch {latest['solve_batch_id']}   "
-          f"{len(solved)} of {len(rows)} site(s) produced a bounded region")
+    # The resolution and other settings a batch was solved at can differ from
+    # what an operator most recently typed: this is the LATEST stored batch,
+    # which may be an automatic solve the field app ran after a drive (at
+    # its own, coarser default) rather than a `geo solve` invocation that was
+    # interrupted before it could write anything -- SQLite writes nothing
+    # until the whole batch finishes, so a cancelled solve leaves no trace at
+    # all, and this always shows the last one that actually completed.
+    batch_settings = json.loads(rows[0]["settings_json"] or "{}") if rows else {}
+    resolution = batch_settings.get("resolution_m")
+    print(f"  batch {latest['solve_batch_id']}"
+          + (f"  (resolution {resolution:g} m)" if resolution else "")
+          + f"   {len(solved)} of {len(rows)} site(s) produced a bounded region")
     for row in rows:
         if not (row["detection_count"] or row["non_detection_count"]):
             continue
