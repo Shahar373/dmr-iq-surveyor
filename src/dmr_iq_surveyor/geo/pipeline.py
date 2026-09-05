@@ -33,7 +33,12 @@ from dmr_iq_surveyor.geo.planning import (
     plan_to_geojson,
 )
 from dmr_iq_surveyor.geo.report import render_solution_markdown
-from dmr_iq_surveyor.geo.solver import SOURCE_MODEL, solve_site
+from dmr_iq_surveyor.geo.solver import (
+    FIT_NOT_FITTED,
+    FIT_UNDERDETERMINED,
+    SOURCE_MODEL,
+    solve_site,
+)
 from dmr_iq_surveyor.geo.store import (
     connect_geo_database,
     fetch_all_measurements,
@@ -335,6 +340,7 @@ def _solve_one(
         "mean_latitude": None,
         "mean_longitude": None,
         "path_loss_exponent": None,
+        "fit_status": FIT_NOT_FITTED,
         "reference_level_db": None,
         "residual_rms_db": None,
         "azimuth_span_deg": None,
@@ -385,6 +391,7 @@ def _solve_one(
         mean_latitude=result.mean_latitude,
         mean_longitude=result.mean_longitude,
         path_loss_exponent=result.path_loss_exponent,
+        fit_status=result.fit_status,
         reference_level_db=result.reference_level_db,
         residual_rms_db=result.residual_rms_db,
         azimuth_span_deg=result.azimuth_span_deg,
@@ -427,9 +434,22 @@ def _build_plan(
     """Rank where the next stop would teach the most, from the final posteriors."""
     targets = []
     projection: LocalProjection | None = None
+    skipped: list[str] = []
     for row in rows:
         result = results.get(row["site_key"])
         if result is None or result.surface is None:
+            continue
+        if (
+            not plan_settings.plan_from_underdetermined_fits
+            and row.get("fit_status") == FIT_UNDERDETERMINED
+        ):
+            # The planner's entire value for a site is the entropy of the
+            # detection probability it predicts at a candidate -- and that
+            # prediction is computed from the reference level and exponent.
+            # When those were never identified, the prediction is not a
+            # prediction, and steering a drive by it sends the operator
+            # somewhere for a reason that does not exist.
+            skipped.append(str(row["site_key"]))
             continue
         projection = result.surface.projection
         measurements = usable_by_site.get(row["site_key"], [])
@@ -447,12 +467,21 @@ def _build_plan(
         if target is not None:
             targets.append(target)
 
+    note = (
+        ""
+        if not skipped
+        else (
+            f" {len(skipped)} site(s) were left out of the plan because their propagation fit "
+            f"is not identifiable yet ({', '.join(sorted(skipped))}); they need more detections "
+            "before they can say where a stop would help."
+        )
+    )
     if projection is None:
         return {
             "status": "no_targets",
             "reason": (
                 "no site has a posterior to plan against yet; make a few stops spread around the "
-                "area first"
+                "area first" + note
             ),
             "candidates": [],
             "top_stops": [],
@@ -467,13 +496,19 @@ def _build_plan(
             if item["latitude"] is not None
         }
     )
-    return plan_next_stops(
+    plan = plan_next_stops(
         targets=targets,
         projection=projection,
         visited=visited,
         solve=settings,
         settings=plan_settings,
     )
+    # Appended rather than replacing the planner's own reason: which sites
+    # were left out is the operator's business either way, and it is the
+    # difference between "nothing helps" and "nothing that could vote, voted".
+    plan["reason"] = (plan.get("reason", "") + note).strip()
+    plan["excluded_from_plan"] = sorted(skipped)
+    return plan
 
 
 def solve_all_sites(

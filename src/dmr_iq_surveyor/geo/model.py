@@ -191,6 +191,23 @@ class SolveSettings:
     # cannot separate transmit power from distance, so a single detection
     # constrains nothing about position.
     min_detections: int = 2
+    # Detections needed before the FITTED PARAMETERS -- the path-loss
+    # exponent, the reference level, the residual RMS -- mean anything, as
+    # opposed to the region, which is honest at any count.
+    #
+    # The reference level is fitted analytically per cell, so it consumes one
+    # detection outright; the exponent is then chosen from the grid, which
+    # consumes another. With two detections the pair is EXACTLY determined:
+    # any exponent can be matched by a compensating reference level, the
+    # residual is identically near zero, and a reported "residual RMS 0.4 dB"
+    # describes arithmetic rather than agreement. Three is the first count at
+    # which one degree of freedom is left over to disagree.
+    #
+    # This gates REPORTING, never the solve. A site with two detections still
+    # gets a posterior and a region -- and that region, being enormous, is the
+    # honest answer. What it does not get is a point estimate presented as if
+    # it had been measured.
+    min_detections_for_fit: int = 3
     # Independent constraints required, counted as `(detections - 1) +
     # non_detections`. Detections contribute one fewer than their count
     # because the unknown reference level absorbs one of them -- only the
@@ -244,6 +261,8 @@ class SolveSettings:
             raise ValueError("refine_mass must be in (0, 1]")
         if any(not 0.0 < level < 1.0 for level in self.credible_levels):
             raise ValueError("credible_levels must be strictly between 0 and 1")
+        if self.min_detections_for_fit < 1:
+            raise ValueError("min_detections_for_fit must be at least 1")
         if self.min_detections < 1:
             raise ValueError("min_detections must be at least 1")
         if self.min_constraint_count < 1:

@@ -392,3 +392,102 @@ def test_the_report_explains_the_correction_and_the_plan(tmp_path: Path) -> None
     assert "Where to go next" in markdown
     assert "least predictable" in markdown
     assert math.isfinite(report["common_mode"]["largest_offset_db"])
+
+
+def _campaign_with_a_barely_heard_site(tmp_path: Path) -> tuple[Path, str]:
+    """A campaign where one site is heard from only two stops.
+
+    Built by making that site far weaker than the rest, so it clears the
+    detection threshold at the two nearest stops and nowhere else -- which
+    is exactly how a distant or obstructed site presents in real data.
+    """
+    # 14 dB puts it over the detection threshold at exactly the two nearest
+    # stops and nowhere else: enough to solve (min_detections is 2) and not
+    # enough for the fit to mean anything (min_detections_for_fit is 3),
+    # which is the narrow band this test is about.
+    faint = Transmitter(
+        868_800_000.0, 32.050, 34.800, reference_level_db=14.0, path_loss_exponent=3.2
+    )
+    transmitters = [*TRANSMITTERS, faint]
+    database = tmp_path / "db.sqlite3"
+    connect_geo_database(database).close()
+    csv_path = tmp_path / "sites.csv"
+    header = "wacn_hex,system_id_hex,rfss,site,observation_status,primary_cc_mhz,nac_hex,notes\n"
+    csv_path.write_text(
+        header
+        + "".join(
+            f"BEE00,37D,1,{20 + index},DIRECT,{tx.frequency_hz / 1e6:.6f},37B,\n"
+            for index, tx in enumerate(transmitters)
+        ),
+        encoding="utf-8",
+    )
+    import_reference_sites(csv_path, database_path=database, snapshot_id="faint")
+
+    connection = connect_geo_database(database)
+    for index, (latitude, longitude) in enumerate(STOPS):
+        seed_run(
+            connection,
+            run_id=f"stop_{index:02d}",
+            latitude=latitude,
+            longitude=longitude,
+            transmitters=transmitters,
+            site_id=f"stop_{index:02d}",
+            capture_start_utc=f"2026-08-01T{7 + index:02d}:00:00+00:00",
+        )
+    connection.close()
+    materialise_measurements(database_path=database)
+    return database, f"BEE00:37D:1:{20 + len(TRANSMITTERS)}"
+
+
+def test_a_site_whose_fit_is_unidentifiable_does_not_steer_the_plan(tmp_path: Path) -> None:
+    """The planner's value for a site is the entropy of the detection
+    probability it predicts at a candidate, and it computes that prediction
+    from the site's reference level and exponent. When those were never
+    identified -- two detections reproduced exactly by many different pairs --
+    the prediction is arithmetic, and steering a drive by it sends the
+    operator somewhere for a reason that does not exist. Such a site is still
+    solved and still reported; it just gets no vote on where to go, and the
+    plan says so rather than leaving the operator to wonder."""
+    database, faint_key = _campaign_with_a_barely_heard_site(tmp_path)
+    report = solve_all_sites(database_path=database, settings=fast_solve_settings())
+
+    by_key = {row["site_key"]: row for row in report["solutions"]}
+    faint = by_key[faint_key]
+    assert faint["detection_count"] == 2, "the fixture must starve this site to exactly two"
+    assert faint["fit_status"] == "underdetermined"
+
+    underdetermined = {
+        key for key, row in by_key.items() if row.get("fit_status") == "underdetermined"
+    }
+    assert faint_key in underdetermined
+
+    plan = report["plan"]
+    voted = {
+        helped["site_key"] for stop in plan["top_stops"] for helped in stop.get("helps_most", [])
+    }
+    assert not (underdetermined & voted), (
+        f"{sorted(underdetermined & voted)} steered the plan on a fit that was never identified"
+    )
+    assert set(plan.get("excluded_from_plan", [])) == underdetermined
+    assert "not identifiable" in plan["reason"]
+    # The well-determined sites still plan, so this removes a bad vote rather
+    # than the whole election.
+    assert voted, "sites with an identified fit must still steer the plan"
+
+    # And the starved site is still solved and still reported -- left out of
+    # the plan, not dropped from the campaign.
+    assert faint["status"], "it still carries a status of its own"
+
+
+def test_an_unidentified_fit_may_be_let_back_into_the_plan(tmp_path: Path) -> None:
+    """The exclusion is a default, not a law: an operator who wants every
+    site voting can say so, and then nothing is held back."""
+    from dmr_iq_surveyor.geo.planning import PlanSettings
+
+    database, faint_key = _campaign_with_a_barely_heard_site(tmp_path)
+    report = solve_all_sites(
+        database_path=database,
+        settings=fast_solve_settings(),
+        plan_settings=PlanSettings(plan_from_underdetermined_fits=True),
+    )
+    assert report["plan"].get("excluded_from_plan") == []

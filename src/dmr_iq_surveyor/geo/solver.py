@@ -83,6 +83,21 @@ STATUS_WEAK_GEOMETRY = "weak_geometry"
 # rather than leaving the assumption implicit.
 SOURCE_MODEL = "single_transmitter_assumed"
 
+# Whether a solution's fitted propagation parameters are separable from each
+# other. Four states, because they are four different things to a reader and
+# collapsing them loses the reason:
+#   identified      -- enough detections; the numbers describe the data
+#   underdetermined -- a fit ran, but the exponent and reference level are
+#                      reproduced exactly by many pairs, so the numbers are
+#                      arithmetic rather than measurement
+#   not_fitted      -- no fit was attempted; there are no numbers to qualify
+#   unknown         -- solved before this check existed, so nothing can be
+#                      said either way (the migration's default, never written)
+FIT_IDENTIFIED = "identified"
+FIT_UNDERDETERMINED = "underdetermined"
+FIT_NOT_FITTED = "not_fitted"
+FIT_UNKNOWN = "unknown"
+
 
 @dataclass(slots=True)
 class PosteriorSurface:
@@ -107,6 +122,11 @@ class SolveResult:
     mean_latitude: float | None = None
     mean_longitude: float | None = None
     path_loss_exponent: float | None = None
+    # Whether the fitted parameters above describe the data or merely
+    # reproduce it. "underdetermined" means there were too few detections for
+    # the exponent and reference level to be separable, so they are arithmetic,
+    # not measurement. The region is unaffected and remains honest.
+    fit_status: str = FIT_NOT_FITTED
     reference_level_db: float | None = None
     residual_rms_db: float | None = None
     residuals: list[dict[str, Any]] = field(default_factory=list)
@@ -125,6 +145,7 @@ class SolveResult:
             "mean_latitude": self.mean_latitude,
             "mean_longitude": self.mean_longitude,
             "path_loss_exponent": self.path_loss_exponent,
+            "fit_status": self.fit_status,
             "reference_level_db": self.reference_level_db,
             "residual_rms_db": self.residual_rms_db,
             "residuals": list(self.residuals),
@@ -572,8 +593,27 @@ def solve_site(
             "transmit power cannot be separated"
         )
 
-    if exponent in (min(resolved.path_loss_exponents), max(resolved.path_loss_exponents)) and (
-        len(resolved.path_loss_exponents) > 1
+    # Too few detections to tell the exponent and the reference level apart.
+    # Said before the edge-of-range warning below, because "the exponent is at
+    # the edge of the range" invites the reader to widen the range, and when
+    # the exponent was never identified in the first place a wider range only
+    # lets the fit travel further into a corner.
+    fit_status = FIT_IDENTIFIED
+    if len(detections) < resolved.min_detections_for_fit:
+        fit_status = FIT_UNDERDETERMINED
+        warnings.append(
+            f"the path-loss exponent and reference level are not identifiable from "
+            f"{len(detections)} detection(s): the reference level is fitted per cell and the "
+            "exponent chosen from a grid, so two detections are reproduced exactly by many "
+            "different pairs. The region below is still honest -- its size is the answer -- but "
+            "the fitted numbers are arithmetic rather than measurement and are reported as "
+            "unidentifiable"
+        )
+
+    if (
+        fit_status == FIT_IDENTIFIED
+        and exponent in (min(resolved.path_loss_exponents), max(resolved.path_loss_exponents))
+        and len(resolved.path_loss_exponents) > 1
     ):
         warnings.append(
             f"the best-fitting path-loss exponent ({exponent:g}) is at the edge of the searched "
@@ -635,6 +675,7 @@ def solve_site(
         path_loss_exponent=exponent,
         reference_level_db=reference_level,
         residual_rms_db=residual_rms,
+        fit_status=fit_status,
         residuals=residuals,
         azimuth_span_deg=span,
         diagnostics=diagnostics,
@@ -642,6 +683,10 @@ def solve_site(
 
 
 __all__ = [
+    "FIT_IDENTIFIED",
+    "FIT_NOT_FITTED",
+    "FIT_UNDERDETERMINED",
+    "FIT_UNKNOWN",
     "SOURCE_MODEL",
     "STATUS_INSUFFICIENT_EVIDENCE",
     "STATUS_OK",

@@ -23,6 +23,7 @@ from collections import Counter
 from pathlib import Path
 
 from dmr_iq_surveyor.geo.model import haversine_m
+from dmr_iq_surveyor.geo.solver import FIT_UNDERDETERMINED
 from dmr_iq_surveyor.geo.store import connect_geo_database
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
 
@@ -176,9 +177,19 @@ def solutions(connection: sqlite3.Connection) -> None:
             print(f"      region        50%: {row['area_km2_50']:.2f} km2   "
                   f"90%: {row['area_km2_90']:.2f} km2")
         bits = []
-        if row["path_loss_exponent"] is not None:
+        # Below the identifiability threshold the exponent and reference level
+        # are reproduced exactly by many different pairs, and the residual is
+        # arithmetic rather than agreement. Printing the numbers anyway would
+        # invite exactly the wrong reading -- "n is pegged at 5, widen the
+        # range" -- when the truth is that n was never measured at all.
+        underdetermined = row["fit_status"] == FIT_UNDERDETERMINED
+        if underdetermined:
+            bits.append(
+                f"n, P0 and residual UNIDENTIFIABLE from {row['detection_count']} detection(s)"
+            )
+        elif row["path_loss_exponent"] is not None:
             bits.append(f"n={row['path_loss_exponent']:.2f}")
-        if row["reference_level_db"] is not None:
+        if row["reference_level_db"] is not None and not underdetermined:
             bits.append(f"P0={row['reference_level_db']:.1f} dB")
         try:
             fading = json.loads(row["diagnostics_json"] or "{}").get("shadow_fading", {})
@@ -186,7 +197,7 @@ def solutions(connection: sqlite3.Connection) -> None:
                 bits.append(f"sigma={fading['best_sigma_db']:.0f} dB")
         except (TypeError, json.JSONDecodeError):
             pass
-        if row["residual_rms_db"] is not None:
+        if row["residual_rms_db"] is not None and not underdetermined:
             bits.append(f"residual RMS={row['residual_rms_db']:.1f} dB")
         if row["azimuth_span_deg"] is not None:
             bits.append(f"seen across {row['azimuth_span_deg']:.0f} deg of bearing")

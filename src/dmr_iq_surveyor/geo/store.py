@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS geo_solutions (
     reference_level_db REAL,
     level_metric TEXT NOT NULL,
     residual_rms_db REAL,
+    fit_status TEXT NOT NULL DEFAULT 'unknown',
     azimuth_span_deg REAL,
     warnings_json TEXT NOT NULL DEFAULT '[]',
     settings_json TEXT NOT NULL DEFAULT '{}',
@@ -115,6 +116,15 @@ def connect_geo_database(path: str | Path) -> sqlite3.Connection:
     if "scope" not in existing:
         connection.execute(
             "ALTER TABLE geo_run_exclusions ADD COLUMN scope TEXT NOT NULL DEFAULT 'all'"
+        )
+    solution_columns = {row[1] for row in connection.execute("PRAGMA table_info(geo_solutions)")}
+    if "fit_status" not in solution_columns:
+        # 'unknown', not 'identified': those batches were solved before the
+        # check existed, so whether their fits were separable was never
+        # established. Claiming they were would put a verdict on rows that
+        # never faced the question.
+        connection.execute(
+            "ALTER TABLE geo_solutions ADD COLUMN fit_status TEXT NOT NULL DEFAULT 'unknown'"
         )
     connection.commit()
     return connection
@@ -310,10 +320,10 @@ def store_solution(
             status_reason, detection_count, non_detection_count, excluded_count,
             mode_latitude, mode_longitude, mean_latitude, mean_longitude,
             area_km2_50, area_km2_90, path_loss_exponent, reference_level_db,
-            level_metric, residual_rms_db, azimuth_span_deg, warnings_json,
+            level_metric, residual_rms_db, fit_status, azimuth_span_deg, warnings_json,
             settings_json, diagnostics_json, residuals_json, geojson,
             input_run_ids_json, tool_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             solve_batch_id,
@@ -336,6 +346,7 @@ def store_solution(
             row.get("reference_level_db"),
             row["level_metric"],
             row.get("residual_rms_db"),
+            row.get("fit_status", "unknown"),
             row.get("azimuth_span_deg"),
             json.dumps(row.get("warnings", [])),
             json.dumps(row.get("settings", {}), sort_keys=True),

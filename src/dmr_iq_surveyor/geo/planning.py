@@ -65,6 +65,14 @@ class PlanSettings:
     # gain and stops dominating the plan.
     satisfied_area_km2: float = 3.0
     top_n: int = 5
+    # Whether sites whose propagation fit was never identified may steer the
+    # plan. Off by default: such a site's reference level and exponent are
+    # reproduced exactly by many different pairs, so the detection probability
+    # the planner predicts from them at a candidate stop is arithmetic, not a
+    # forecast. The sites are still solved and still reported -- they simply
+    # do not get a vote on where to drive until they have enough detections to
+    # earn one. Set it true to restore the old behaviour.
+    plan_from_underdetermined_fits: bool = False
     chunk_candidates: int = 512
 
     def validate(self) -> None:

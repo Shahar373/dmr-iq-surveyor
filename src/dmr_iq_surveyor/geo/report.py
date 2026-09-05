@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from dmr_iq_surveyor.geo.solver import FIT_UNDERDETERMINED
+
 
 def _format_position(latitude: float | None, longitude: float | None) -> str:
     if latitude is None or longitude is None:
@@ -69,6 +71,10 @@ def render_solution_markdown(
     ]
     for solution in sorted(solutions, key=lambda row: (row.get("rfss", 0), row.get("site", 0))):
         exponent = solution.get("path_loss_exponent")
+        # Named, not blanked: a dash would read as "the solver did not get
+        # this far", when in fact it got there and found the number carries
+        # no information.
+        underdetermined = solution.get("fit_status") == FIT_UNDERDETERMINED
         span = solution.get("azimuth_span_deg")
         lines.append(
             "| {key} | {status} | {det} | {non} | {mode} | {a50} | {a90} | {n} | {span} |".format(
@@ -81,7 +87,11 @@ def render_solution_markdown(
                 ),
                 a50=_format_area(solution.get("area_km2_50")),
                 a90=_format_area(solution.get("area_km2_90")),
-                n=f"{exponent:.2f}" if exponent is not None else "-",
+                n=(
+                    "unidentifiable"
+                    if underdetermined
+                    else (f"{exponent:.2f}" if exponent is not None else "-")
+                ),
                 span=f"{span:.0f} deg" if span is not None else "-",
             )
         )

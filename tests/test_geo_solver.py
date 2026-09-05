@@ -311,6 +311,64 @@ def test_a_pinned_path_loss_exponent_is_warned_about() -> None:
     assert any("edge of the searched range" in warning for warning in result.warnings)
 
 
+# -------------------------------------------------- fit identifiability
+
+
+def _two_detections() -> list[GeoMeasurement]:
+    """Two detections and a ring of non-detections around them.
+
+    Enough evidence for a region -- the non-detections bound it from outside
+    -- but not enough to separate the exponent from the reference level, since
+    the reference level is fitted per cell and consumes one of the two.
+    """
+    return _measurements(NEAR_STOPS[:2] + FAR_STOPS, reference_level_db=25.0)
+
+
+def test_two_detections_report_the_fit_as_unidentifiable() -> None:
+    result = solve_site(_two_detections(), fast_solve_settings())
+    assert result.detection_count == 2
+    assert result.fit_status == "underdetermined"
+    assert any("not identifiable" in warning for warning in result.warnings)
+
+
+def test_an_unidentifiable_fit_does_not_also_claim_the_range_is_too_narrow() -> None:
+    """The two warnings point opposite ways. "The exponent is at the edge of
+    the range" invites widening the range; when the exponent was never
+    identified, a wider range only lets the fit travel further into a corner.
+    Saying both would be advice against itself."""
+    result = solve_site(
+        _two_detections(), fast_solve_settings(path_loss_exponents=(2.0, 2.5))
+    )
+    assert result.fit_status == "underdetermined"
+    assert not any("edge of the searched range" in warning for warning in result.warnings)
+
+
+def test_the_region_itself_is_untouched_by_the_identifiability_check() -> None:
+    """The gate is about what gets REPORTED. A site with two detections still
+    gets the same posterior it always did -- an enormous one, which is the
+    honest answer -- and nothing about the region may move."""
+    measurements = _two_detections()
+    strict = solve_site(measurements, fast_solve_settings(min_detections_for_fit=3))
+    permissive = solve_site(measurements, fast_solve_settings(min_detections_for_fit=1))
+
+    assert strict.fit_status == "underdetermined"
+    assert permissive.fit_status == "identified"
+    assert strict.status == permissive.status
+    assert strict.mode_latitude == permissive.mode_latitude
+    assert strict.mode_longitude == permissive.mode_longitude
+    assert strict.path_loss_exponent == permissive.path_loss_exponent
+    assert np.allclose(strict.surface.probability, permissive.surface.probability)
+
+
+def test_enough_detections_leave_the_fit_identified() -> None:
+    result = solve_site(
+        _measurements(NEAR_STOPS + MID_STOPS + FAR_STOPS), fast_solve_settings()
+    )
+    assert result.detection_count >= 3
+    assert result.fit_status == "identified"
+    assert not any("not identifiable" in warning for warning in result.warnings)
+
+
 # --------------------------------------------------------------- contours
 
 
