@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS sites (
     gain_mode TEXT,
     gain REAL,
     notes TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    lna_state INTEGER
 );
 CREATE TABLE IF NOT EXISTS survey_runs (
     survey_run_id TEXT PRIMARY KEY,
@@ -169,6 +170,12 @@ def connect_survey_database(path: str | Path) -> sqlite3.Connection:
         ("gps_fetched_at_utc", "TEXT"),
     ):
         _ensure_column(connection, "survey_runs", column, declaration)
+    # The LNA state is the other half of a fixed manual gain: IFGR alone does
+    # not reproduce a receiver setting. It was applied to the radio but never
+    # stored, so a campaign that changed it between stops could not be caught
+    # by the gain check. NULL on rows written before this column existed means
+    # exactly "not recorded", and readers say so rather than assuming a value.
+    _ensure_column(connection, "sites", "lna_state", "INTEGER")
     connection.commit()
     return connection
 
@@ -182,8 +189,8 @@ def upsert_site(connection: sqlite3.Connection, site: SiteProfile) -> None:
             """
             INSERT INTO sites(
                 site_id, label, latitude, longitude, antenna, receiver,
-                gain_mode, gain, notes, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                gain_mode, gain, notes, created_at, lna_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site.site_id,
@@ -196,6 +203,7 @@ def upsert_site(connection: sqlite3.Connection, site: SiteProfile) -> None:
                 site.gain,
                 site.notes,
                 datetime.now(UTC).isoformat(),
+                site.lna_state,
             ),
         )
     else:
@@ -203,7 +211,7 @@ def upsert_site(connection: sqlite3.Connection, site: SiteProfile) -> None:
             """
             UPDATE sites SET
                 label = ?, latitude = ?, longitude = ?, antenna = ?,
-                receiver = ?, gain_mode = ?, gain = ?, notes = ?
+                receiver = ?, gain_mode = ?, gain = ?, notes = ?, lna_state = ?
             WHERE site_id = ?
             """,
             (
@@ -215,6 +223,7 @@ def upsert_site(connection: sqlite3.Connection, site: SiteProfile) -> None:
                 site.gain_mode,
                 site.gain,
                 site.notes,
+                site.lna_state,
                 site.site_id,
             ),
         )

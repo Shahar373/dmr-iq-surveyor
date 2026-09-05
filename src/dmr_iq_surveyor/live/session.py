@@ -48,10 +48,11 @@ from dmr_iq_surveyor.live.bins import (
     BinVisit,
     adaptive_bin_size_m,
 )
-from dmr_iq_surveyor.spectrum.core import SpectrumSettings, fft_frame_count
+from dmr_iq_surveyor.spectrum.core import SpectrumSettings
 from dmr_iq_surveyor.survey.discovery import (
     accumulate_segment_spectrum,
     observations_from_segments,
+    spread_frame_starts,
 )
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
 from dmr_iq_surveyor.survey.store import SurveyRunRecord, import_survey_run, upsert_site
@@ -296,21 +297,12 @@ def _window_frame_starts(
     second they came from, and clustering them at the start would measure
     the first fifth of the bin's travel and call it the bin.
     """
-    available = fft_frame_count(window_frames, settings.fft_size, settings.overlap_ratio)
-    if available < 1:
-        return []
-    wanted = min(frames_per_window or settings.frames_per_window, available)
-    span = window_frames - settings.fft_size
-    if wanted == 1 or span <= 0:
-        return [0]
-    # Clamped to `span`: rounding to a whole frame step can land past the end
-    # of the buffer, and a short final slice would reach the periodogram as a
-    # length mismatch rather than as anything meaningful.
-    step = max(1, settings.fft_size // 2)
-    starts = sorted(
-        {min(span, round(index * span / (wanted - 1) / step) * step) for index in range(wanted)}
+    return spread_frame_starts(
+        window_frames,
+        fft_size=settings.fft_size,
+        overlap_ratio=settings.overlap_ratio,
+        wanted=frames_per_window or settings.frames_per_window,
     )
-    return starts
 
 
 class LiveSession:

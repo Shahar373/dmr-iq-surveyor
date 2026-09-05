@@ -26,7 +26,11 @@ from dmr_iq_surveyor.geo.model import haversine_m
 from dmr_iq_surveyor.geo.solver import FIT_UNDERDETERMINED
 from dmr_iq_surveyor.geo.store import connect_geo_database
 from dmr_iq_surveyor.live.session import SUPERSEDED_REASON_PREFIX
-from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
+from dmr_iq_surveyor.survey.pipeline import (
+    DEFAULT_DATABASE_PATH,
+    DRIVE_VIEW_MODE,
+    DRIVE_VIEW_REASON_PREFIX,
+)
 
 
 def _rows(connection: sqlite3.Connection, sql: str, *args) -> list[sqlite3.Row]:
@@ -45,10 +49,14 @@ def stops(connection: sqlite3.Connection) -> None:
         connection,
         "SELECT r.survey_run_id, r.capture_start_utc, r.coverage_status, r.gps_latitude, "
         "       r.gps_longitude, r.analyzed_seconds, r.segment_count, r.settings_json, "
-        "       r.sample_rate_hz, r.center_frequency_hz, s.gain "
+        "       r.sample_rate_hz, r.center_frequency_hz, s.gain, s.lna_state "
         "FROM survey_runs r LEFT JOIN sites s ON s.site_id = r.site_id "
         "ORDER BY COALESCE(r.capture_start_utc, r.imported_at)",
     )
+    # A drive view is a second reading of a recorded stop, not a stop of its
+    # own: counted separately so the total is places measured, not rows.
+    views = [row for row in runs if _settings(row).get("mode") == DRIVE_VIEW_MODE]
+    runs = [row for row in runs if _settings(row).get("mode") != DRIVE_VIEW_MODE]
     live = [row for row in runs if _settings(row).get("mode") == "live"]
     holds = [row for row in runs if _settings(row).get("mode") == "live_stop"]
     fixed = [row for row in runs if _settings(row).get("mode") not in ("live", "live_stop")]
@@ -56,6 +64,9 @@ def stops(connection: sqlite3.Connection) -> None:
     print("== WHAT WAS COLLECTED " + "=" * 47)
     print(f"  stops total          {len(runs)}   ({len(fixed)} recorded, {len(live)} drive bins, "
           f"{len(holds)} stationary holds)")
+    if views:
+        print(f"  drive views          {len(views)} recorded stop(s) also read with the drive "
+              "statistic (kept beside the stop, not counted as a place)")
     moved = [row for row in holds if _settings(row).get("moved_during_hold")]
     if moved:
         print(f"  !! {len(moved)} hold(s) were not stationary -- the car moved during them")
@@ -65,12 +76,11 @@ def stops(connection: sqlite3.Connection) -> None:
         print(f"  first / last         {first[:16]}  ->  {last[:16]}")
 
     # Gain discipline: levels measured at different gain are not comparable,
-    # and that is the assumption the whole method rests on. Only the IF gain
-    # reduction is stored per stop -- the LNA state is applied to the radio
-    # but never written to the database, so a campaign that changed LNA state
-    # between stops would not be caught here. Said plainly rather than
-    # implied, because a check that silently covers half the setting is worse
-    # than no check.
+    # and that is the assumption the whole method rests on. Both halves of a
+    # manual gain are checked -- the IF gain reduction and the LNA state --
+    # and a stop written before the LNA state was stored is reported as "not
+    # recorded" rather than assumed to match, because a check that silently
+    # covers half the setting is worse than no check.
     gains = Counter(row["gain"] for row in runs if row["gain"] is not None)
     if len(gains) > 1:
         print("  !! IF GAIN VARIES ACROSS STOPS -- levels are not comparable:")
@@ -78,7 +88,19 @@ def stops(connection: sqlite3.Connection) -> None:
             print(f"       IFGR {gain} dB: {count} stop(s)")
     elif gains:
         gain, _count = gains.most_common(1)[0]
-        print(f"  gain (all stops)     IFGR {gain} dB   (LNA state is not recorded per stop)")
+        print(f"  gain (all stops)     IFGR {gain} dB")
+    lna = Counter(row["lna_state"] for row in runs if row["lna_state"] is not None)
+    lna_missing = sum(1 for row in runs if row["lna_state"] is None)
+    if len(lna) > 1:
+        print("  !! LNA STATE VARIES ACROSS STOPS -- levels are not comparable:")
+        for state, count in lna.most_common():
+            print(f"       LNA state {state}: {count} stop(s)")
+    elif lna:
+        state, count = lna.most_common(1)[0]
+        print(f"  LNA state            {state} on {count} stop(s)"
+              + (f"; not recorded on {lna_missing} earlier stop(s)" if lna_missing else ""))
+    elif runs:
+        print(f"  LNA state            not recorded on any stop (all {lna_missing} predate the column)")
 
     rates = Counter(row["sample_rate_hz"] for row in runs)
     print(
@@ -134,13 +156,67 @@ def measurements(connection: sqlite3.Connection) -> None:
 
     excluded = _rows(connection, "SELECT survey_run_id, reason, scope FROM geo_run_exclusions")
     superseded = [row for row in excluded if row["reason"].startswith(SUPERSEDED_REASON_PREFIX)]
+    views = [row for row in excluded if row["reason"].startswith(DRIVE_VIEW_REASON_PREFIX)]
     for row in excluded:
-        if row in superseded:
+        if row in superseded or row in views:
             continue
         scope = "" if row["scope"] == "all" else f" [{row['scope']} only]"
         print(f"  excluded stop        {row['survey_run_id']}: {row['reason']}{scope}")
     if superseded:
         _redriven_agreement(connection, superseded)
+    if views:
+        _drive_view_agreement(connection, views)
+
+
+def _drive_view_agreement(connection: sqlite3.Connection, views: list[sqlite3.Row]) -> None:
+    """A recorded stop and its drive view, channel by channel.
+
+    Same recording, same place, same radio -- only the statistic differs:
+    ~150 consecutive periodograms per segment against 24 spread ones per
+    second. Measured on synthetic air, the 24-frame p95 reads a few dB high
+    and so hears channels near the gate that the long average rejects. This
+    is the same comparison on real air, and it is what says how far a drive
+    bin and a stationary stop can be trusted to agree at the knee.
+    """
+    both = only_stop = only_view = 0
+    deltas: list[float] = []
+    for row in views:
+        view_id = row["survey_run_id"]
+        stop_id = row["reason"][len(DRIVE_VIEW_REASON_PREFIX):]
+        stop_channels = {
+            r["nearest_raster_hz"]: float(r["snr_db"]) for r in _rows(
+                connection,
+                "SELECT nearest_raster_hz, snr_db FROM rf_observations WHERE survey_run_id = ?",
+                stop_id,
+            )
+        }
+        view_channels = {
+            r["nearest_raster_hz"]: float(r["snr_db"]) for r in _rows(
+                connection,
+                "SELECT nearest_raster_hz, snr_db FROM rf_observations WHERE survey_run_id = ?",
+                view_id,
+            )
+        }
+        shared = stop_channels.keys() & view_channels.keys()
+        both += len(shared)
+        only_stop += len(stop_channels.keys() - shared)
+        only_view += len(view_channels.keys() - shared)
+        deltas.extend(view_channels[hz] - stop_channels[hz] for hz in shared)
+    print(f"  drive views          {len(views)} recorded stop(s) re-read with the drive statistic "
+          "(kept, not counted)")
+    print(f"                       channels heard by both {both}, only by the recording (~150 frames) "
+          f"{only_stop}, only by the drive view (24 frames) {only_view}")
+    if deltas:
+        deltas.sort()
+        median = deltas[len(deltas) // 2]
+        print(f"                       drive view reads {median:+.1f} dB relative to the recording "
+              f"(median over {len(deltas)} shared channel(s))")
+    if only_view > only_stop:
+        print("                       -> the drive statistic hears more at the knee, as measured; "
+              "a site a drive bin hears and a stop does not is not a contradiction")
+    elif only_stop > only_view:
+        print("                       -> the long average hears more here than the drive statistic "
+              "did; not what the synthetic measurement predicted -- worth a look")
 
 
 def _redriven_agreement(connection: sqlite3.Connection, superseded: list[sqlite3.Row]) -> None:

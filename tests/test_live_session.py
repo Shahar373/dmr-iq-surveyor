@@ -1052,3 +1052,21 @@ def test_a_hold_that_moved_says_so(tmp_path: Path) -> None:
     assert len(holds) == 1
     assert holds[0]["settings"]["moved_during_hold"] is True
     assert holds[0]["settings"]["position_spread_m"] > 30.0
+
+
+def test_window_frame_starts_is_the_shared_spread(tmp_path) -> None:
+    """The drive window and the stationary drive view take their frames from
+    the same function, so the two statistics cannot drift apart."""
+    from dmr_iq_surveyor.live.session import LiveSettings, _window_frame_starts
+    from dmr_iq_surveyor.survey.discovery import spread_frame_starts
+
+    settings = LiveSettings(fft_size=4096, frames_per_window=24)
+    window = 200_000  # one second at the fixture rate
+    starts = _window_frame_starts(window, settings)
+    assert starts == spread_frame_starts(window, fft_size=4096, overlap_ratio=0.5, wanted=24)
+    assert len(starts) == 24
+    assert starts[0] == 0 and starts[-1] <= window - 4096
+    assert all(b - a >= 2048 for a, b in zip(starts, starts[1:], strict=False))
+    # Too short for one frame: nothing, not a crash and not a partial frame.
+    assert spread_frame_starts(1000, fft_size=4096, overlap_ratio=0.5, wanted=24) == []
+    assert spread_frame_starts(4096, fft_size=4096, overlap_ratio=0.5, wanted=24) == [0]

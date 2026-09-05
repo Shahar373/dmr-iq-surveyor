@@ -573,6 +573,25 @@ flip in one ten-second bin and a settled answer after sixty seconds. Each run no
 `frames_per_window`, because a drive bin (24) and a recorded stop (~150) sit on different points of
 that curve and a reader of the two side by side should know it.
 
+**The drive view of a recorded stop.** Rather than leave that difference as a footnote, every
+recorded stop taken through the field app is also read back the way a drive bin would have heard it:
+one-second windows, 24 spread periodograms each, at the live FFT size, through the same
+`spread_frame_starts` the drive loop uses. The result is stored as a second survey run named
+`<run_id>_drive_view` (`mode: drive_view`, `derived_from`), beside the stop and with the stop's own
+analysis and labels untouched, and is excluded from geolocation on the spot with the reason
+`drive_view of <run_id>` — the solver must not see one stop as two agreeing places. What it buys is a
+measurement on real air of the thing the synthetic table only predicted: the digest lists, over all
+such pairs, the channels heard by both statistics, only by the long average, and only by the drive
+statistic, with the median level shift between them. `survey run --drive-view` does the same for a
+recording analysed by hand; the field app has it on by default (`drive_view_for_stops`).
+
+**Both halves of the gain are stored.** The SDRplay's manual gain is an IF gain reduction *and* an
+LNA state, and only the first was written to the database, so the digest's gain-discipline check
+covered half the setting. `sites.lna_state` (additive, `NULL` on rows written before it existed) now
+carries the state actually applied at each stop and each drive, and the digest reports it the same
+way it reports IFGR: one value across the campaign, a warning when it varies, and "not recorded"
+where an older stop cannot say.
+
 Two length scales decide the design, and neither is adjustable by taste:
 
 - **A window is one second.** At 50 km/h that is 14 m, about 40 wavelengths at 868 MHz — the

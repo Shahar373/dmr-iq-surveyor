@@ -610,6 +610,120 @@ def observations_from_segments(
     }
 
 
+def spread_frame_starts(
+    frame_count: int, *, fft_size: int, overlap_ratio: float, wanted: int
+) -> list[int]:
+    """Where in a span of `frame_count` samples to take `wanted` FFT frames,
+    spread across the whole span rather than clustered at its start.
+
+    This is the drive-mode window: a bin's second is represented by frames
+    from all of it, not from its first fifth. Shared with the stationary
+    "drive view" so the two are the same statistic by construction, not by
+    two copies of the same arithmetic drifting apart.
+    """
+    available = fft_frame_count(frame_count, fft_size, overlap_ratio)
+    if available < 1:
+        return []
+    count = min(wanted, available)
+    span = frame_count - fft_size
+    if count == 1 or span <= 0:
+        return [0]
+    # Clamped to `span`: rounding to a whole frame step can land past the end
+    # of the buffer, and a short final slice would reach the periodogram as a
+    # length mismatch rather than as anything meaningful.
+    step = max(1, fft_size // 2)
+    return sorted(
+        {min(span, round(index * span / (count - 1) / step) * step) for index in range(count)}
+    )
+
+
+def discover_observations_windowed(
+    recording_path: str | Path,
+    *,
+    band_profile: BandProfile,
+    assumed_iq_order: str = "IQ",
+    fft_size: int = 16_384,
+    frames_per_window: int = 24,
+    window_seconds: float = 1.0,
+    max_windows: int | None = None,
+) -> dict[str, Any]:
+    """The drive-mode statistic, computed over a stationary recording.
+
+    A drive bin is up to ten one-second windows of 24 spread periodograms
+    each; a stationary survey segment averages ~150 consecutive ones. The
+    detector's `p95_snr_db` is a percentile ACROSS frames, so the two do not
+    agree on a channel a few dB either side of the gate -- measured: at 5 dB
+    true in-channel SNR, 24 frames detect and 150 do not. This pass cuts the
+    recording into `window_seconds` windows and takes `frames_per_window`
+    spread frames from each, exactly as `live.session` does on the air, so
+    a recorded stop and a drive bin can be read side by side.
+
+    Bounded like everything else here: frames are read through the memmap
+    one at a time and only their accumulated spectra are kept.
+    """
+    source = Path(recording_path).expanduser().resolve()
+    info = inspect_wave_iq(source, assumed_iq_order=assumed_iq_order)
+    if info.center_frequency_hz is None:
+        raise ValueError("Center frequency is required for survey discovery")
+    reader = IQMemmapReader(info)
+    sample_rate = float(info.fmt.sample_rate_hz)
+    spectrum_settings = SpectrumSettings(fft_size=fft_size, overlap_ratio=0.5)
+
+    windows = plan_segments(
+        info.frame_count,
+        sample_rate,
+        segment_seconds=window_seconds,
+        stride_seconds=window_seconds,
+        max_segments=max_windows,
+    )
+    spectra: list[SegmentSpectrum] = []
+    skipped = 0
+    for window in windows:
+        starts = spread_frame_starts(
+            window.frame_count,
+            fft_size=fft_size,
+            overlap_ratio=spectrum_settings.overlap_ratio,
+            wanted=frames_per_window,
+        )
+        if not starts:
+            skipped += 1
+            continue
+
+        def frames(starts: list[int] = starts, base: int = window.start_frame) -> Iterator[np.ndarray]:
+            for start in starts:
+                yield reader.read_complex(base + start, fft_size)
+
+        spectra.append(
+            accumulate_segment_spectrum(
+                frames(),
+                fft_count=len(starts),
+                sample_rate_hz=sample_rate,
+                center_frequency_hz=float(info.center_frequency_hz),
+                nominal_low_hz=float(info.nominal_frequency_low_hz),
+                nominal_high_hz=float(info.nominal_frequency_high_hz),
+                settings=spectrum_settings,
+            )
+        )
+
+    detection = observations_from_segments(
+        spectra,
+        band_profile=band_profile,
+        center_frequency_hz=float(info.center_frequency_hz),
+        sample_rate_hz=sample_rate,
+        spectrum_settings=spectrum_settings,
+    )
+    return {
+        **detection,
+        "recording": info,
+        "segment_count": len(windows),
+        "segments_skipped": skipped,
+        "frames_per_window": frames_per_window,
+        "analyzed_seconds": sum(
+            w.end_seconds - w.start_seconds for w in windows[: len(spectra)]
+        ),
+    }
+
+
 def discover_observations(
     recording_path: str | Path,
     *,
@@ -684,8 +798,10 @@ __all__ = [
     "accumulate_segment_spectrum",
     "analyze_segment",
     "discover_observations",
+    "discover_observations_windowed",
     "measure_usable_passband",
     "observations_from_segments",
     "plan_segments",
     "resolve_capture_time",
+    "spread_frame_starts",
 ]

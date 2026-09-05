@@ -41,7 +41,7 @@ from dmr_iq_surveyor.geo.store import (
 )
 from dmr_iq_surveyor.live.session import LiveSession, LiveSettings, Position
 from dmr_iq_surveyor.reference.store import list_sites
-from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_survey
+from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, DriveViewSettings, run_survey
 from dmr_iq_surveyor.survey.profiles import (
     ProfileError,
     SiteProfile,
@@ -149,6 +149,13 @@ class FieldSettings:
     # instead just measure again. A failed stop still keeps its IQ, and every
     # deletion is written to a ledger. Set it to 1 to keep the last one.
     keep_recordings: int = 0
+    # Every recorded stop is also read back the way a drive bin hears it
+    # (24 spread periodograms per one-second window, at the live FFT size)
+    # and stored as a second, solve-excluded run beside the stop. Measured
+    # reason: the detector's p95 is a percentile across frames, so a channel
+    # near the gate is decided differently by 24 frames and by ~150. Keeping
+    # both views is what lets the digest say how often that happens on air.
+    drive_view_for_stops: bool = True
     # A capture that delivered materially less than it asked for must not
     # contribute: undetected weak signals would become non-detections, which
     # is evidence, not absence.
@@ -616,6 +623,7 @@ class FieldService:
             site_profile,
             gain=capture.if_gain_reduction_db,
             gain_mode="agc" if capture.agc else "manual",
+            lna_state=capture.lna_state,
         )
         solve = bool(payload.get("solve", self.settings.solve_after_capture))
 
@@ -712,11 +720,26 @@ class FieldService:
             gps_fetched_at_utc=position.get("set_at"),
             site_id_override=stop_id,
             site_label_override=label or stop_id,
+            drive_view=(
+                DriveViewSettings(
+                    fft_size=self.settings.live_fft_size,
+                    frames_per_window=self.settings.live_frames_per_window,
+                    window_seconds=self.settings.live_window_seconds,
+                )
+                if self.settings.drive_view_for_stops
+                else None
+            ),
         )
         job.check_cancelled()
+        view = survey.get("drive_view")
         job.emit(
             "survey",
-            f"{survey['observation_count']} observation(s), coverage {survey['coverage_status']}",
+            f"{survey['observation_count']} observation(s), coverage {survey['coverage_status']}"
+            + (
+                f"; drive view heard {view['observation_count']} over {view['windows']} window(s)"
+                if view
+                else ""
+            ),
             progress=0.82,
         )
 
