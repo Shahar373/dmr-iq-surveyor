@@ -531,6 +531,48 @@ when you ask for it — bins are written the whole time either way, and a solve 
 map catches up with them, at the cost of CPU the receiver is competing for. Stopping the drive runs
 a final solve. Set `live_solve_every_bins` above zero to have it happen on its own.
 
+**Driving alone.** While a drive runs the tab shows three large numbers — bins, sites heard in the
+last bin, GPS age — and speaks the events a driver cannot look down for: drive started, GPS lost
+and back, every fifth bin, a stop suggestion, "done, you can drive" after a hold, drive stopped. The
+screen is held awake for the length of the drive because some browsers throttle the GPS watch when
+the tab sleeps. Voice can be turned off on the tab.
+
+**"Worth a stop here."** A drive bin integrates for ten seconds. When a bin shows a registry
+control channel that missed the detection gate by less than 3 dB in most of its windows, the app
+says so, names the sites, and offers **Measure here, 60 s**. That is a *hold*: binning pauses, the
+receiver integrates where it stands, the result is written as a `live_stop` run that supersedes the
+drive bin at that spot, and binning resumes. If the positions during a hold spread more than 30 m
+the row is written with `moved_during_hold: true` — kept, since the data is real, but not passed
+off as stationary. A hold cannot make a detection out of nothing (see below); it settles a coin flip.
+
+**A second day on the same road.** Every drive bin's id carries the place *and* the session.
+Re-driving a road writes new bins and marks the earlier ones `superseded by …` — kept, with their
+observations, but barred from the solve, so two days are one constraint per place and a free
+consistency check. The digest puts the two side by side: median level shift and spread over the
+channels both drives heard.
+
+**What was measured about sensitivity, and what it rules out.** Every bin of the first real drive
+hit the 10-window cap, so two levers were measured rather than reasoned about, with the live
+pipeline's own detector on a synthesised 12.5 kHz carrier at in-channel SNRs around the 9 dB p95
+gate:
+
+| in-channel SNR | 5 windows | 10 windows | 20 windows | 30 windows |
+|---|---|---|---|---|
+| 3 dB | 0% | 0% | 25% | 25% |
+| 5 dB | 25% | **100%** | 100% | 100% |
+| 7 dB | 100% | 100% | 100% | 100% |
+
+More *windows* past ten buy nothing: the cap stays at 10. And more *periodograms per window* go
+the wrong way — at 5 dB, 24 frames detected 100% and 150 frames detected 0%. `p95_snr_db` is the
+per-bin 95th percentile *across frames*, and with 24 frames that is roughly the second-highest of 24
+chi-squared samples, inflated by a few dB above the true level; at 150 frames it converges to the
+true ~5 dB and correctly fails the gate. So the detection floor is the gate itself, around 5 dB true
+in-channel SNR in practice, and no amount of averaging moves it. Averaging only narrows the
+*variance* of the decision — which is exactly what a hold is for: a channel at 6–9 dB is a coin
+flip in one ten-second bin and a settled answer after sixty seconds. Each run now records its
+`frames_per_window`, because a drive bin (24) and a recorded stop (~150) sit on different points of
+that curve and a reader of the two side by side should know it.
+
 Two length scales decide the design, and neither is adjustable by taste:
 
 - **A window is one second.** At 50 km/h that is 14 m, about 40 wavelengths at 868 MHz — the

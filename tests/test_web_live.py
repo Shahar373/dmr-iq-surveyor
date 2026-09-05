@@ -455,3 +455,107 @@ def test_the_app_drives_with_adaptive_spans_inside_their_limits(
     status = service.live_status()
     assert status["bin_count"] >= 3
     assert 100.0 <= status["stats"]["bin_size_m"] <= 250.0
+
+
+def test_a_hold_can_only_be_asked_for_mid_drive(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    with pytest.raises(ValueError, match="no drive is running"):
+        service.request_live_hold({"seconds": 60})
+
+
+def test_a_hold_request_is_bounded_and_handed_to_the_drive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ten to three hundred seconds, taken at the next window, reported in
+    the status the phone polls -- including the countdown a pulled-over
+    driver is waiting on."""
+    service = _service(tmp_path)
+    rig = _Rig(service, start=(32.0400, 34.7800), speed_ms=20.0)
+    monkeypatch.setattr(live_session, "SoapyIqDevice", lambda: rig)
+    monkeypatch.setattr(web_service, "probe_soapysdr", lambda driver: _Probe())
+    service.push_live_position({"latitude": 32.0400, "longitude": 34.7800, "accuracy_m": 6.0})
+    job = service.start_live({"max_seconds": 120.0, "fft_size": 4096, "frames_per_window": 8})
+    deadline = time.monotonic() + 90.0
+    while service.live_status()["bin_count"] < 1 and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    result = service.request_live_hold({"seconds": 3})
+    assert result["accepted"]
+    assert result["seconds"] == 10.0, "requests under ten seconds are raised to ten"
+    status = service.live_status()
+    assert status["hold"]["requested"] or status["hold"]["active"]
+
+    # Taken at the next window boundary, then counted down.
+    while not service.live_status()["hold"]["active"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    active = service.live_status()["hold"]
+    assert active["active"]
+    assert 0.0 < active["seconds_left"] <= 10.0
+    second = service.request_live_hold({"seconds": 60})
+    assert not second["accepted"] and "already" in second["reason"]
+
+    job.request_cancel()
+    while not job.is_terminal() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    # The status the phone polls carries both structures whether or not a
+    # drive is running, so the page never has to guard against their absence.
+    final = service.live_status()
+    assert set(final["hold"]) == {"active", "seconds_left", "requested", "holds_written"}
+    assert set(final["pull_over"]) == {"suggest", "sites", "channels", "bin", "reason"}
+    assert final["hold"]["active"] is False
+    assert final["pull_over"]["suggest"] is False, "nothing is suggested once the drive is over"
+
+
+def test_the_pull_over_hint_names_registry_sites_and_only_them(tmp_path: Path) -> None:
+    """A near miss on a control channel the registry knows is a reason to
+    stop; a near miss on some other frequency is not. The hint says which."""
+    service = _service(tmp_path)
+    service._live_cc_index = [(867_762_500.0, "BEE00:37D:1:30"), (866_712_500.0, "BEE00:37D:1:33")]
+    service._live_cc_tolerance_hz = 6_250.0
+    service._live_bins = [
+        {
+            "kind": "bin", "survey_run_id": "live_x_+00001_+00001_s",
+            "near_threshold": [
+                {"frequency_hz": 867_762_500.0, "p95_snr_db": 7.4, "segments_near": 8, "segments_analyzed": 10},
+                {"frequency_hz": 868_500_000.0, "p95_snr_db": 8.1, "segments_near": 9, "segments_analyzed": 10},
+            ],
+        }
+    ]
+    hint = service._pull_over_hint(running=True)
+    assert hint["suggest"] is True
+    assert [s["site_key"] for s in hint["sites"]] == ["BEE00:37D:1:30"]
+    assert hint["channels"] == 2, "both near misses are counted, one is named"
+    assert hint["bin"] == "live_x_+00001_+00001_s"
+
+    service._live_bins[-1]["near_threshold"] = [
+        {"frequency_hz": 868_500_000.0, "p95_snr_db": 8.1, "segments_near": 9, "segments_analyzed": 10},
+    ]
+    hint = service._pull_over_hint(running=True)
+    assert hint["suggest"] is False
+    assert "none a registry control channel" in hint["reason"]
+
+    assert service._pull_over_hint(running=False)["suggest"] is False
+
+
+def test_the_hold_endpoint_is_reachable_and_refuses_without_a_drive(tmp_path: Path) -> None:
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    from dmr_iq_surveyor.web.server import create_server
+
+    server = create_server(_service(tmp_path).settings, host="127.0.0.1", port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    request = urllib.request.Request(
+        base + "/api/live/hold", data=b'{"seconds": 60}',
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(request, timeout=30)
+        assert excinfo.value.code == 400
+        assert "no drive" in _json.loads(excinfo.value.read().decode())["error"]
+    finally:
+        server.shutdown()
+        server.server_close()

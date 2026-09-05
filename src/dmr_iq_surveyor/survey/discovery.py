@@ -573,10 +573,38 @@ def observations_from_segments(
         )
     observations.sort(key=lambda item: item.measured_center_hz)
 
+    # Channels that missed the gate by a little in most segments and did not
+    # become an observation. Aggregated by raster step so a channel that was
+    # near in seven of ten windows is one entry with seven votes, not seven
+    # entries. Kept apart from `observations` on purpose: these are NOT
+    # detections and must never be written as evidence -- they are a hint
+    # about where a longer, stationary measurement would probably pay off.
+    near_votes: dict[float, list[float]] = {}
+    for _label, result in segment_results:
+        for feature in result.get("near_threshold", []):
+            centre = float(feature["frequency_hz_assuming_iq"])
+            near_votes.setdefault(centre, []).append(float(feature["p95_snr_db"]))
+    detected_centres = [item.measured_center_hz for item in observations]
+    near_threshold = []
+    for centre, p95s in sorted(near_votes.items()):
+        if len(p95s) * 2 < len(segment_spectra):
+            continue
+        if any(abs(centre - seen) <= detection_settings.merge_tolerance_hz for seen in detected_centres):
+            continue
+        near_threshold.append(
+            {
+                "frequency_hz": centre,
+                "p95_snr_db": round(sorted(p95s)[len(p95s) // 2], 2),
+                "segments_near": len(p95s),
+                "segments_analyzed": len(segment_spectra),
+            }
+        )
+
     return {
         "observations": observations,
         "usable_passband": passband,
         "segments_analyzed": len(segment_spectra),
+        "near_threshold": near_threshold,
         "detection_settings": detection_settings,
         "occupancy_threshold_db": spectrum_settings.occupancy_threshold_db,
     }

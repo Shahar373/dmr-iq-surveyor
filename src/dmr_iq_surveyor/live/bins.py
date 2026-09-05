@@ -69,6 +69,9 @@ class BinKey:
 # that a set of them stays small across a long drive.
 DEFAULT_LEDGER_CELL_M = 50.0
 
+VISIT_DRIVE = "drive"
+VISIT_HOLD = "hold"
+
 # Bounds on how much road one adaptive measurement covers. Both are 150 m, and
 # both were set by measurement after an argument said otherwise.
 #
@@ -128,6 +131,10 @@ class BinVisit:
     # Where the visit began, for deciding when it has covered enough road.
     origin: tuple[float, float] | None = None
     span_target_m: float = 0.0
+    # What kind of measurement this is. A drive bin is the default; a hold is
+    # a deliberate stop mid-drive, integrated longer, and is written and
+    # reported differently -- but travels the same close-and-write path.
+    kind: str = VISIT_DRIVE
 
     @property
     def window_count(self) -> int:
@@ -273,6 +280,8 @@ __all__ = [
     "DEFAULT_LEDGER_CELL_M",
     "MAX_ADAPTIVE_BIN_M",
     "MIN_ADAPTIVE_BIN_M",
+    "VISIT_DRIVE",
+    "VISIT_HOLD",
     "adaptive_bin_size_m",
     "BinGrid",
     "BinKey",

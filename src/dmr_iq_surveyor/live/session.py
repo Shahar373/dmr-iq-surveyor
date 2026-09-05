@@ -36,11 +36,13 @@ import numpy as np
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.device import DeviceSettings, IqDevice, SoapyIqDevice
 from dmr_iq_surveyor.geo.model import haversine_m
+from dmr_iq_surveyor.geo.store import EXCLUSION_SCOPE_ALL, exclude_run, run_exclusion
 from dmr_iq_surveyor.live.bins import (
     DEFAULT_BIN_SIZE_M,
     DEFAULT_LEDGER_CELL_M,
     MAX_ADAPTIVE_BIN_M,
     MIN_ADAPTIVE_BIN_M,
+    VISIT_HOLD,
     BinGrid,
     BinKey,
     BinVisit,
@@ -59,6 +61,11 @@ from dmr_iq_surveyor.survey.store import SurveyRunRecord, import_survey_run, ups
 # fading to recover the local mean. Shorter and multipath leaks into the
 # measurement; much longer and one window smears across bins.
 DEFAULT_WINDOW_SECONDS = 1.0
+
+# Prefix of the exclusion reason written on a bin that a later drive over the
+# same road replaced. A constant so the digest can recognise it and compare
+# the two measurements rather than merely count them.
+SUPERSEDED_REASON_PREFIX = "superseded by "
 
 
 @dataclass(slots=True)
@@ -166,6 +173,16 @@ class LiveSettings:
     fft_size: int = 16_384
     overlap_ratio: float = 0.5
     chunk_frames: int = 262_144
+    # Periodograms per window while the car is stopped for a deliberate
+    # "measure here" hold. None means the same as while driving. Left None
+    # until the frames-per-window measurement says more of them buys
+    # sensitivity -- the window-count measurement already showed that more
+    # WINDOWS do not, so this is the one knob a hold could still turn.
+    hold_frames_per_window: int | None = None
+    # A hold is declared stationary. If the positions its windows carry
+    # spread further than this, the car moved, and the measurement is written
+    # with that said rather than dropped or passed off as still.
+    hold_max_spread_m: float = 30.0
     # Analyse a finished bin on a second thread instead of in the streaming
     # loop. The detector scans every raster step of the band once PER WINDOW
     # in the bin -- about 0.11 s per window here, several times that on a Pi
@@ -247,6 +264,18 @@ class LiveStats:
     # metres from the last one -- inside the distance over which shadow fading
     # is still correlated, which is the one thing the binning exists to stop.
     windows_held_apart: int = 0
+    # Bins from an EARLIER drive that this one re-measured. The old rows are
+    # kept -- excluded from the solve with a reason naming their replacement,
+    # so two days on one road are one constraint and a free consistency
+    # check, not two constraints and a silent overwrite.
+    bins_superseded: int = 0
+    # Deliberate stationary measurements taken mid-drive, and their live
+    # state for the phone: a driver who has pulled over needs to know when
+    # they may go, and a status poll is how they find out.
+    holds_written: int = 0
+    hold_seconds_total: float = 0.0
+    hold_active: bool = False
+    hold_seconds_left: float = 0.0
     observations_written: int = 0
     overflow_count: int = 0
     # True when no campaign anchor was configured and the grid fell back to
@@ -258,7 +287,9 @@ class LiveStats:
         return asdict(self)
 
 
-def _window_frame_starts(window_frames: int, settings: LiveSettings) -> list[int]:
+def _window_frame_starts(
+    window_frames: int, settings: LiveSettings, frames_per_window: int | None = None
+) -> list[int]:
     """Where in a window to take FFT frames, spread across its whole span.
 
     Spread rather than consecutive: the frames are meant to represent the
@@ -268,7 +299,7 @@ def _window_frame_starts(window_frames: int, settings: LiveSettings) -> list[int
     available = fft_frame_count(window_frames, settings.fft_size, settings.overlap_ratio)
     if available < 1:
         return []
-    wanted = min(settings.frames_per_window, available)
+    wanted = min(frames_per_window or settings.frames_per_window, available)
     span = window_frames - settings.fft_size
     if wanted == 1 or span <= 0:
         return [0]
@@ -297,6 +328,7 @@ class LiveSession:
         device: IqDevice | None = None,
         on_bin: Callable[[dict[str, Any]], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        hold_provider: Callable[[], float | None] | None = None,
     ) -> None:
         settings.validate()
         self.session_id = session_id
@@ -308,6 +340,17 @@ class LiveSession:
         self.device = device
         self.on_bin = on_bin
         self.clock = clock
+        # Polled once per window. A duration in seconds means: stop binning,
+        # stay here, integrate for that long, write it as one stationary
+        # measurement, then carry on. None means keep driving.
+        self.hold_provider = hold_provider
+        self._hold_visit: BinVisit | None = None
+        self._hold_until: float | None = None
+        self._hold_seconds: float = 0.0
+        # Places a hold has claimed. A drive bin for one of these that is
+        # still in the analysis queue when the hold lands would otherwise be
+        # written afterwards and count beside it.
+        self._held_places: set[str] = set()
         self.stats = LiveStats()
         self._grid: BinGrid | None = None
         self._visit: BinVisit | None = None
@@ -379,6 +422,10 @@ class LiveSession:
                     # Where the window began. Its measurement belongs midway
                     # between here and where it ends, not at either end.
                     started_at = self.position_provider()
+                    if self._hold_visit is None and self.hold_provider is not None:
+                        wanted = self.hold_provider()
+                        if wanted is not None and wanted > 0:
+                            self._begin_hold(float(wanted), started_at, connection)
                 chunk = np.asarray(
                     resolved_device.read_stream_chunk(
                         min(self.settings.chunk_frames, window_frames - filled)
@@ -424,6 +471,13 @@ class LiveSession:
             # placed, and placing it at the last known position is exactly
             # how a drive would smear measurements onto a spot it had left.
             self.stats.windows_without_position += 1
+            return
+
+        if self._hold_visit is not None:
+            # Declared stationary, so the travel guard does not apply -- a GPS
+            # wobble must not drop a window from a car that is parked. Whether
+            # it really stayed still is judged from the positions afterwards.
+            self._consume_hold_window(samples, ended_at, connection)
             return
 
         travelled = haversine_m(
@@ -555,8 +609,8 @@ class LiveSession:
         self.stats.bin_size_m = round(span, 1)
         return span
 
-    def _analyse(self, samples: np.ndarray) -> Any:
-        starts = _window_frame_starts(samples.size, self.settings)
+    def _analyse(self, samples: np.ndarray, frames_per_window: int | None = None) -> Any:
+        starts = _window_frame_starts(samples.size, self.settings, frames_per_window)
         if not starts:
             return None
 
@@ -574,6 +628,68 @@ class LiveSession:
             nominal_high_hz=self.settings.center_frequency_hz + nyquist,
             settings=self._spectrum_settings,
         )
+
+    # -- a deliberate stop mid-drive ---------------------------------------
+
+    def _begin_hold(self, seconds: float, at: Position | None, connection: Any) -> None:
+        """Stop binning and integrate here.
+
+        The open drive bin is closed first so the road up to this point is
+        kept. The hold then accumulates windows with no cap and no span --
+        the car is not moving, so neither applies -- until its time is up.
+        """
+        self._close_visit(connection)
+        if self._grid is None and at is not None:
+            anchor_lat = self.settings.grid_anchor_latitude
+            anchor_lon = self.settings.grid_anchor_longitude
+            if anchor_lat is None or anchor_lon is None:
+                anchor_lat, anchor_lon = at.latitude, at.longitude
+                self.stats.anchor_from_first_fix = True
+            self._grid = BinGrid(anchor_lat, anchor_lon, bin_size_m=self.settings.grid_cell_m())
+        key = (
+            self._grid.key_for(at.latitude, at.longitude)
+            if self._grid is not None and at is not None
+            else BinKey(0, 0)
+        )
+        self._hold_seconds = seconds
+        self._hold_visit = BinVisit(
+            key=key,
+            started_utc=datetime.now(UTC).isoformat(),
+            origin=(at.latitude, at.longitude) if at is not None else None,
+            span_target_m=self._span_target_m(),
+            kind=VISIT_HOLD,
+        )
+        self._hold_until = self.clock() + seconds
+        self.stats.hold_active = True
+        self.stats.hold_seconds_left = seconds
+
+    def _consume_hold_window(self, samples: np.ndarray, at: Position, connection: Any) -> None:
+        visit = self._hold_visit
+        assert visit is not None and self._hold_until is not None
+        spectrum = self._analyse(samples, self.settings.hold_frames_per_window)
+        if spectrum is not None:
+            visit.spectra.append(spectrum)
+            visit.latitudes.append(at.latitude)
+            visit.longitudes.append(at.longitude)
+            if self._grid is not None:
+                visit.cells.add(self._grid.key_for(at.latitude, at.longitude))
+            self.stats.windows_recorded += 1
+        self.stats.hold_seconds_left = max(0.0, self._hold_until - self.clock())
+        if self.clock() >= self._hold_until:
+            self._finish_hold(connection)
+
+    def _finish_hold(self, connection: Any) -> None:
+        visit, self._hold_visit, self._hold_until = self._hold_visit, None, None
+        self.stats.hold_active = False
+        self.stats.hold_seconds_left = 0.0
+        if visit is None:
+            return
+        self.stats.hold_seconds_total += self._hold_seconds
+        # Routed through the same close path as a drive bin, so it is analysed
+        # on the worker thread and written by the streaming thread like any
+        # other, and so the ledger and the pitch hold learn about it.
+        self._visit = visit
+        self._close_visit(connection)
 
     # -- writing a bin -----------------------------------------------------
 
@@ -672,13 +788,36 @@ class LiveSession:
         analysed = (
             visit.window_count
             * len(_window_frame_starts(
-                round(self.settings.window_seconds * self.settings.sample_rate_hz), self.settings
+                round(self.settings.window_seconds * self.settings.sample_rate_hz),
+                self.settings,
+                (self.settings.hold_frames_per_window or None) if visit.kind == VISIT_HOLD else None,
             ))
             * self.settings.fft_size
             / self.settings.sample_rate_hz
         )
+        # The id carries the place AND the drive. A place-only id made a second
+        # day on the same road overwrite the first in silence: no duplicate
+        # evidence, which was the point, but also no record that the first
+        # measurement ever existed and no way to see whether the two agreed.
+        # Now the earlier bin stays, barred from the solve with a reason that
+        # names its replacement, and the digest can put the two side by side.
+        place_key = visit.key.run_id(self._grid.tag)
+        is_hold = visit.kind == VISIT_HOLD
+        run_id = f"{place_key}_{self.session_id}" + ("_hold" if is_hold else "")
+        # A hold is the better measurement of its place, so it supersedes the
+        # drive bin taken there -- this session's or an earlier one's -- and
+        # is itself superseded by a later day's hold on the same spot.
+        self.stats.bins_superseded += _supersede_earlier_bins(connection, place_key, run_id)
+        if is_hold:
+            self._held_places.add(place_key)
+        frames = (
+            (self.settings.hold_frames_per_window or self.settings.frames_per_window)
+            if is_hold
+            else self.settings.frames_per_window
+        )
+        spread = visit.spread_m()
         record = SurveyRunRecord(
-            survey_run_id=visit.key.run_id(self._grid.tag),
+            survey_run_id=run_id,
             site_id=self.site.site_id,
             band_profile=self.band.name,
             # No file: this measurement never existed as a recording, and
@@ -701,8 +840,21 @@ class LiveSession:
             detection_settings=detection["detection_settings"].to_dict(),
             tool_version=__version__,
             settings={
-                "mode": "live",
+                "mode": "live_stop" if is_hold else "live",
                 "session_id": self.session_id,
+                "frames_per_window": frames,
+                **(
+                    {
+                        "hold_seconds": self._hold_seconds,
+                        # Said, not assumed: a "stationary" measurement whose
+                        # positions spread further than a parked car's GPS
+                        # jitter was not stationary, and a reader should know.
+                        "moved_during_hold": spread > self.settings.hold_max_spread_m,
+                    }
+                    if is_hold
+                    else {}
+                ),
+                "near_threshold": detection.get("near_threshold", []),
                 "grid_anchor": list(self._grid.anchor),
                 "bin_x": visit.key.x,
                 "bin_y": visit.key.y,
@@ -711,7 +863,8 @@ class LiveSession:
                 "ledger_cell_m": self._grid.bin_size_m,
                 "cells": len(visit.cells) or 1,
                 "window_seconds": self.settings.window_seconds,
-                "position_spread_m": round(visit.spread_m(), 1),
+                "position_spread_m": round(spread, 1),
+                "place_key": place_key,
             },
             gps_latitude=latitude,
             gps_longitude=longitude,
@@ -723,20 +876,76 @@ class LiveSession:
             observations=detection["observations"],
             raster_tolerance_hz=self.band.comparison.frequency_tolerance_hz,
         )
-        self.stats.bins_written += 1
+        if not is_hold and place_key in self._held_places:
+            # This drive bin was still being analysed when a hold claimed its
+            # place. It is written -- the data is real -- but the hold is the
+            # measurement of record for this spot, so it must not count too.
+            exclude_run(
+                connection, run_id,
+                f"{SUPERSEDED_REASON_PREFIX}{place_key}_{self.session_id}_hold",
+                scope=EXCLUSION_SCOPE_ALL,
+            )
+            self.stats.bins_superseded += 1
+        if is_hold:
+            self.stats.holds_written += 1
+        else:
+            self.stats.bins_written += 1
         self.stats.observations_written += len(detection["observations"])
         if self.on_bin is not None:
             self.on_bin(
                 {
+                    "kind": "hold" if is_hold else "bin",
                     "survey_run_id": record.survey_run_id,
                     "latitude": latitude,
                     "longitude": longitude,
                     "windows": visit.window_count,
                     "observations": len(detection["observations"]),
-                    "spread_m": round(visit.spread_m(), 1),
+                    "near_threshold": detection.get("near_threshold", []),
+                    "spread_m": round(spread, 1),
                     "bins_written": self.stats.bins_written,
+                    "holds_written": self.stats.holds_written,
                 }
             )
+
+
+def _like_prefix(literal: str) -> str:
+    """A LIKE pattern matching `literal` followed by an underscore and more.
+
+    The place key is full of underscores, and to LIKE an underscore is a
+    wildcard -- unescaped, `live_x_y_%` would match any id of the right length
+    whatever its digits. Escaped, it matches exactly this place's ids.
+    """
+    escaped = literal.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%")
+    return escaped + "\\_%"
+
+
+def _supersede_earlier_bins(connection: Any, place_key: str, new_run_id: str) -> int:
+    """Bar every earlier measurement of this place from the solve, naming the
+    one that replaces it. Returns how many were superseded.
+
+    Matches both the bare place key -- the id scheme before drives were
+    session-qualified, which existing campaigns still carry -- and any
+    session-qualified id of the same place. Neither is deleted: the rows,
+    their observations and their levels all stay, so the digest can report
+    whether two drives of one road agree.
+    """
+    rows = connection.execute(
+        "SELECT survey_run_id FROM survey_runs "
+        "WHERE (survey_run_id = ? OR survey_run_id LIKE ? ESCAPE '\\') AND survey_run_id != ?",
+        (place_key, _like_prefix(place_key), new_run_id),
+    ).fetchall()
+    superseded = 0
+    for row in rows:
+        old_id = str(row[0])
+        existing = run_exclusion(connection, old_id)
+        if existing is not None and str(existing).startswith(SUPERSEDED_REASON_PREFIX):
+            # Already superseded by some earlier drive; re-pointing it at the
+            # newest is honest but not needed for the solve, which only cares
+            # that it is excluded. Left as is so the chain stays readable.
+            continue
+        exclude_run(connection, old_id, f"{SUPERSEDED_REASON_PREFIX}{new_run_id}", scope=EXCLUSION_SCOPE_ALL)
+        superseded += 1
+    return superseded
 
 
 def bin_size_for_speed(speed_kmh: float, window_seconds: float = DEFAULT_WINDOW_SECONDS) -> float:
@@ -753,6 +962,7 @@ def bin_size_for_speed(speed_kmh: float, window_seconds: float = DEFAULT_WINDOW_
 
 __all__ = [
     "DEFAULT_WINDOW_SECONDS",
+    "SUPERSEDED_REASON_PREFIX",
     "LiveSession",
     "LiveSettings",
     "LiveStats",

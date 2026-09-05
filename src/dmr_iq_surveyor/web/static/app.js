@@ -33,7 +33,61 @@ const live = {
   postError: "",
   lastSolveAt: null,
   binsDrawn: 0,
+  // Driver-alone aids. Edge-triggered so each event is spoken once: a
+  // stale-GPS state that is announced on every two-second poll would be a
+  // stream of noise, and the one thing a solo driver cannot do is read.
+  gpsLost: false,
+  announcedBins: 0,
+  holdWasActive: false,
+  pullOverBin: null,
+  wakeLock: null,
+  lastSpoken: { text: "", at: 0 },
 };
+
+/* --------------------------------------------------------------- driving aids */
+
+/* Speech for a driver who must not look down. Throttled so the same sentence
+ * is not repeated within twenty seconds, and cut short if a newer one lands,
+ * because "GPS lost" must not queue behind "twelve bins". */
+function speak(text, { urgent = false } = {}) {
+  const toggle = $("#drive-voice");
+  if (toggle && !toggle.checked) return;
+  if (!("speechSynthesis" in window)) return;
+  const now = Date.now();
+  if (live.lastSpoken.text === text && now - live.lastSpoken.at < 20000) return;
+  live.lastSpoken = { text, at: now };
+  try {
+    if (urgent) window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.05;
+    window.speechSynthesis.speak(utterance);
+  } catch (_) {
+    /* speech is a convenience, never a dependency */
+  }
+}
+
+/* Keep the screen -- and with it the GPS watch, which some browsers throttle
+ * when the tab is hidden -- alive for the length of the drive. Re-acquired on
+ * visibility change because the platform drops it whenever the tab hides. */
+async function holdScreenAwake() {
+  if (!("wakeLock" in navigator)) return;
+  try {
+    live.wakeLock = await navigator.wakeLock.request("screen");
+  } catch (_) {
+    /* denied or unsupported: the drive still works, the screen may dim */
+  }
+}
+
+function releaseScreen() {
+  if (live.wakeLock) {
+    live.wakeLock.release().catch(() => {});
+    live.wakeLock = null;
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && live.jobId && !live.wakeLock) holdScreenAwake();
+});
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -824,8 +878,13 @@ async function startDrive() {
     });
     live.jobId = job.job_id;
     live.binsDrawn = 0;
+    live.announcedBins = 0;
+    live.gpsLost = false;
+    live.pullOverBin = null;
     if (layers.bins) layers.bins.clearLayers();
     if (layers.track) layers.track.clearLayers();
+    holdScreenAwake();
+    speak("Drive started. Measuring.");
     watchJob(job.job_id);
     pollLive();
   } catch (error) {
@@ -866,6 +925,20 @@ async function solveNow() {
   }
 }
 
+async function requestHold() {
+  const button = $("#drive-hold");
+  button.disabled = true;
+  try {
+    const result = await api("/api/live/hold", { method: "POST", body: JSON.stringify({ seconds: 60 }) });
+    if (result.accepted) speak("Stay still. Measuring for sixty seconds.", { urgent: true });
+    else jobLog("hold not started: " + result.reason);
+  } catch (error) {
+    alert("Could not start the measurement: " + error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function stopDrive() {
   if (!live.jobId) return;
   $("#drive-stop").disabled = true;
@@ -881,6 +954,8 @@ async function stopDrive() {
 const DRIVE_STATS = [
   ["bins_written", "bins measured"],
   ["windows_recorded", "windows used"],
+  ["holds_written", "stationary measurements"],
+  ["bins_superseded", "earlier bins replaced"],
   ["bins_analysed_inline", "bins that stalled the stream"],
   ["bins_failed", "bins lost to an error"],
   ["bins_capped", "bins filled while stopped"],
@@ -921,6 +996,67 @@ function renderLive(payload) {
   }
 
   const stats = payload.stats || {};
+
+  // -- the HUD: three numbers, readable at a glance -------------------------
+  const hud = $("#drive-hud");
+  hud.hidden = !running;
+  if (running) {
+    const hold = payload.hold || {};
+    const bins = payload.bins || [];
+    const last = bins.length ? bins[bins.length - 1] : null;
+    const gpsAge = payload.position_age_seconds;
+    const gpsStale = gpsAge === null || gpsAge === undefined || gpsAge > 5;
+
+    $("#hud-bins").textContent = hold.active
+      ? `${Math.ceil(hold.seconds_left)}s`
+      : String(payload.bin_count || 0);
+    $("#hud-bins").parentElement.querySelector(".hud-label").textContent = hold.active ? "measuring, stay still" : "bins";
+    $("#hud-sites").textContent = last ? String(last.observations) : "–";
+    const gpsCell = $("#hud-gps").parentElement;
+    $("#hud-gps").textContent = gpsStale ? "LOST" : `${Math.round(gpsAge)}s`;
+    gpsCell.classList.toggle("bad", gpsStale);
+    gpsCell.classList.toggle("ok", !gpsStale);
+
+    // GPS, edge-triggered both ways.
+    if (gpsStale && !live.gpsLost) { live.gpsLost = true; speak("GPS lost.", { urgent: true }); }
+    if (!gpsStale && live.gpsLost) { live.gpsLost = false; speak("GPS back."); }
+
+    // Progress, every five bins rather than every bin.
+    const count = payload.bin_count || 0;
+    if (count >= live.announcedBins + 5) { live.announcedBins = count; speak(`${count} bins.`); }
+
+    // Hold finished: the one message a pulled-over driver is waiting for.
+    if (live.holdWasActive && !hold.active) speak("Done. You can drive.", { urgent: true });
+    live.holdWasActive = Boolean(hold.active);
+
+    // Pull-over hint, once per bin that raised it.
+    const hint = payload.pull_over || {};
+    const notice = $("#drive-pullover");
+    const holdRow = $("#drive-hold-row");
+    if (hint.suggest && !hold.active) {
+      const names = (hint.sites || []).map((s) => s.site_key.split(":").slice(-2).join(":")).join(", ");
+      notice.hidden = false;
+      notice.className = "notice pullover";
+      notice.textContent = `Worth a stop here: ${names} just under the gate. ${hint.reason}`;
+      holdRow.hidden = false;
+      if (hint.bin && hint.bin !== live.pullOverBin) {
+        live.pullOverBin = hint.bin;
+        speak(`Worth a stop here. ${(hint.sites || []).length} site${(hint.sites || []).length === 1 ? "" : "s"} just under the gate.`);
+      }
+    } else if (hold.active) {
+      notice.hidden = false;
+      notice.className = "notice";
+      notice.textContent = `Measuring here — ${Math.ceil(hold.seconds_left)} s left. Stay still.`;
+      holdRow.hidden = true;
+    } else {
+      notice.hidden = true;
+      holdRow.hidden = true;
+    }
+  } else {
+    $("#drive-pullover").hidden = true;
+    $("#drive-hold-row").hidden = true;
+  }
+
   const span = $("#drive-span");
   if (stats.bin_size_m) {
     span.textContent =
@@ -1000,8 +1136,10 @@ async function pollLive() {
   if (payload && payload.running) {
     live.timer = setTimeout(pollLive, 2000);
   } else {
+    if (live.jobId && payload) speak(`Drive stopped. ${payload.bin_count || 0} bins.`);
     live.timer = null;
     live.jobId = null;
+    releaseScreen();
   }
 }
 
@@ -1102,6 +1240,7 @@ function wireUi() {
   });
   $("#drive-start").addEventListener("click", startDrive);
   $("#drive-solve").addEventListener("click", solveNow);
+  $("#drive-hold").addEventListener("click", requestHold);
   $("#drive-stop").addEventListener("click", stopDrive);
   for (const [id, format] of [["#export-kml", "kml"], ["#export-gpx", "gpx"]]) {
     $(id).addEventListener("click", () => {

@@ -237,3 +237,16 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
   font-size: 13px; border-bottom: 1px dotted var(--line); padding-bottom: 3px; }
 #drive-stats .stat b { font-variant-numeric: tabular-nums; }
 #drive-stats .stat.muted { opacity: .6; }
+
+/* -- driving HUD ---------------------------------------------------------
+ * Read at arm's length in a moving car. Large, few, high contrast; the GPS
+ * cell turns red when a fix is stale, because that is the one state that
+ * silently ruins a drive and the driver cannot watch a timestamp for it. */
+#drive-hud { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 10px 0; }
+.hud-cell { text-align: center; padding: 10px 4px; border: 1px solid var(--line); border-radius: 10px; }
+.hud-value { font-size: 44px; font-weight: 700; line-height: 1.05; font-variant-numeric: tabular-nums; }
+.hud-label { font-size: 12px; opacity: .7; margin-top: 4px; }
+.hud-cell.bad .hud-value { color: #b42318; }
+.hud-cell.ok .hud-value { color: #0b7a5f; }
+#drive-pullover.pullover { border-color: #0b7a5f; }
+#drive-hold.big { font-size: 20px; padding: 16px; }

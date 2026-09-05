@@ -25,6 +25,7 @@ from pathlib import Path
 from dmr_iq_surveyor.geo.model import haversine_m
 from dmr_iq_surveyor.geo.solver import FIT_UNDERDETERMINED
 from dmr_iq_surveyor.geo.store import connect_geo_database
+from dmr_iq_surveyor.live.session import SUPERSEDED_REASON_PREFIX
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
 
 
@@ -49,10 +50,15 @@ def stops(connection: sqlite3.Connection) -> None:
         "ORDER BY COALESCE(r.capture_start_utc, r.imported_at)",
     )
     live = [row for row in runs if _settings(row).get("mode") == "live"]
-    fixed = [row for row in runs if _settings(row).get("mode") != "live"]
+    holds = [row for row in runs if _settings(row).get("mode") == "live_stop"]
+    fixed = [row for row in runs if _settings(row).get("mode") not in ("live", "live_stop")]
 
     print("== WHAT WAS COLLECTED " + "=" * 47)
-    print(f"  stops total          {len(runs)}   ({len(fixed)} recorded, {len(live)} drive bins)")
+    print(f"  stops total          {len(runs)}   ({len(fixed)} recorded, {len(live)} drive bins, "
+          f"{len(holds)} stationary holds)")
+    moved = [row for row in holds if _settings(row).get("moved_during_hold")]
+    if moved:
+        print(f"  !! {len(moved)} hold(s) were not stationary -- the car moved during them")
     if runs:
         first = runs[0]["capture_start_utc"] or "?"
         last = runs[-1]["capture_start_utc"] or "?"
@@ -127,9 +133,56 @@ def measurements(connection: sqlite3.Connection) -> None:
         print(f"  {reason:20s} {count} measurement(s) set aside")
 
     excluded = _rows(connection, "SELECT survey_run_id, reason, scope FROM geo_run_exclusions")
+    superseded = [row for row in excluded if row["reason"].startswith(SUPERSEDED_REASON_PREFIX)]
     for row in excluded:
+        if row in superseded:
+            continue
         scope = "" if row["scope"] == "all" else f" [{row['scope']} only]"
         print(f"  excluded stop        {row['survey_run_id']}: {row['reason']}{scope}")
+    if superseded:
+        _redriven_agreement(connection, superseded)
+
+
+def _redriven_agreement(connection: sqlite3.Connection, superseded: list[sqlite3.Row]) -> None:
+    """Two drives of one road, side by side.
+
+    A bin re-measured on a later day is kept and barred from the solve, so
+    it costs nothing -- and it is the one consistency check a campaign gets
+    for free: the same road, the same radio, a different day. Reported as the
+    spread of level differences over the channels both drives heard, because
+    a campaign whose re-driven roads disagree by 8 dB has a problem no solve
+    will reveal on its own.
+    """
+    deltas: list[float] = []
+    pairs = 0
+    for row in superseded:
+        old_id = row["survey_run_id"]
+        new_id = row["reason"][len(SUPERSEDED_REASON_PREFIX):]
+        shared = _rows(
+            connection,
+            "SELECT a.snr_db AS old_db, b.snr_db AS new_db FROM rf_observations a "
+            "JOIN rf_observations b ON b.nearest_raster_hz = a.nearest_raster_hz "
+            "WHERE a.survey_run_id = ? AND b.survey_run_id = ?",
+            old_id, new_id,
+        )
+        if shared:
+            pairs += 1
+            deltas.extend(float(item["new_db"]) - float(item["old_db"]) for item in shared)
+    print(f"  re-driven bins       {len(superseded)} superseded by a later drive "
+          f"(kept, not counted)")
+    if not deltas:
+        print("                       no channel was heard by both drives, so nothing to compare")
+        return
+    deltas.sort()
+    median = deltas[len(deltas) // 2]
+    spread = sorted(abs(d) for d in deltas)[len(deltas) // 2]
+    verdict = (
+        "agree" if spread <= 3.0 else
+        "differ more than fading alone explains -- check gain, antenna, or the road" if spread > 6.0
+        else "differ somewhat"
+    )
+    print(f"                       {len(deltas)} channel(s) heard on both days across {pairs} bin(s): "
+          f"median shift {median:+.1f} dB, median |difference| {spread:.1f} dB -> {verdict}")
 
 
 def solutions(connection: sqlite3.Connection) -> None:

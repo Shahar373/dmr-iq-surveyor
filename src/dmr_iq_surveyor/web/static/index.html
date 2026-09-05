@@ -154,6 +154,20 @@
       competing with, so ask for it at a red light rather than mid-overtake.
     </p>
     <div id="drive-status" class="notice" hidden></div>
+
+    <!-- Three numbers a driver can read in the time it takes to glance at a
+         speedometer. Everything else on this tab is for before and after. -->
+    <div id="drive-hud" hidden>
+      <div class="hud-cell"><div class="hud-value" id="hud-bins">0</div><div class="hud-label">bins</div></div>
+      <div class="hud-cell"><div class="hud-value" id="hud-sites">–</div><div class="hud-label">sites, last bin</div></div>
+      <div class="hud-cell"><div class="hud-value" id="hud-gps">–</div><div class="hud-label">GPS</div></div>
+    </div>
+    <label class="check"><input type="checkbox" id="drive-voice" checked> Voice announcements (for driving alone)</label>
+
+    <div id="drive-pullover" class="notice" hidden></div>
+    <div class="row buttons" id="drive-hold-row" hidden>
+      <button id="drive-hold" class="primary">Measure here, 60 s</button>
+    </div>
     <div id="drive-stats"></div>
   </div>
 

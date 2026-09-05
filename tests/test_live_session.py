@@ -30,6 +30,7 @@ from dmr_iq_surveyor.live.session import (
     bin_size_for_speed,
 )
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
+from dmr_iq_surveyor.survey.store import SurveyRunRecord, import_survey_run, upsert_site
 
 # Site 30 in the shared fixture registry sits on this control channel.
 SITE_30_HZ = 867_762_500.0
@@ -775,3 +776,279 @@ def test_slow_traffic_does_not_pack_measurements_inside_one_fading_length(
                 f"two measurements {gap:.0f} m apart at 15 km/h -- inside the distance "
                 "over which urban shadow fading is still correlated"
             )
+
+
+# ------------------------------------------------- a second day, same road
+
+
+def _superseded(database: Path) -> dict[str, str]:
+    connection = connect_geo_database(database)
+    try:
+        return {
+            row["survey_run_id"]: row["reason"]
+            for row in connection.execute("SELECT survey_run_id, reason FROM geo_run_exclusions")
+        }
+    finally:
+        connection.close()
+
+
+def test_a_second_drive_over_the_same_road_keeps_both_and_uses_the_newer(tmp_path: Path) -> None:
+    """Day two must not silently overwrite day one, and must not count twice.
+
+    The earlier bin stays in the database with its observations, barred from
+    the solve by an exclusion that names its replacement. The solver sees one
+    constraint per place -- the newest -- and the operator can put the two
+    side by side to see whether the road measured the same on both days.
+    """
+    database = tmp_path / "two_days.sqlite3"
+    settings = _settings(min_windows_per_bin=2)
+
+    connection = build_database(database)
+    drive_a = _Drive(start=(32.0700, 34.8000), east_step_m=60.0)
+    session_a = LiveSession(
+        session_id="day1", settings=settings, band=_band(),
+        site=SiteProfile(site_id="mobile", label="mobile"), database_path=database,
+        position_provider=drive_a.position, device=drive_a, clock=drive_a.clock,
+    )
+    stats_a = session_a.run(stop=lambda: drive_a.now >= 14.0, connection=connection)
+    connection.close()
+    assert stats_a.bins_written >= 2
+    assert stats_a.bins_superseded == 0, "a first drive supersedes nothing"
+    first_ids = set(_written(database))
+    assert all(run_id.endswith("_day1") for run_id in first_ids)
+
+    connection = build_database(database)
+    drive_b = _Drive(start=(32.0700, 34.8000), east_step_m=60.0)
+    session_b = LiveSession(
+        session_id="day2", settings=settings, band=_band(),
+        site=SiteProfile(site_id="mobile", label="mobile"), database_path=database,
+        position_provider=drive_b.position, device=drive_b, clock=drive_b.clock,
+    )
+    stats_b = session_b.run(stop=lambda: drive_b.now >= 14.0, connection=connection)
+    connection.close()
+
+    all_ids = set(_written(database))
+    second_ids = all_ids - first_ids
+    assert first_ids <= all_ids, "day one's rows must still be there"
+    assert second_ids and all(run_id.endswith("_day2") for run_id in second_ids)
+    assert stats_b.bins_superseded == len(first_ids), (
+        "every bin day two re-measured must be reported as superseded"
+    )
+
+    exclusions = _superseded(database)
+    for run_id in first_ids:
+        assert run_id in exclusions, f"{run_id} from day one must be barred from the solve"
+        assert exclusions[run_id].startswith("superseded by live_")
+        assert exclusions[run_id].endswith("_day2")
+    for run_id in second_ids:
+        assert run_id not in exclusions, "the newer measurement is the one that counts"
+
+    # And the solve sees exactly one constraint per place: the newer one.
+    summary = materialise_measurements(database_path=database)["summary"]
+    connection = connect_geo_database(database)
+    try:
+        usable_runs = {
+            row["survey_run_id"]
+            for row in connection.execute(
+                "SELECT DISTINCT survey_run_id FROM geo_measurements WHERE usability = 'usable'"
+            )
+        }
+        barred_runs = {
+            row["survey_run_id"]
+            for row in connection.execute(
+                "SELECT DISTINCT survey_run_id FROM geo_measurements "
+                "WHERE usability = 'run_excluded'"
+            )
+        }
+    finally:
+        connection.close()
+    assert usable_runs & first_ids == set(), "day one must contribute nothing"
+    assert first_ids <= barred_runs
+    assert usable_runs & second_ids == second_ids
+    assert summary["usable"] > 0
+
+
+def test_a_legacy_place_keyed_bin_is_superseded_too(tmp_path: Path) -> None:
+    """Campaigns from before ids carried the session hold bare place keys.
+    A drive over that road must supersede them as well, or the old bin would
+    silently keep counting beside the new one."""
+    database = tmp_path / "legacy.sqlite3"
+    settings = _settings(min_windows_per_bin=2)
+    connection = build_database(database)
+    drive = _Drive(start=(32.0700, 34.8000), east_step_m=60.0)
+    session = LiveSession(
+        session_id="new", settings=settings, band=_band(),
+        site=SiteProfile(site_id="mobile", label="mobile"), database_path=database,
+        position_provider=drive.position, device=drive, clock=drive.clock,
+    )
+    # Plant a legacy row under the bare place key of the first bin the drive
+    # will produce, exactly as an older build would have written it.
+    grid = BinGrid(32.0700, 34.8000, bin_size_m=150.0)
+    legacy_key = grid.key_for(32.0700, 34.8000 + 0.0003).run_id(grid.tag)
+    # Written through the real record type, as the older build did, so the
+    # row is exactly what a legacy campaign holds -- and so this test does
+    # not have to be rewritten every time the schema gains a column.
+    upsert_site(connection, SiteProfile(site_id="mobile", label="mobile"))
+    import_survey_run(
+        connection,
+        run=SurveyRunRecord(
+            survey_run_id=legacy_key,
+            site_id="mobile",
+            band_profile="live_test",
+            source_path="live://old",
+            source_sha256=None,
+            center_frequency_hz=CENTER,
+            sample_rate_hz=RATE,
+            capture_start_utc="2026-01-01T00:00:00+00:00",
+            capture_time_source="live",
+            requested_start_hz=CENTER - 90_000.0,
+            requested_stop_hz=CENTER + 90_000.0,
+            usable_low_hz=CENTER - 90_000.0,
+            usable_high_hz=CENTER + 90_000.0,
+            coverage_status="complete",
+            duration_seconds=3.0,
+            analyzed_seconds=3.0,
+            segment_count=3,
+            occupancy_threshold_db=8.0,
+            detection_settings={},
+            tool_version="legacy",
+            settings={"mode": "live", "session_id": "old"},
+            gps_latitude=32.0700,
+            gps_longitude=34.8003,
+            gps_source="live_gps",
+        ),
+        observations=[],
+        raster_tolerance_hz=6250.0,
+    )
+
+    stats = session.run(stop=lambda: drive.now >= 6.0, connection=connection)
+    connection.close()
+    assert stats.bins_written >= 1
+    exclusions = _superseded(database)
+    assert legacy_key in exclusions, "the bare-key legacy row must be superseded"
+    assert exclusions[legacy_key].startswith("superseded by ")
+
+
+# ------------------------------------------------------ a stop mid-drive
+
+
+class _Parkable(_Drive):
+    """A drive that can be told to stop moving, as a car that pulled over does."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.parked_at: float | None = None
+
+    def position(self) -> Position:
+        now = self.now if self.parked_at is None else min(self.now, self.parked_at)
+        metres_per_degree = 111_320.0
+        latitude, longitude = self.start
+        longitude += now * self.speed_ms / (metres_per_degree * math.cos(math.radians(latitude)))
+        return Position(latitude=latitude, longitude=longitude, at=self.now)
+
+
+def _hold_after(drive: _Parkable, after_seconds: float, seconds: float, *, park: bool):
+    """A hold provider that asks once, after the drive has been going a while."""
+    asked = {"done": False}
+
+    def provider() -> float | None:
+        if asked["done"] or drive.now < after_seconds:
+            return None
+        asked["done"] = True
+        if park:
+            drive.parked_at = drive.now
+        return seconds
+
+    return provider
+
+
+def _runs_by_mode(database: Path) -> dict[str, list[dict]]:
+    import json
+
+    connection = connect_geo_database(database)
+    try:
+        out: dict[str, list[dict]] = {}
+        for row in connection.execute(
+            "SELECT survey_run_id, settings_json, duration_seconds FROM survey_runs "
+            "WHERE survey_run_id LIKE 'live_%'"
+        ):
+            settings = json.loads(row["settings_json"] or "{}")
+            out.setdefault(settings.get("mode", "?"), []).append(
+                {"id": row["survey_run_id"], "settings": settings, "duration": row["duration_seconds"]}
+            )
+        return out
+    finally:
+        connection.close()
+
+
+def test_a_hold_writes_a_stationary_measurement_and_the_drive_carries_on(tmp_path: Path) -> None:
+    """Pull over, measure, drive on. The hold is written as its own kind of
+    run, it supersedes the drive bin taken at that spot, and bins resume
+    afterwards -- a hold is a pause in the binning, not the end of it."""
+    database = tmp_path / "hold.sqlite3"
+    connection = build_database(database)
+    drive = _Parkable(start=(32.0700, 34.8000), east_step_m=60.0)
+    settings = _settings(min_windows_per_bin=2)
+    session = LiveSession(
+        session_id="s", settings=settings, band=_band(),
+        site=SiteProfile(site_id="mobile", label="mobile"), database_path=database,
+        position_provider=drive.position, device=drive, clock=drive.clock,
+        hold_provider=_hold_after(drive, after_seconds=6.0, seconds=5.0, park=True),
+    )
+
+    def resume():
+        # The car drives on once the hold is over.
+        if drive.parked_at is not None and not session.stats.hold_active and drive.now > 12.0:
+            drive.parked_at = None
+        return drive.now >= 24.0
+
+    stats = session.run(stop=resume, connection=connection)
+    connection.close()
+
+    assert stats.holds_written == 1
+    assert stats.hold_seconds_total == 5.0
+    assert not stats.hold_active
+    runs = _runs_by_mode(database)
+    holds = runs.get("live_stop", [])
+    assert len(holds) == 1
+    hold = holds[0]
+    assert hold["id"].endswith("_s_hold")
+    assert hold["settings"]["hold_seconds"] == 5.0
+    assert hold["settings"]["moved_during_hold"] is False, "the car was parked"
+    assert hold["duration"] >= 4.0, "the hold integrated for about its whole length"
+
+    # The drive bin at that spot is superseded by the hold, whichever was
+    # written first -- both orders are possible with the analysis thread.
+    exclusions = _superseded(database)
+    place = hold["settings"]["place_key"]
+    drive_bin_here = [r for r in runs.get("live", []) if r["settings"].get("place_key") == place]
+    for run in drive_bin_here:
+        assert run["id"] in exclusions
+        assert exclusions[run["id"]].endswith("_hold")
+    assert hold["id"] not in exclusions, "the hold is the measurement of record here"
+
+    # And the drive kept going: bins exist that were written after the hold.
+    later = [r for r in runs.get("live", []) if r["id"] not in exclusions]
+    assert later, "bins must resume after the hold"
+    assert stats.bins_written >= 2
+
+
+def test_a_hold_that_moved_says_so(tmp_path: Path) -> None:
+    """A "stationary" measurement whose positions spread past a parked car's
+    GPS jitter was not stationary. It is kept -- the data is real -- and the
+    row says what happened, rather than being passed off as still."""
+    database = tmp_path / "moved.sqlite3"
+    connection = build_database(database)
+    drive = _Parkable(start=(32.0700, 34.8000), east_step_m=60.0)
+    session = LiveSession(
+        session_id="m", settings=_settings(min_windows_per_bin=2), band=_band(),
+        site=SiteProfile(site_id="mobile", label="mobile"), database_path=database,
+        position_provider=drive.position, device=drive, clock=drive.clock,
+        hold_provider=_hold_after(drive, after_seconds=4.0, seconds=4.0, park=False),
+    )
+    session.run(stop=lambda: drive.now >= 14.0, connection=connection)
+    connection.close()
+    holds = _runs_by_mode(database).get("live_stop", [])
+    assert len(holds) == 1
+    assert holds[0]["settings"]["moved_during_hold"] is True
+    assert holds[0]["settings"]["position_spread_m"] > 30.0

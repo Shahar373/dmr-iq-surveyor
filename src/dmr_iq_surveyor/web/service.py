@@ -40,6 +40,7 @@ from dmr_iq_surveyor.geo.store import (
     solution_history,
 )
 from dmr_iq_surveyor.live.session import LiveSession, LiveSettings, Position
+from dmr_iq_surveyor.reference.store import list_sites
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_survey
 from dmr_iq_surveyor.survey.profiles import (
     ProfileError,
@@ -269,6 +270,16 @@ class FieldService:
         self._live_job_id: str | None = None
         self._live_solving = False
         self._live_last_solve: dict[str, Any] | None = None
+        # A pending "measure here" request, handed to the live session the
+        # next time it starts a window, and the running session itself so the
+        # status poll can read the hold's live state off it.
+        self._live_hold_request: float | None = None
+        self._live_session: LiveSession | None = None
+        # Registry control channels, built once per drive, so a near-threshold
+        # channel in a bin can be named as a site without a database hit on
+        # every two-second poll from the phone.
+        self._live_cc_index: list[tuple[float, str]] = []
+        self._live_cc_tolerance_hz: float = 6_250.0
 
     # -- operator position -------------------------------------------------
 
@@ -1012,9 +1023,81 @@ class FieldService:
                 "solving": self._live_solving,
                 "last_solve": self._live_last_solve,
             }
+            session = self._live_session if running else None
+            payload["hold"] = {
+                "active": bool(session is not None and session.stats.hold_active),
+                "seconds_left": round(session.stats.hold_seconds_left, 1) if session else 0.0,
+                "requested": self._live_hold_request is not None,
+                "holds_written": session.stats.holds_written if session else 0,
+            }
+            payload["pull_over"] = self._pull_over_hint(running)
         payload["position_age_seconds"] = self.live_position_age_seconds()
         payload["job"] = job.snapshot() if job is not None else None
         return payload
+
+    def _pull_over_hint(self, running: bool) -> dict[str, Any]:
+        """Whether the last bin suggests a longer, stationary measurement here.
+
+        A drive bin integrates for ten seconds; a stop can integrate for
+        sixty. A channel that missed the detection gate by a little in most
+        of a bin's windows is one that a stop would probably turn into a
+        detection -- and if that channel is a registry site's control channel,
+        the stop is worth making. Said as a hint, never acted on: the operator
+        decides whether this is a place a car can stop.
+        """
+        empty = {"suggest": False, "sites": [], "channels": 0, "bin": None, "reason": ""}
+        if not running or not self._live_bins:
+            return empty
+        latest = self._live_bins[-1]
+        if latest.get("kind") == "hold" or (self._live_session and self._live_session.stats.hold_active):
+            return {**empty, "reason": "a stationary measurement was just taken here"}
+        near = latest.get("near_threshold") or []
+        if not near:
+            return empty
+        sites: dict[str, float] = {}
+        for entry in near:
+            frequency = float(entry["frequency_hz"])
+            for cc_hz, site_key in self._live_cc_index:
+                if abs(cc_hz - frequency) <= self._live_cc_tolerance_hz:
+                    sites[site_key] = max(sites.get(site_key, -99.0), float(entry["p95_snr_db"]))
+        if not sites:
+            return {**empty, "channels": len(near),
+                    "reason": f"{len(near)} channel(s) near threshold, none a registry control channel"}
+        return {
+            "suggest": True,
+            "sites": [{"site_key": key, "p95_snr_db": db} for key, db in sorted(sites.items())],
+            "channels": len(near),
+            "bin": latest.get("survey_run_id"),
+            "reason": (
+                f"{len(sites)} registry site(s) sat just under the detection gate in the last bin; "
+                "a 60 s stationary measurement here would probably hear them"
+            ),
+        }
+
+    def request_live_hold(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Ask the running drive to stop binning and integrate here.
+
+        Bounded to 10-300 s: shorter than ten is no better than the drive bin
+        it replaces, longer than five minutes is a stationary stop that should
+        be recorded as one. Takes effect at the next window boundary, so it is
+        never more than a second late.
+        """
+        job = self.jobs.active_job()
+        if job is None or job.kind != "live":
+            raise ValueError("no drive is running; a hold only makes sense mid-drive")
+        seconds = float(payload.get("seconds", 60.0) or 60.0)
+        seconds = max(10.0, min(300.0, seconds))
+        with self._live_lock:
+            session = self._live_session
+            if session is not None and session.stats.hold_active:
+                return {"accepted": False, "seconds": seconds, "reason": "a hold is already running"}
+            self._live_hold_request = seconds
+        return {"accepted": True, "seconds": seconds, "reason": ""}
+
+    def _take_hold_request(self) -> float | None:
+        with self._live_lock:
+            wanted, self._live_hold_request = self._live_hold_request, None
+        return wanted
 
     def start_live(self, payload: dict[str, Any]) -> Job:
         """Begin a moving survey. Nothing is recorded; bins are written as
@@ -1070,11 +1153,27 @@ class FieldService:
         # Cleared BEFORE the job is submitted, because submitting starts the
         # thread: clearing afterwards could wipe the first bins of the drive
         # that is already running.
+        # Registry control channels for naming near-threshold hints. Read once
+        # here: the registry does not change mid-drive and the phone polls
+        # status every couple of seconds.
+        registry = connect_geo_database(Path(self.settings.database_path))
+        try:
+            cc_index = [
+                (float(channel["frequency_hz"]), str(site_row["site_key"]))
+                for site_row in list_sites(registry)
+                for channel in site_row.get("channels", [])
+            ]
+        finally:
+            registry.close()
+
         with self._live_lock:
             self._live_bins = []
             self._live_pending_runs = []
             self._live_stats = {}
             self._live_last_solve = None
+            self._live_hold_request = None
+            self._live_cc_index = cc_index
+            self._live_cc_tolerance_hz = float(band.comparison.frequency_tolerance_hz)
 
         def work(job: Job) -> dict[str, Any]:
             return self._run_live(
@@ -1151,11 +1250,16 @@ class FieldService:
             database_path=self.settings.database_path,
             position_provider=self._live_position,
             on_bin=on_bin,
+            hold_provider=self._take_hold_request,
         )
+        with self._live_lock:
+            self._live_session = session
         try:
             stats = session.run(stop=stop, connection=connection)
         finally:
             connection.close()
+            with self._live_lock:
+                self._live_session = None
 
         with self._live_lock:
             self._live_stats = stats.to_dict()
