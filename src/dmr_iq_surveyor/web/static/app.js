@@ -648,16 +648,34 @@ async function startCapture(confirmPosition = false) {
     const job = await api("/api/capture", { method: "POST", body: JSON.stringify(body) });
     watchJob(job.job_id);  // keeps the button disabled until the job ends
   } catch (error) {
-    button.disabled = false;
     // A stale marked position is recoverable, and recording a stop against
     // the PREVIOUS stop's coordinates is the one mistake that silently
     // corrupts a whole campaign -- so it asks rather than proceeding.
     if (error.needsPositionConfirmation) {
+      button.disabled = false;
       if (confirm(error.message + "\n\nRecord this stop at the marked position anyway?")) {
         await startCapture(true);
       }
       return;
     }
+    // The race the comment above describes: a duplicate tap that landed
+    // during the SDR probe loses the claim on the job slot even though it
+    // is the SAME operator's SAME recording that is now running under the
+    // other request. Before alarming them over their own successful tap,
+    // check whether a capture is in fact under way -- if so, it is theirs.
+    try {
+      const jobs = (await api("/api/jobs")).jobs || [];
+      const running = jobs.find(
+        (job) => job.kind === "capture" && (job.status === "running" || job.status === "pending")
+      );
+      if (running) {
+        watchJob(running.job_id);
+        return;
+      }
+    } catch (_) {
+      /* the server did not answer either; fall through to the real error */
+    }
+    button.disabled = false;
     alert("Could not start the recording: " + error.message);
   }
 }
@@ -786,6 +804,10 @@ function stopLocationSharing() {
 }
 
 async function startDrive() {
+  // Disabled on the way IN, not once the POST answers, for the same reason
+  // Record does this: the server probes the SDR before it replies, and on a
+  // phone that pause is long enough for a second tap -- or a second tab --
+  // to land.
   const button = $("#drive-start");
   button.disabled = true;
   if (live.watchId === null) startLocationSharing();
@@ -807,6 +829,25 @@ async function startDrive() {
     watchJob(job.job_id);
     pollLive();
   } catch (error) {
+    // The duplicate-tap race Record has: this endpoint also probes real
+    // hardware before it claims the job slot, so a second request that
+    // landed during that probe can lose the claim even though it is the
+    // SAME drive the operator meant to start that is now running under the
+    // other request. Check before alarming them over their own tap.
+    try {
+      const status = await api("/api/live");
+      if (status.running) {
+        live.jobId = status.job_id;
+        live.binsDrawn = 0;
+        if (layers.bins) layers.bins.clearLayers();
+        if (layers.track) layers.track.clearLayers();
+        watchJob(status.job_id);
+        pollLive();
+        return;
+      }
+    } catch (_) {
+      /* the server did not answer either; fall through to the real error */
+    }
     button.disabled = false;
     alert("Could not start the drive: " + error.message);
   }
