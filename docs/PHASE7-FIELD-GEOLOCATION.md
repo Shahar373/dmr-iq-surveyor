@@ -96,7 +96,10 @@ into SQLite; after that it is 1.68 GiB describing something already measured. So
   capture that does not fit is **refused**, with the numbers — filling the card mid-capture costs the
   stop and can leave the recording unreadable.
 - After a survey **succeeds**, recordings beyond the newest `--keep-recordings` (default 1) are
-  deleted, and each deletion is written to `recordings/retention.json`. A failed stop keeps its IQ.
+  deleted, and each deletion is written to `recordings/retention.json`. A failed stop keeps its IQ
+  regardless of this setting. The default of 1, rather than 0, is a transitional policy: no
+  event-triggered IQ snippet mechanism exists yet, so keeping nothing would leave nothing to replay
+  a field anomaly against. See `docs/known-issues-v0.10.md`.
 - Every capture keeps its `*_capture_report.json` — a few kilobytes recording the settings, frame
   count, overflow count and timing of exactly what was recorded. A discarded recording leaves
   evidence, not a gap.

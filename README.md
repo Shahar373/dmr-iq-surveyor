@@ -508,14 +508,17 @@ The solve that runs after each stop uses a coarser grid (`--solve-resolution-m`,
 finishes in seconds; `--no-solve-after-capture` skips it entirely on a long campaign. Run
 `dmr-surveyor geo solve --resolution-m 100` once at the end of the day.
 
-**Recordings are not kept.** A 5 MS/s, 90 s stop writes 1.68 GiB, so a 20-stop campaign would be
-33 GiB — more than a Pi in the field has. The recording is only needed until the survey has
+**Recordings are not kept for long.** A 5 MS/s, 90 s stop writes 1.68 GiB, so a 20-stop campaign
+would be 33 GiB — more than a Pi in the field has. The recording is only needed until the survey has
 extracted its observations into SQLite, so free space is checked *before* every capture (a capture
 that does not fit is refused, with the numbers) and, after a survey succeeds, recordings beyond
-`--keep-recordings` (default 0) are deleted, with each deletion written to a ledger and every
-capture's `*_capture_report.json` left behind. A failed stop keeps its IQ. Pass
-`--keep-recordings 1` to hold the last one back for re-analysis; `live stop` is usually the better
-answer, since it measures the same thing without writing IQ at all.
+`--keep-recordings` (default **1**, so the most recent stop can still be re-analysed) are deleted,
+with each deletion written to a ledger and every capture's `*_capture_report.json` left behind. A
+failed stop keeps its IQ regardless of this setting. Pass `--keep-recordings 0` to keep none, or a
+higher number on a campaign with more storage headroom; `live stop` measures the same thing without
+writing IQ at all. The default of 1 is a transitional policy — no event-triggered IQ snippet
+mechanism exists yet (see `docs/known-issues-v0.10.md`), so keeping zero recordings would leave
+nothing to replay a field anomaly against.
 
 ### Live (moving) survey
 

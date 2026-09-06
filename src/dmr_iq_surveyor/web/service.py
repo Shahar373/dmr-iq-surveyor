@@ -143,14 +143,16 @@ class FieldSettings:
     solve_resolution_m: float = 250.0
     solve_max_cells: int = 40_000
     # A 5 MS/s, 120 s stop writes ~2.24 GiB, so a campaign cannot keep every
-    # recording on the storage a Pi has in the field. None are kept: the
-    # survey has already extracted everything geolocation needs into SQLite,
-    # and `live stop` now takes a stationary measurement without writing IQ at
-    # all, so the case for holding one back -- re-analysing the stop just made
-    # with different settings -- costs 1.68 GiB for something the operator can
-    # instead just measure again. A failed stop still keeps its IQ, and every
-    # deletion is written to a ledger. Set it to 1 to keep the last one.
-    keep_recordings: int = 0
+    # recording on the storage a Pi has in the field. The survey has already
+    # extracted everything geolocation needs into SQLite, and `live stop`
+    # takes a stationary measurement without writing IQ at all -- but nothing
+    # in this codebase yet captures a short IQ snippet around an interesting
+    # event, so keeping zero recordings would leave nothing to replay a field
+    # anomaly against. Transitional policy (stabilize/p25-geolocation-v0.10,
+    # see docs/known-issues-v0.10.md): keep the most recent one. Revisit once
+    # event-triggered IQ snippets exist. A failed stop still keeps its IQ
+    # regardless of this setting, and every deletion is written to a ledger.
+    keep_recordings: int = 1
     # Every recorded stop is also read back the way a drive bin hears it
     # (24 spread periodograms per one-second window, at the live FFT size)
     # and stored as a second, solve-excluded run beside the stop. Measured

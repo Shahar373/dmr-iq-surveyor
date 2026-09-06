@@ -217,10 +217,11 @@ def web_serve(
             help=(
                 "How many captured recordings to keep on disk. Each 5 MS/s 120 s stop is about "
                 "2.24 GiB, so a campaign cannot keep them all; the survey has already extracted "
-                "what geolocation needs. 0 keeps none, 1 lets you re-analyse the stop just made"
+                "what geolocation needs. Default 1 (re-analysable), a transitional policy until "
+                "event-triggered IQ snippets exist; 0 keeps none"
             ),
         ),
-    ] = 0,
+    ] = 1,
     solve_resolution: Annotated[
         float,
         typer.Option(
