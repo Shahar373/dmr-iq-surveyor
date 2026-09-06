@@ -15,6 +15,8 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - Phase 5.1: validated 10m/500k/250k targeted-capture profiles, metadata and standalone-log import
 - Phase 5.2: exact 5m and 62k5 profiles for additional SDRconnect recording modes
 - Phase 6A: protocol-agnostic RF survey (discovery, persistent inventory, run comparison), the first step toward multi-protocol support (P25 in 866-870 MHz)
+- Phase 7: multi-session P25 site geolocation (reference registry, censored-likelihood grid posterior, credible-region polygons) and a field web app
+- Phase 7.1: live (moving) survey — measure while driving, write no IQ, one virtual stop per 150 m
 
 ## Project documentation
 
@@ -26,6 +28,8 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - [`docs/PHASE5-2-ADDITIONAL-RATES.md`](docs/PHASE5-2-ADDITIONAL-RATES.md)
 - [`docs/phase6-design.md`](docs/phase6-design.md)
 - [`docs/phase6a-survey.md`](docs/phase6a-survey.md)
+- [`docs/phase7-geolocation-design.md`](docs/phase7-geolocation-design.md)
+- [`docs/PHASE7-FIELD-GEOLOCATION.md`](docs/PHASE7-FIELD-GEOLOCATION.md)
 - [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md)
 - [`docs/FIELD-RECORDING-GUIDE.md`](docs/FIELD-RECORDING-GUIDE.md)
 - [`docs/TRANSMITTER-LOCATION-STUDY.md`](docs/TRANSMITTER-LOCATION-STUDY.md)
@@ -353,6 +357,336 @@ Runs and observations persist in the same SQLite database as the DMR inventory (
 
 Band profiles (`config/bands/*.yaml`, e.g. `central_800.yaml` for 866-870 MHz, `central_800_recon.yaml` for a short first-look capture) describe where to look; site profiles (`config/sites/*.yaml`, copy `home.example.yaml`) record the fixed measurement context. See [`docs/phase6a-survey.md`](docs/phase6a-survey.md) for the full design, schema and acceptance criteria, [`docs/phase6-design.md`](docs/phase6-design.md) for the overall Phase 6 roadmap toward P25, and [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md) for a field-ready capture procedure at a new site.
 
+## Phase 7 — P25 site geolocation
+
+**Geolocation maturity: experimental.** The estimator itself is exercised by the test suite and CI,
+but the current P25/868 MHz workflow has not received in-band ground-truth validation -- no
+transmitter of known position has yet been measured at 868 MHz to check the model against. Software
+tests passing is not evidence of RF accuracy. See `docs/known-issues-v0.10.md`.
+
+```bash
+dmr-surveyor geo import-sites config/p25_sites.csv --snapshot-id p25_sites_v1
+dmr-surveyor geo sites
+dmr-surveyor geo measurements
+dmr-surveyor geo solve --output runs/geo
+dmr-surveyor geo history BEE00:37D:1:30
+dmr-surveyor geo export runs/geo/map.geojson
+```
+
+Phase 7 turns the Phase 6A observation inventory into per-site transmitter *location estimates*: a
+posterior probability surface and credible-region polygons for each P25 site, built from several
+passive recording sessions made at different places and improving as sessions accumulate.
+
+### Site attribution is explicit, never assumed
+
+A received level measured on a frequency is not a measurement of a site. Every measurement stores how
+it was attributed:
+
+| `attribution` | Meaning | Used by the solver |
+|---|---|---|
+| `decoded` | RFSS/Site read from control-channel decoder evidence | yes (reserved; nothing emits it yet) |
+| `inferred_unique` | measured, and exactly one registry site uses that frequency | yes, flagged |
+| `ambiguous_reuse` | measured, but more than one site uses that frequency | no — excluded with a reason |
+| `frequency_unknown` | site is known, no control-channel frequency on record | no — nothing to measure |
+
+and separately, whether it can be used at all:
+
+| `usability` | Meaning |
+|---|---|
+| `usable` | inside the run's *measured* usable passband, and the run has a position |
+| `not_covered` | outside the measured passband. **Not evidence** — we did not look there |
+| `level_unreliable` | detected outside the measured passband, so the roll-off understates its level |
+| `receiver_artifact` | landed on the receiver's own DC/LO spike, whose level is a property of the radio |
+| `superseded_channel` | the site has two control channels; only one may count per stop |
+| `run_excluded` | the whole stop was barred — a truncated capture, driver overflows, or set aside by the operator |
+| `no_position` | the run has no coordinates |
+| `ambiguous` | excluded by the ladder above |
+
+A NAC is not a site identifier — one NAC is routinely shared by many sites in a system — so it is
+stored as context and never used to attribute a measurement.
+
+### Detections and non-detections are both evidence
+
+A frequency that was inside the measured passband and produced nothing is a **left-censored**
+measurement, not a missing one, and is often what closes a region. A campaign made entirely of
+detections is reported `unbounded_region`, correctly.
+
+### The estimator
+
+For each site, a grid posterior over position with the log-distance model
+`mu = P0 - 10 n log10(d/d0)`, Gaussian shadow fading, and `P0`/`n` marginalised out. Detections use a
+Gaussian likelihood; non-detections use `Phi((y_threshold - mu)/sigma)`. Evaluation is a bounded
+coarse pass over the whole region followed by a fine pass restricted to where the mass is, chunked
+over cells so peak memory does not scale with the grid. Credible regions are highest-density regions,
+emitted as GeoJSON MultiPolygons with holes where the posterior is annular.
+
+The solver refuses rather than guessing:
+
+| `status` | Raised when |
+|---|---|
+| `ok` | enough evidence and geometry for a bounded region |
+| `insufficient_evidence` | fewer than `--min-detections` (default 2) usable detections, or fewer than 2 independent constraints -- `(detections - 1) + non-detections` -- on the position |
+| `unbounded_region` | the 90% region reaches the edge of the analysed area |
+| `weak_geometry` | detections span under 90 degrees of azimuth around the estimate |
+
+A region is a search-area reduction, not a transmitter coordinate, and reports never present the
+posterior mode as one. Simulcast — several transmitters keyed together as one logical site — is not
+modelled; every solution records `source_model: single_transmitter_assumed`.
+
+### Where to go next
+
+```bash
+dmr-surveyor geo plan
+```
+
+Geometry decides a campaign more than stop count does, and choosing well is hard from inside a car.
+After every solve the system ranks candidate places by how much a stop there would teach: for each
+site, the binary entropy of the detection probability its current posterior predicts, weighted so a
+site already pinned down stops pulling the plan, and damped near places already measured.
+
+A place where a site is certainly heard, or certainly not, teaches nothing about where it is. A place
+where the posterior genuinely cannot say teaches the most. The field app draws this as a layer and
+numbers the top suggestions; `geo export plan.gpx --format gpx` loads them into a phone navigator.
+
+It is a planning aid computed from current beliefs, not a prediction about the transmitters.
+
+### Keeping stops comparable
+
+The method compares levels between places, so anything that shifts one stop's levels as a whole
+corrupts it. Three guards, all reported whether or not they fire:
+
+- **Per-stop common-mode offset.** If every site heard at one stop sits the same distance from its
+  predicted level while the rest of the campaign fits, the stop is what differs — a re-seated
+  antenna, local interference, front-end compression. The solve runs a second pass with that offset
+  removed. It is only estimated where it is identifiable (three or more sites heard), only applied
+  when the sites actually agree on it (a large but scattered residual is model misfit, not a shared
+  shift), and the reported magnitude is a lower bound because the first pass already absorbed part
+  of it. `--no-common-mode` reports without applying.
+- **Gain drift.** The gain actually applied is stored per stop, and measurements from a stop
+  recorded at a gain other than the campaign's are flagged.
+- **Noise-floor shift.** Levels are SNR above the local noise floor, so a floor that moves takes
+  every level with it. A stop more than 4 dB from the campaign's median floor is flagged.
+
+### Managing stops and exporting
+
+The field app's **Stops** tab lists every stop and can set one aside — its measurements stop
+counting, the reason is recorded, and it can be put back — or delete it outright. Exports:
+
+```bash
+dmr-surveyor geo export survey.kml --format kml   # regions over imagery in Google Earth
+dmr-surveyor geo export stops.gpx --format gpx    # suggested next stops for a navigator
+dmr-surveyor geo export map.geojson               # everything, for anything else
+```
+
+
+### Field web app
+
+```bash
+dmr-surveyor web serve --host 0.0.0.0 --token auto \
+  --band central_800_narrow --site mobile --output runs/field
+```
+
+This serves plain HTTP: a stationary stop still works (mark a position by tapping the map), but a
+**live drive cannot run** without HTTPS -- see the secure-context note below. To test Drive over
+HTTPS, add `--tls` on a trusted staging network:
+
+```bash
+dmr-surveyor web serve --host 0.0.0.0 --tls --token auto \
+  --band central_800_narrow --site mobile --output runs/field
+```
+
+A local control surface served by the Pi and opened from a phone on the same hotspot: mark your
+position (phone GPS or a map tap), record a stop with one button, watch capture -> survey ->
+measurements -> solve progress live, and see the measurement points and credible regions on the map.
+Built on the standard library's HTTP server with a dependency-free single-page app — a field tool
+must not fail because a dependency did not install.
+
+It binds to loopback unless `--host` says otherwise, because the API can start a capture; on an open
+network pass `--token auto` and use the printed URL.
+
+Browsers gate `navigator.geolocation` behind a *secure context*: over plain HTTP a phone does not
+merely warn, it refuses to share GPS at all. Pass `--tls` and the app issues a self-signed
+certificate covering loopback and the Pi's own addresses, prints its SHA-256 fingerprint, and serves
+over HTTPS. Accept the warning once per device ("Advanced" -> "Proceed"), or install the certificate
+to trust it permanently — it is issued for 397 days precisely so a phone will accept it as trusted.
+The pair lives in `<output>/tls` and is reused, not reissued, so a phone that has trusted it stays
+trusted; `--tls-cert/--tls-key` take your own instead. Without TLS you can still tap the map to place
+a position, but a **live drive cannot run**.
+
+The solve that runs after each stop uses a coarser grid (`--solve-resolution-m`, default 250 m) so it
+finishes in seconds; `--no-solve-after-capture` skips it entirely on a long campaign. Run
+`dmr-surveyor geo solve --resolution-m 100` once at the end of the day.
+
+**Recordings are not kept for long.** A 5 MS/s, 90 s stop writes 1.68 GiB, so a 20-stop campaign
+would be 33 GiB — more than a Pi in the field has. The recording is only needed until the survey has
+extracted its observations into SQLite, so free space is checked *before* every capture (a capture
+that does not fit is refused, with the numbers) and, after a survey succeeds, recordings beyond
+`--keep-recordings` (default **1**, so the most recent stop can still be re-analysed) are deleted,
+with each deletion written to a ledger and every capture's `*_capture_report.json` left behind. A
+failed stop keeps its IQ regardless of this setting. Pass `--keep-recordings 0` to keep none, or a
+higher number on a campaign with more storage headroom; `live stop` measures the same thing without
+writing IQ at all. The default of 1 is a transitional policy — no event-triggered IQ snippet
+mechanism exists yet (see `docs/known-issues-v0.10.md`), so keeping zero recordings would leave
+nothing to replay a field anomaly against.
+
+### Live (moving) survey
+
+A stationary stop records IQ; a drive does not record anything at all. The receiver streams
+continuously, each second of samples is reduced to a spectrum and tagged with where the phone said
+the car was, and the samples are dropped. Every 150 m square of road becomes one ordinary
+`survey_runs` row with its observations — about **8 KiB, measured** — so a 13 km drive costs under a
+megabyte and a whole campaign of driving costs single-digit megabytes. That is the reason the mode
+exists on a Pi that does not have gigabytes to spare.
+
+Because a bin is written as an ordinary survey run, `geo measurements`, `geo solve`, the stop list,
+the exclusions, the common-mode check and the next-stop planner consume a drive without knowing one
+happened.
+
+Open the app over HTTPS on the phone, go to the **Drive** tab, tap *Share my location*, then *Start
+drive*. Bins appear on the map as they are written. **Solve now** refreshes the credible regions
+when you ask for it — bins are written the whole time either way, and a solve only decides when the
+map catches up with them, at the cost of CPU the receiver is competing for. Stopping the drive runs
+a final solve. Set `live_solve_every_bins` above zero to have it happen on its own.
+
+**Driving alone.** While a drive runs the tab shows three large numbers — bins, sites heard in the
+last bin, GPS age — and speaks the events a driver cannot look down for: drive started, GPS lost
+and back, every fifth bin, a stop suggestion, "done, you can drive" after a hold, drive stopped. The
+screen is held awake for the length of the drive because some browsers throttle the GPS watch when
+the tab sleeps. Voice can be turned off on the tab.
+
+**"Worth a stop here."** A drive bin integrates for ten seconds. When a bin shows a registry
+control channel that missed the detection gate by less than 3 dB in most of its windows, the app
+says so, names the sites, and offers **Measure here, 60 s**. That is a *hold*: binning pauses, the
+receiver integrates where it stands, the result is written as a `live_stop` run that supersedes the
+drive bin at that spot, and binning resumes. If the positions during a hold spread more than 30 m
+the row is written with `moved_during_hold: true` — kept, since the data is real, but not passed
+off as stationary. A hold cannot make a detection out of nothing (see below); it settles a coin flip.
+
+**A second day on the same road.** Every drive bin's id carries the place *and* the session.
+Re-driving a road writes new bins and marks the earlier ones `superseded by …` — kept, with their
+observations, but barred from the solve, so two days are one constraint per place and a free
+consistency check. The digest puts the two side by side: median level shift and spread over the
+channels both drives heard.
+
+**What was measured about sensitivity, and what it rules out.** Every bin of the first real drive
+hit the 10-window cap, so two levers were measured rather than reasoned about, with the live
+pipeline's own detector on a synthesised 12.5 kHz carrier at in-channel SNRs around the 9 dB p95
+gate:
+
+| in-channel SNR | 5 windows | 10 windows | 20 windows | 30 windows |
+|---|---|---|---|---|
+| 3 dB | 0% | 0% | 25% | 25% |
+| 5 dB | 25% | **100%** | 100% | 100% |
+| 7 dB | 100% | 100% | 100% | 100% |
+
+More *windows* past ten buy nothing: the cap stays at 10. And more *periodograms per window* go
+the wrong way — at 5 dB, 24 frames detected 100% and 150 frames detected 0%. `p95_snr_db` is the
+per-bin 95th percentile *across frames*, and with 24 frames that is roughly the second-highest of 24
+chi-squared samples, inflated by a few dB above the true level; at 150 frames it converges to the
+true ~5 dB and correctly fails the gate. So the detection floor is the gate itself, around 5 dB true
+in-channel SNR in practice, and no amount of averaging moves it. Averaging only narrows the
+*variance* of the decision — which is exactly what a hold is for: a channel at 6–9 dB is a coin
+flip in one ten-second bin and a settled answer after sixty seconds. Each run now records its
+`frames_per_window`, because a drive bin (24) and a recorded stop (~150) sit on different points of
+that curve and a reader of the two side by side should know it.
+
+**The drive view of a recorded stop.** Rather than leave that difference as a footnote, every
+recorded stop taken through the field app is also read back the way a drive bin would have heard it:
+one-second windows, 24 spread periodograms each, at the live FFT size, through the same
+`spread_frame_starts` the drive loop uses. The result is stored as a second survey run named
+`<run_id>_drive_view` (`mode: drive_view`, `derived_from`), beside the stop and with the stop's own
+analysis and labels untouched, and is excluded from geolocation on the spot with the reason
+`drive_view of <run_id>` — the solver must not see one stop as two agreeing places. What it buys is a
+measurement on real air of the thing the synthetic table only predicted: the digest lists, over all
+such pairs, the channels heard by both statistics, only by the long average, and only by the drive
+statistic, with the median level shift between them. `survey run --drive-view` does the same for a
+recording analysed by hand; the field app has it on by default (`drive_view_for_stops`).
+
+**An exclusion takes effect at the next solve, whenever it was written.** A measurement row
+carries the verdict that was true when it was built, and a superseded bin's exclusion is written
+later, by the drive that replaced it. `geo solve` (and the field app's solves) now begin by
+rebuilding the measurements of every run whose stored verdict disagrees with its exclusion, in
+either direction, and the report lists them under `measurements_refreshed`. Before this, a bin
+re-driven on day two kept counting beside its replacement until someone ran a full
+`geo measurements` by hand. In the same spirit, a one-run rebuild now judges gain drift and noise
+floor against the whole campaign rather than against the run itself, and a live run id is made
+unique structurally (`…_2`, `…_3`) rather than by the clock, so two stationary measurements of one
+place in one session are both kept.
+
+**Both halves of the gain are stored.** The SDRplay's manual gain is an IF gain reduction *and* an
+LNA state, and only the first was written to the database, so the digest's gain-discipline check
+covered half the setting. `sites.lna_state` (additive, `NULL` on rows written before it existed) now
+carries the state actually applied at each stop and each drive, and the digest reports it the same
+way it reports IFGR: one value across the campaign, a warning when it varies, and "not recorded"
+where an older stop cannot say.
+
+Two length scales decide the design, and neither is adjustable by taste:
+
+- **A window is one second.** At 50 km/h that is 14 m, about 40 wavelengths at 868 MHz — the
+  drive-test convention for averaging fast (multipath) fading out of a level to recover the local
+  mean, which is the quantity the path-loss model is written in.
+- **A measurement covers 150 m of road, at every speed.** Feeding the solver a measurement per
+  second would treat a thousand correlated samples as a thousand independent constraints and shrink
+  a region by a factor near 240, almost all of it fabricated. 150 m is not a compromise between
+  detail and caution — it is the shortest span that does not over-claim, and that was measured. A
+  simulated city drive under *correlated* shadow fading (Gudmundson, σ = 6 dB, decorrelation 20 m),
+  20 trials per spacing, asking the only question that matters about a credible region — does it
+  contain the transmitter as often as it says?
+
+  | spacing | measurements | 90% region contained the truth | median area |
+  |---|---|---|---|
+  | 50 m | 146 | **60%** | 151 km² |
+  | 80 m | 91 | 80% | 218 km² |
+  | 100 m | 73 | 80% | 261 km² |
+  | 150 m | 48 | **90%** | 370 km² |
+
+  Urban fading decorrelates over 10–50 m, so shortening the span in a city looks free. It is not: a
+  90% region that contains the truth 60% of the time is not a smaller region, it is a false one.
+  Adjacent spans *average* neighbouring ground, and the residual correlation between those averages
+  accumulates across a drive. (Those regions all touched the analysed edge, so the areas are
+  inflated; the coverage column carries the result. Twenty trials put about ±10 points on each
+  figure — enough to separate 60% from 90%, not 80% from 90%.)
+
+  What speed does change is the **pitch discipline**. A measurement starts only once the receiver
+  has travelled a full span from where the last one began — because crawling in traffic a bin fills
+  its ten-window cap in 40 m, and without the hold the next measurement would start there, which is
+  the 50 m row above arriving by accident. Underneath, the grid is a fixed 50 m ledger of measured
+  road rather than the measurement size, so no two measurements can ever cover the same ground — at
+  any speed, on any day. Set `live_adaptive_bins: false` for the plain grid, which has no such
+  guarantee at its cell boundaries.
+
+The detector scans every raster step of the band once per window in a bin, so closing a bin is
+seconds of arithmetic — and every one of those seconds is a second the SDR is not being read. It
+therefore runs on a second thread while the stream keeps going, with a one-deep queue: when analysis
+falls behind the road the bin is analysed inline (counted as `bins_analysed_inline`) rather than
+queued without bound or thrown away. Live analysis uses a 16384-point FFT, 305 Hz at 5 MS/s;
+measured against 65536 on a synthesised 12.5 kHz carrier at 35, 20 and 10 dB the reported SNR agrees
+to within 0.2 dB, so a drive's bins and a stationary stop's offline analysis stay on **one scale**,
+at a quarter of the memory and a third of the detection cost. End to end, one second of 5 MS/s
+stream costs about 0.22 CPU-seconds across both threads on a development machine.
+
+Sampling is therefore **time-triggered, placement is distance-triggered**. Standing still is bounded
+too: a bin closes after `live_max_windows_per_bin` windows (10) instead of accumulating spectra for
+as long as the car sits there, so a red light costs ~17 MB rather than 100 MB a minute, and windows
+after that are dropped before the FFT.
+
+Without a phone — for a stationary measurement that writes no IQ:
+
+```bash
+dmr-surveyor live stop --latitude 32.0500 --longitude 34.7900 --seconds 30 \
+  --band central_800_narrow --site mobile
+```
+
+A 30 s live stop replaces a 560 MiB recording with an 8 KiB row. What is lost is the recording
+itself: a live measurement cannot be re-analysed later with different settings, because the samples
+are gone. That is the trade, and it is the right one when the alternative is not measuring at all
+for want of a card.
+
+See [`docs/phase7-geolocation-design.md`](docs/phase7-geolocation-design.md) for the full design and
+schema, [`docs/PHASE7-FIELD-GEOLOCATION.md`](docs/PHASE7-FIELD-GEOLOCATION.md) for the campaign
+procedure, and [`config/p25_sites.example.md`](config/p25_sites.example.md) for the snapshot format.
+
+
 ## Result packaging
 
 Generated runs, reports, metadata and the persistent SQLite database can be archived without including raw IQ files:
@@ -372,7 +706,7 @@ pytest -q
 ruff check .
 ```
 
-The suite covers metadata parsing, spectrum processing, candidate detection, streamed DSP, 10m/5m/500k/250k/62k5 profiles, off-center frequency mixing, peak-safe WAV output, DSD-FME quality parsing, polarity selection, active slots, event parsing, session semantics, capture metadata migration, standalone-log import, idempotent SQLite import and cross-run aggregation, plus Phase 6A band/site profiles, segmented discovery, occupancy vs. persistence, usable-passband measurement, idempotent survey import with capture-time-based history, and protocol-agnostic run comparison — all against synthetic fixtures generated at test time, no real IQ data is committed. An optional real-recording integration test is documented in [`docs/phase6a-survey.md`](docs/phase6a-survey.md).
+The suite covers metadata parsing, spectrum processing, candidate detection, streamed DSP, 10m/5m/500k/250k/62k5 profiles, off-center frequency mixing, peak-safe WAV output, DSD-FME quality parsing, polarity selection, active slots, event parsing, session semantics, capture metadata migration, standalone-log import, idempotent SQLite import and cross-run aggregation, plus Phase 6A band/site profiles, segmented discovery, occupancy vs. persistence, usable-passband measurement, idempotent survey import with capture-time-based history, and protocol-agnostic run comparison, plus Phase 7 reference-snapshot parsing and idempotent import, the measurement attribution and usability ladder, projection/geometry, the grid posterior and its refusal statuses, credible-region contours including annuli and separated modes, the geolocation CLI, and the field web app's routing, authorisation and job lifecycle — all against synthetic fixtures generated at test time, no real IQ data is committed. An optional real-recording integration test is documented in [`docs/phase6a-survey.md`](docs/phase6a-survey.md).
 
 ## Passive scope
 

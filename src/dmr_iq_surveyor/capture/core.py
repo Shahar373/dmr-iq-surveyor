@@ -132,7 +132,12 @@ def run_capture(
 
     `on_progress(frames_written, target_frames, elapsed_seconds)` is called
     as the capture advances, so an operator watching a field capture sees it
-    moving instead of a blank terminal.
+    moving instead of a blank terminal. It fires every loop iteration,
+    including one where the device read came back empty (an overflow or a
+    timed-out read) -- the field app's caller checks for cancellation from
+    inside this callback, and a sustained overflow storm must not be able to
+    block that check, or "Cancel" silently stops working for as long as the
+    storm lasts.
 
     A wall-clock deadline of `timeout_factor` x the requested duration (plus
     a fixed grace period) bounds the run. A device that delivers samples far
@@ -162,6 +167,12 @@ def run_capture(
     timed_out = False
     device_close_error: str | None = None
     writer = WaveIQWriter(wav_path, writer_settings)
+    # Wall-clock span of the streaming itself, measured from the first sample
+    # that actually arrived. Opening an SDRplay device takes a second or two,
+    # and counting that against the recording would report a gap where the
+    # radio was merely still warming up.
+    stream_started: float | None = None
+    stream_ended = started
     try:
         while writer.frame_count < target_frame_count:
             if time.time() > deadline:
@@ -170,11 +181,13 @@ def run_capture(
             remaining = target_frame_count - writer.frame_count
             chunk = resolved_device.read_stream_chunk(min(settings.chunk_frames, remaining))
             chunk = np.asarray(chunk)
-            if chunk.size == 0:
-                continue
-            if chunk.size > remaining:
-                chunk = chunk[:remaining]
-            writer.write_frames(chunk)
+            if chunk.size > 0:
+                if chunk.size > remaining:
+                    chunk = chunk[:remaining]
+                writer.write_frames(chunk)
+                if stream_started is None:
+                    stream_started = time.time() - chunk.size / settings.sample_rate_hz
+                stream_ended = time.time()
             if on_progress is not None:
                 on_progress(writer.frame_count, target_frame_count, time.time() - started)
     finally:
@@ -182,13 +195,36 @@ def run_capture(
         # real data size; until that runs the file declares a data size of
         # zero and inspect_wave_iq() reads it as empty. If closing the device
         # raised before this, a complete recording would be unreadable.
-        writer_summary = writer.close()
+        #
+        # But closing the writer can itself raise -- a full disk fails on the
+        # final flush -- and an unguarded raise here would skip the device
+        # close below, leaving the RSP1B claimed so every later capture in the
+        # session fails to open it until the SDRplay service is restarted. A
+        # full SD card would end the campaign rather than one recording.
+        writer_summary = None
+        writer_close_error: str | None = None
+        try:
+            writer_summary = writer.close()
+        except Exception as exc:  # noqa: BLE001 -- the device must still be released
+            writer_close_error = f"{type(exc).__name__}: {exc}"
         try:
             resolved_device.close()
         except Exception as exc:  # noqa: BLE001 -- never lose a recording over teardown
             device_close_error = f"{type(exc).__name__}: {exc}"
+    if writer_summary is None:
+        raise OSError(
+            f"the recording could not be finalised ({writer_close_error}); "
+            f"{wav_path} is incomplete. The SDR was released, so the next capture can proceed."
+        )
 
     elapsed = time.time() - started
+    captured_seconds = writer_summary["frame_count"] / settings.sample_rate_hz
+    stream_span = max(stream_ended - stream_started, 0.0) if stream_started is not None else 0.0
+    # Clamped at zero: timing jitter around the first chunk can make the span
+    # read a hair shorter than the samples it delivered, which is noise, not
+    # a negative gap.
+    gap_seconds = max(stream_span - captured_seconds, 0.0)
+    time_coverage = (captured_seconds / stream_span) if stream_span > 0 else 1.0
     manifest = {
         "tool": "dmr-iq-surveyor",
         "tool_version": __version__,
@@ -204,8 +240,19 @@ def run_capture(
         # something downstream stalled: the recording has a gap there, so
         # actual_duration_seconds understates the wall-clock span covered.
         "overflow_count": getattr(resolved_device, "overflow_count", 0),
+        # How much wall-clock time the recording does NOT account for, and
+        # what fraction of the span it does. A count of overflows says how
+        # often the driver dropped its FIFO, not how much was lost with it,
+        # and those are very different numbers: one overflow in a 30 s
+        # capture discards a buffer measured in milliseconds. Anything that
+        # decides whether a non-detection can be trusted needs the duration,
+        # not the count.
+        "stream_span_seconds": stream_span,
+        "gap_seconds": gap_seconds,
+        "time_coverage": time_coverage,
         "device_settings_applied": getattr(resolved_device, "applied_settings", {}),
         "device_close_error": device_close_error,
+        "writer_close_error": writer_close_error,
         "start_utc": writer_summary["start_utc"],
         "stop_utc": writer_summary["stop_utc"],
         "elapsed_seconds": elapsed,

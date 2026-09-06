@@ -10,11 +10,24 @@ Repository:
 https://github.com/Shahar373/dmr-iq-surveyor
 ```
 
-Current release after Phase 5.1:
+Current release:
 
 ```text
-0.7.0
+0.10.0
 ```
+
+> **State note (Phase 7).** Sections 1–11 below describe the project as of Phase 5.1 and are kept
+> for the DMR history they record. Since then the repository has also gained Phase 6A (generic
+> protocol-agnostic RF survey), live SoapySDR capture, and Phase 7 (multi-session P25 site
+> geolocation plus a served field app). Read `README.md`, `docs/phase6-design.md`,
+> `docs/phase6a-survey.md`, `docs/phase7-geolocation-design.md` and
+> `docs/PHASE7-FIELD-GEOLOCATION.md` for the current state; the sections below are not a complete
+> inventory of what exists.
+>
+> The most consequential gap is still Phase 6B: no P25 control channel is decoded, so a geolocation
+> measurement is attributed to a site by frequency alone, and a frequency shared by two sites is
+> excluded rather than guessed. A NAC does not identify a site — one NAC is routinely shared by
+> many sites in a system.
 
 The repository implements Phases 1–5.1 of an offline, passive, receive-only DMR survey pipeline. Do not restart the project or replace established commands, formats or tests without evidence.
 
@@ -198,6 +211,9 @@ Do not claim TG or Radio IDs for the original short recordings; none were recove
 
 ## 6. Commands on the Pi
 
+> **Historical.** This section and its expected version below predate Phases 5.2-7.1; the current
+> version is 0.10.0. Kept for the Phase 5 archived-inventory record it documents.
+
 Update and validate:
 
 ```bash
@@ -366,6 +382,10 @@ issue -> feature branch -> implementation/tests/docs -> PR -> CI -> merge
 Merge only after full pytest and Ruff succeed. Update this handoff whenever the project state changes materially.
 
 ## 12. Prompt for the next chat
+
+> **Historical.** This prompt is from the Phase 5.1 handoff and names version 0.7.0; the project is
+> now at 0.10.0 with Phases 6A and 7/7.1 also complete. Kept verbatim as the historical record of
+> that session's next step, not as a current-state prompt.
 
 ```text
 Continue the DMR IQ Surveyor project in:

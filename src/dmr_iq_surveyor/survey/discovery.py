@@ -16,6 +16,7 @@ be read as a protocol confirmation.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -161,22 +162,29 @@ class SegmentSpectrum:
         }
 
 
-def analyze_segment(
-    reader: IQMemmapReader,
-    segment: Segment,
+def accumulate_segment_spectrum(
+    frames: Iterable[np.ndarray],
     *,
+    fft_count: int,
+    sample_rate_hz: float,
+    center_frequency_hz: float,
+    nominal_low_hz: float,
+    nominal_high_hz: float,
     settings: SpectrumSettings,
 ) -> SegmentSpectrum | None:
-    """Analyze one time segment using the same FFT/PSD primitives as Phase 2,
-    scoped to `segment`'s frame range. Returns None when the segment is too
-    short to contain a full FFT window (typically only the final segment).
+    """Reduce a run of FFT-length sample frames to one `SegmentSpectrum`.
+
+    Split out of `analyze_segment` so live streaming and offline file
+    analysis share one implementation instead of two that drift. `frames` is
+    consumed lazily, which is what preserves the offline path's memmap
+    discipline: it hands over a generator that reads one FFT window at a
+    time, never a whole segment at once.
     """
-    info = reader.info
-    sample_rate = float(info.fmt.sample_rate_hz)
-    count = fft_frame_count(segment.frame_count, settings.fft_size, settings.overlap_ratio)
-    if count < 1:
+    if fft_count < 1:
         return None
-    frequency_hz = frequency_axis_hz(float(info.center_frequency_hz), sample_rate, settings.fft_size)
+    frequency_hz = frequency_axis_hz(center_frequency_hz, sample_rate_hz, settings.fft_size)
+    sample_rate = sample_rate_hz
+    count = fft_count
     resolution_hz = sample_rate / settings.fft_size
     window = build_window(settings.window, settings.fft_size)
     average_sum = np.zeros(settings.fft_size, dtype=np.float64)
@@ -187,10 +195,7 @@ def analyze_segment(
     percentile_samples_db = np.empty((len(percentile_indices), settings.fft_size), dtype=np.float32)
     bins_per_noise_window = max(1, round(settings.local_noise_window_hz / resolution_hz))
 
-    for frame_index, relative_start in enumerate(
-        iter_fft_starts(segment.frame_count, settings.fft_size, settings.overlap_ratio)
-    ):
-        samples = reader.read_complex(segment.start_frame + relative_start, settings.fft_size)
+    for frame_index, samples in enumerate(frames):
         power = periodogram_power_density(samples, window, sample_rate)
         spectrum_db = power_to_db(power)
         floor_db = local_noise_floor_db(spectrum_db, bins_per_noise_window)
@@ -208,13 +213,10 @@ def analyze_segment(
         np.float32
     )
 
-    low_hz = float(info.nominal_frequency_low_hz)
-    high_hz = float(info.nominal_frequency_high_hz)
-    center_hz = float(info.center_frequency_hz)
-    edge_mask = (frequency_hz < low_hz + settings.edge_exclusion_hz) | (
-        frequency_hz > high_hz - settings.edge_exclusion_hz
+    edge_mask = (frequency_hz < nominal_low_hz + settings.edge_exclusion_hz) | (
+        frequency_hz > nominal_high_hz - settings.edge_exclusion_hz
     )
-    dc_mask = np.abs(frequency_hz - center_hz) <= settings.dc_exclusion_hz
+    dc_mask = np.abs(frequency_hz - center_frequency_hz) <= settings.dc_exclusion_hz
 
     return SegmentSpectrum(
         frequency_hz=frequency_hz,
@@ -225,6 +227,39 @@ def analyze_segment(
         edge_mask=edge_mask,
         dc_mask=dc_mask,
         fft_count=count,
+    )
+
+
+def analyze_segment(
+    reader: IQMemmapReader,
+    segment: Segment,
+    *,
+    settings: SpectrumSettings,
+) -> SegmentSpectrum | None:
+    """Analyze one time segment using the same FFT/PSD primitives as Phase 2,
+    scoped to `segment`'s frame range. Returns None when the segment is too
+    short to contain a full FFT window (typically only the final segment).
+    """
+    info = reader.info
+    sample_rate = float(info.fmt.sample_rate_hz)
+    count = fft_frame_count(segment.frame_count, settings.fft_size, settings.overlap_ratio)
+    if count < 1:
+        return None
+
+    def frames() -> Iterator[np.ndarray]:
+        for relative_start in iter_fft_starts(
+            segment.frame_count, settings.fft_size, settings.overlap_ratio
+        ):
+            yield reader.read_complex(segment.start_frame + relative_start, settings.fft_size)
+
+    return accumulate_segment_spectrum(
+        frames(),
+        fft_count=count,
+        sample_rate_hz=sample_rate,
+        center_frequency_hz=float(info.center_frequency_hz),
+        nominal_low_hz=float(info.nominal_frequency_low_hz),
+        nominal_high_hz=float(info.nominal_frequency_high_hz),
+        settings=settings,
     )
 
 
@@ -446,52 +481,27 @@ def _remeasure_across_segments(
     )
 
 
-def discover_observations(
-    recording_path: str | Path,
+def observations_from_segments(
+    segment_spectra: list[SegmentSpectrum],
     *,
     band_profile: BandProfile,
-    assumed_iq_order: str = "IQ",
-    spectrum_fft_size: int = 65_536,
-    spectrum_overlap_ratio: float = 0.5,
+    center_frequency_hz: float,
+    sample_rate_hz: float,
+    spectrum_settings: SpectrumSettings,
 ) -> dict[str, Any]:
-    """Run the full Phase 6A discovery pass on one wideband IQ recording.
+    """Turn analysed segments into detected observations.
 
-    Returns a dict with `observations` (list[RfObservation]), the recording
-    info, the measured usable passband, and per-segment bookkeeping needed
-    by the survey pipeline (segment count, analyzed seconds).
+    The whole detector lives here: usable-passband measurement,
+    per-segment detection, cross-segment merging and remeasurement,
+    raster snapping. It needs nothing but the segments themselves.
+    Separating it from the file reading is what lets a live stream
+    produce observations through exactly this code, rather than through
+    a second implementation that would drift from it.
+
+    Nothing here knows about reference data. Segments are measured on
+    the band profile's own raster; which site a frequency might belong
+    to is decided afterwards, elsewhere.
     """
-    source = Path(recording_path).expanduser().resolve()
-    info = inspect_wave_iq(source, assumed_iq_order=assumed_iq_order)
-    if info.center_frequency_hz is None:
-        raise ValueError("Center frequency is required for survey discovery")
-    reader = IQMemmapReader(info)
-    sample_rate = float(info.fmt.sample_rate_hz)
-
-    # occupancy_threshold_db here is the spectrum-level "energy above local
-    # noise floor" threshold (matches the Phase 2 default), independent of
-    # the detector's own SNR gates in DetectionSettings.
-    spectrum_settings = SpectrumSettings(
-        fft_size=spectrum_fft_size,
-        overlap_ratio=spectrum_overlap_ratio,
-    )
-
-    segments = plan_segments(
-        info.frame_count,
-        sample_rate,
-        segment_seconds=band_profile.segment_seconds,
-        stride_seconds=band_profile.segment_stride_seconds,
-        max_segments=band_profile.max_segments,
-    )
-
-    segment_spectra: list[SegmentSpectrum] = []
-    skipped_segments = 0
-    for segment in segments:
-        result = analyze_segment(reader, segment, settings=spectrum_settings)
-        if result is None:
-            skipped_segments += 1
-            continue
-        segment_spectra.append(result)
-
     passband = measure_usable_passband(
         segment_spectra,
         requested_low_hz=band_profile.start_frequency_hz,
@@ -501,8 +511,8 @@ def discover_observations(
 
     detection_settings = band_profile.detection_settings()
     recording_dict = {
-        "center_frequency_hz": info.center_frequency_hz,
-        "sample_rate_hz": info.fmt.sample_rate_hz,
+        "center_frequency_hz": center_frequency_hz,
+        "sample_rate_hz": sample_rate_hz,
     }
     segment_results: list[tuple[str, dict[str, Any]]] = []
     segment_data_list: list[dict[str, Any]] = []
@@ -563,16 +573,219 @@ def discover_observations(
         )
     observations.sort(key=lambda item: item.measured_center_hz)
 
+    # Channels that missed the gate by a little in most segments and did not
+    # become an observation. Aggregated by raster step so a channel that was
+    # near in seven of ten windows is one entry with seven votes, not seven
+    # entries. Kept apart from `observations` on purpose: these are NOT
+    # detections and must never be written as evidence -- they are a hint
+    # about where a longer, stationary measurement would probably pay off.
+    near_votes: dict[float, list[float]] = {}
+    for _label, result in segment_results:
+        for feature in result.get("near_threshold", []):
+            centre = float(feature["frequency_hz_assuming_iq"])
+            near_votes.setdefault(centre, []).append(float(feature["p95_snr_db"]))
+    detected_centres = [item.measured_center_hz for item in observations]
+    near_threshold = []
+    for centre, p95s in sorted(near_votes.items()):
+        if len(p95s) * 2 < len(segment_spectra):
+            continue
+        if any(abs(centre - seen) <= detection_settings.merge_tolerance_hz for seen in detected_centres):
+            continue
+        near_threshold.append(
+            {
+                "frequency_hz": centre,
+                "p95_snr_db": round(sorted(p95s)[len(p95s) // 2], 2),
+                "segments_near": len(p95s),
+                "segments_analyzed": len(segment_spectra),
+            }
+        )
+
     return {
-        "recording": info,
         "observations": observations,
         "usable_passband": passband,
-        "segment_count": len(segments),
         "segments_analyzed": len(segment_spectra),
-        "segments_skipped": skipped_segments,
-        "analyzed_seconds": sum(seg.end_seconds - seg.start_seconds for seg in segments[: len(segment_spectra)]),
+        "near_threshold": near_threshold,
         "detection_settings": detection_settings,
         "occupancy_threshold_db": spectrum_settings.occupancy_threshold_db,
+    }
+
+
+def spread_frame_starts(
+    frame_count: int, *, fft_size: int, overlap_ratio: float, wanted: int
+) -> list[int]:
+    """Where in a span of `frame_count` samples to take `wanted` FFT frames,
+    spread across the whole span rather than clustered at its start.
+
+    This is the drive-mode window: a bin's second is represented by frames
+    from all of it, not from its first fifth. Shared with the stationary
+    "drive view" so the two are the same statistic by construction, not by
+    two copies of the same arithmetic drifting apart.
+    """
+    available = fft_frame_count(frame_count, fft_size, overlap_ratio)
+    if available < 1:
+        return []
+    count = min(wanted, available)
+    span = frame_count - fft_size
+    if count == 1 or span <= 0:
+        return [0]
+    # Clamped to `span`: rounding to a whole frame step can land past the end
+    # of the buffer, and a short final slice would reach the periodogram as a
+    # length mismatch rather than as anything meaningful.
+    step = max(1, fft_size // 2)
+    return sorted(
+        {min(span, round(index * span / (count - 1) / step) * step) for index in range(count)}
+    )
+
+
+def discover_observations_windowed(
+    recording_path: str | Path,
+    *,
+    band_profile: BandProfile,
+    assumed_iq_order: str = "IQ",
+    fft_size: int = 16_384,
+    frames_per_window: int = 24,
+    window_seconds: float = 1.0,
+    max_windows: int | None = None,
+) -> dict[str, Any]:
+    """The drive-mode statistic, computed over a stationary recording.
+
+    A drive bin is up to ten one-second windows of 24 spread periodograms
+    each; a stationary survey segment averages ~150 consecutive ones. The
+    detector's `p95_snr_db` is a percentile ACROSS frames, so the two do not
+    agree on a channel a few dB either side of the gate -- measured: at 5 dB
+    true in-channel SNR, 24 frames detect and 150 do not. This pass cuts the
+    recording into `window_seconds` windows and takes `frames_per_window`
+    spread frames from each, exactly as `live.session` does on the air, so
+    a recorded stop and a drive bin can be read side by side.
+
+    Bounded like everything else here: frames are read through the memmap
+    one at a time and only their accumulated spectra are kept.
+    """
+    source = Path(recording_path).expanduser().resolve()
+    info = inspect_wave_iq(source, assumed_iq_order=assumed_iq_order)
+    if info.center_frequency_hz is None:
+        raise ValueError("Center frequency is required for survey discovery")
+    reader = IQMemmapReader(info)
+    sample_rate = float(info.fmt.sample_rate_hz)
+    spectrum_settings = SpectrumSettings(fft_size=fft_size, overlap_ratio=0.5)
+
+    windows = plan_segments(
+        info.frame_count,
+        sample_rate,
+        segment_seconds=window_seconds,
+        stride_seconds=window_seconds,
+        max_segments=max_windows,
+    )
+    spectra: list[SegmentSpectrum] = []
+    skipped = 0
+    for window in windows:
+        starts = spread_frame_starts(
+            window.frame_count,
+            fft_size=fft_size,
+            overlap_ratio=spectrum_settings.overlap_ratio,
+            wanted=frames_per_window,
+        )
+        if not starts:
+            skipped += 1
+            continue
+
+        def frames(starts: list[int] = starts, base: int = window.start_frame) -> Iterator[np.ndarray]:
+            for start in starts:
+                yield reader.read_complex(base + start, fft_size)
+
+        spectra.append(
+            accumulate_segment_spectrum(
+                frames(),
+                fft_count=len(starts),
+                sample_rate_hz=sample_rate,
+                center_frequency_hz=float(info.center_frequency_hz),
+                nominal_low_hz=float(info.nominal_frequency_low_hz),
+                nominal_high_hz=float(info.nominal_frequency_high_hz),
+                settings=spectrum_settings,
+            )
+        )
+
+    detection = observations_from_segments(
+        spectra,
+        band_profile=band_profile,
+        center_frequency_hz=float(info.center_frequency_hz),
+        sample_rate_hz=sample_rate,
+        spectrum_settings=spectrum_settings,
+    )
+    return {
+        **detection,
+        "recording": info,
+        "segment_count": len(windows),
+        "segments_skipped": skipped,
+        "frames_per_window": frames_per_window,
+        "analyzed_seconds": sum(
+            w.end_seconds - w.start_seconds for w in windows[: len(spectra)]
+        ),
+    }
+
+
+def discover_observations(
+    recording_path: str | Path,
+    *,
+    band_profile: BandProfile,
+    assumed_iq_order: str = "IQ",
+    spectrum_fft_size: int = 65_536,
+    spectrum_overlap_ratio: float = 0.5,
+) -> dict[str, Any]:
+    """Run the full Phase 6A discovery pass on one wideband IQ recording.
+
+    Returns a dict with `observations` (list[RfObservation]), the recording
+    info, the measured usable passband, and per-segment bookkeeping needed
+    by the survey pipeline (segment count, analyzed seconds).
+    """
+    source = Path(recording_path).expanduser().resolve()
+    info = inspect_wave_iq(source, assumed_iq_order=assumed_iq_order)
+    if info.center_frequency_hz is None:
+        raise ValueError("Center frequency is required for survey discovery")
+    reader = IQMemmapReader(info)
+    sample_rate = float(info.fmt.sample_rate_hz)
+
+    # occupancy_threshold_db here is the spectrum-level "energy above local
+    # noise floor" threshold (matches the Phase 2 default), independent of
+    # the detector's own SNR gates in DetectionSettings.
+    spectrum_settings = SpectrumSettings(
+        fft_size=spectrum_fft_size,
+        overlap_ratio=spectrum_overlap_ratio,
+    )
+
+    segments = plan_segments(
+        info.frame_count,
+        sample_rate,
+        segment_seconds=band_profile.segment_seconds,
+        stride_seconds=band_profile.segment_stride_seconds,
+        max_segments=band_profile.max_segments,
+    )
+
+    segment_spectra: list[SegmentSpectrum] = []
+    skipped_segments = 0
+    for segment in segments:
+        result = analyze_segment(reader, segment, settings=spectrum_settings)
+        if result is None:
+            skipped_segments += 1
+            continue
+        segment_spectra.append(result)
+
+    detection = observations_from_segments(
+        segment_spectra,
+        band_profile=band_profile,
+        center_frequency_hz=float(info.center_frequency_hz),
+        sample_rate_hz=sample_rate,
+        spectrum_settings=spectrum_settings,
+    )
+    return {
+        **detection,
+        "recording": info,
+        "segment_count": len(segments),
+        "segments_skipped": skipped_segments,
+        "analyzed_seconds": sum(
+            seg.end_seconds - seg.start_seconds
+            for seg in segments[: len(segment_spectra)]
+        ),
     }
 
 
@@ -582,9 +795,13 @@ __all__ = [
     "Segment",
     "SegmentSpectrum",
     "UsablePassband",
+    "accumulate_segment_spectrum",
     "analyze_segment",
     "discover_observations",
+    "discover_observations_windowed",
     "measure_usable_passband",
+    "observations_from_segments",
     "plan_segments",
     "resolve_capture_time",
+    "spread_frame_starts",
 ]

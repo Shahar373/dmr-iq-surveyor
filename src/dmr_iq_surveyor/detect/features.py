@@ -115,6 +115,12 @@ def feature_at(
     return features
 
 
+# How far under the p95 gate a channel may sit and still be reported as a
+# near miss. Three dB: about the gain a longer integration at the same spot
+# can realistically buy, so a near miss is one a stop could plausibly close.
+NEAR_THRESHOLD_MARGIN_DB = 3.0
+
+
 def _is_strong(
     feature: dict[str, Any],
     settings: DetectionSettings,
@@ -228,6 +234,12 @@ def detect_from_data(
     )
 
     strong_rows: list[dict[str, Any]] = []
+    # Channels that missed the gate by a little. Not candidates -- they are
+    # exactly what the gate exists to keep out -- but a moving receiver that
+    # sees several of them in one bin is standing somewhere a longer, still
+    # measurement would probably turn them into detections, and that is
+    # worth telling the operator while they are still there to act on it.
+    near_rows: list[dict[str, Any]] = []
     scan_centers = np.arange(
         low,
         high + resolved.scan_step_hz / 2.0,
@@ -235,10 +247,17 @@ def detect_from_data(
     )
     for scan_center in scan_centers:
         feature = feature_at(data, float(scan_center), resolved)
-        if feature is not None and _is_strong(feature, resolved):
+        if feature is None:
+            continue
+        if _is_strong(feature, resolved):
             strong_rows.append(feature)
+        elif feature["p95_snr_db"] >= resolved.min_p95_channel_snr_db - NEAR_THRESHOLD_MARGIN_DB:
+            near_rows.append(feature)
 
     maxima = _local_maxima(strong_rows, resolved)
+    near_threshold = sorted(
+        _local_maxima(near_rows, resolved), key=lambda row: row["frequency_hz_assuming_iq"]
+    )
     candidates = [
         feature
         for feature in maxima
@@ -261,6 +280,7 @@ def detect_from_data(
         "local_maximum_count": len(maxima),
         "candidates": candidates,
         "rejected": rejected,
+        "near_threshold": near_threshold,
         "frequency_hz": frequency,
         "average_db": data["average_db"],
         "percentile_db": data["percentile_db"],

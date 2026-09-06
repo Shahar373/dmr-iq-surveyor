@@ -10,7 +10,7 @@ from __future__ import annotations
 import resource
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -23,7 +23,11 @@ from dmr_iq_surveyor.reporting.markdown import (
     render_survey_report_markdown,
 )
 from dmr_iq_surveyor.survey.compare import compare_runs, store_comparison
-from dmr_iq_surveyor.survey.discovery import discover_observations, resolve_capture_time
+from dmr_iq_surveyor.survey.discovery import (
+    discover_observations,
+    discover_observations_windowed,
+    resolve_capture_time,
+)
 from dmr_iq_surveyor.survey.profiles import (
     BandProfile,
     ComparisonTolerances,
@@ -41,6 +45,44 @@ from dmr_iq_surveyor.survey.store import (
 )
 
 DEFAULT_DATABASE_PATH = Path("runs/inventory/dmr_inventory.sqlite3")
+
+# A stationary recording re-read with the drive-mode statistic is stored as
+# its own survey run, named after the one it derives from, and barred from
+# the solve with this reason so the same stop is never two constraints. The
+# constant exists so the digest can recognise the pair and compare them.
+DRIVE_VIEW_SUFFIX = "_drive_view"
+DRIVE_VIEW_REASON_PREFIX = "drive_view of "
+DRIVE_VIEW_MODE = "drive_view"
+
+
+@dataclass(frozen=True, slots=True)
+class DriveViewSettings:
+    """How to re-read a recorded stop the way a drive bin would have heard it.
+
+    Defaults are the field drive settings, and the point is that they match:
+    a drive bin (24 spread periodograms of 16384 points per one-second
+    window) and a survey segment (~150 consecutive ones) sit on different
+    points of the `p95_snr_db` curve and decide a channel a few dB either
+    side of the gate differently. The view is a second run, not a
+    replacement -- the stop's own analysis and labels are untouched.
+    """
+
+    fft_size: int = 16_384
+    frames_per_window: int = 24
+    window_seconds: float = 1.0
+    # None reads the whole recording as one long hold would; a number caps it
+    # at that many windows, which is what a drive bin is limited to.
+    max_windows: int | None = None
+
+    def validate(self) -> None:
+        if self.fft_size < 16:
+            raise ValueError("fft_size must be at least 16")
+        if self.frames_per_window < 1:
+            raise ValueError("frames_per_window must be at least 1")
+        if self.window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        if self.max_windows is not None and self.max_windows < 1:
+            raise ValueError("max_windows must be at least 1 when set")
 
 
 def _peak_rss_bytes() -> int:
@@ -95,9 +137,12 @@ def run_survey(
     gps_fetched_at_utc: str | None = None,
     site_id_override: str | None = None,
     site_label_override: str | None = None,
+    drive_view: DriveViewSettings | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     log = SurveyLog()
+    if drive_view is not None:
+        drive_view.validate()
 
     source = Path(recording_path).expanduser().resolve()
     if not source.is_file():
@@ -244,6 +289,20 @@ def run_survey(
 
         run_row = get_run(connection, resolved_run_id)
         observation_rows = get_run_observations(connection, resolved_run_id)
+
+        drive_view_summary = None
+        if drive_view is not None:
+            drive_view_summary = _store_drive_view(
+                connection,
+                database=database,
+                source=source,
+                run_record=run_record,
+                band_profile=band_profile,
+                assumed_iq_order=assumed_iq_order,
+                tolerance=tolerance,
+                settings=drive_view,
+                log=log,
+            )
     finally:
         connection.close()
 
@@ -268,6 +327,7 @@ def run_survey(
         "usable_passband": passband.to_dict(),
         "elapsed_seconds": elapsed,
         "peak_rss_bytes": _peak_rss_bytes(),
+        "drive_view": drive_view_summary,
     }
     write_json(destination / "run.json", manifest)
     log.info(f"survey run complete in {elapsed:.1f}s, peak RSS {_peak_rss_bytes() / (1024 ** 2):.1f} MiB")
@@ -282,6 +342,97 @@ def run_survey(
         "coverage_status": passband.coverage_status,
         "elapsed_seconds": elapsed,
         "peak_rss_bytes": _peak_rss_bytes(),
+        "drive_view": drive_view_summary,
+    }
+
+
+def _store_drive_view(
+    connection: Any,
+    *,
+    database: Path,
+    source: Path,
+    run_record: SurveyRunRecord,
+    band_profile: BandProfile,
+    assumed_iq_order: str,
+    tolerance: float,
+    settings: DriveViewSettings,
+    log: SurveyLog,
+) -> dict[str, Any]:
+    """Re-read the recording as a drive bin would and store it beside the run.
+
+    Stored as a second survey run so its observations are ordinary rows the
+    digest can join, and excluded from geolocation on the spot: the solver
+    would otherwise see one stop twice and count it as two agreeing places.
+    The exclusion is written with `DRIVE_VIEW_REASON_PREFIX` so a reader can
+    tell it apart from a stop set aside for a fault.
+    """
+    view_id = f"{run_record.survey_run_id}{DRIVE_VIEW_SUFFIX}"
+    log.info(
+        f"drive view {view_id!r}: fft_size={settings.fft_size}, "
+        f"frames_per_window={settings.frames_per_window}, "
+        f"window_seconds={settings.window_seconds}, max_windows={settings.max_windows}"
+    )
+    result = discover_observations_windowed(
+        source,
+        band_profile=band_profile,
+        assumed_iq_order=assumed_iq_order,
+        fft_size=settings.fft_size,
+        frames_per_window=settings.frames_per_window,
+        window_seconds=settings.window_seconds,
+        max_windows=settings.max_windows,
+    )
+    passband = result["usable_passband"]
+    view_record = replace(
+        run_record,
+        survey_run_id=view_id,
+        usable_low_hz=passband.usable_low_hz,
+        usable_high_hz=passband.usable_high_hz,
+        coverage_status=passband.coverage_status,
+        analyzed_seconds=result["analyzed_seconds"],
+        segment_count=result["segment_count"],
+        occupancy_threshold_db=result["occupancy_threshold_db"],
+        detection_settings=result["detection_settings"].to_dict(),
+        settings={
+            "mode": DRIVE_VIEW_MODE,
+            "derived_from": run_record.survey_run_id,
+            "fft_size": settings.fft_size,
+            "frames_per_window": settings.frames_per_window,
+            "window_seconds": settings.window_seconds,
+            "max_windows": settings.max_windows,
+            "windows_analysed": result["segment_count"] - result["segments_skipped"],
+            "near_threshold": result.get("near_threshold", []),
+        },
+    )
+    summary = import_survey_run(
+        connection,
+        run=view_record,
+        observations=result["observations"],
+        raster_tolerance_hz=tolerance,
+    )
+    # Imported here rather than at module top: geo builds on survey, and the
+    # dependency must not run the other way at import time.
+    from dmr_iq_surveyor.geo.store import EXCLUSION_SCOPE_ALL, connect_geo_database, exclude_run
+
+    geo = connect_geo_database(database)
+    try:
+        exclude_run(
+            geo,
+            view_id,
+            f"{DRIVE_VIEW_REASON_PREFIX}{run_record.survey_run_id}",
+            scope=EXCLUSION_SCOPE_ALL,
+        )
+    finally:
+        geo.close()
+    log.info(
+        f"drive view stored {summary['observations_imported']} observation(s) over "
+        f"{result['segment_count'] - result['segments_skipped']} window(s); "
+        "excluded from geolocation as a second reading of the same stop"
+    )
+    return {
+        "survey_run_id": view_id,
+        "observation_count": summary["observations_imported"],
+        "windows": result["segment_count"] - result["segments_skipped"],
+        "frames_per_window": settings.frames_per_window,
     }
 
 
