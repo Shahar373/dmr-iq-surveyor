@@ -211,6 +211,9 @@ Do not claim TG or Radio IDs for the original short recordings; none were recove
 
 ## 6. Commands on the Pi
 
+> **Historical.** This section and its expected version below predate Phases 5.2-7.1; the current
+> version is 0.10.0. Kept for the Phase 5 archived-inventory record it documents.
+
 Update and validate:
 
 ```bash
@@ -379,6 +382,10 @@ issue -> feature branch -> implementation/tests/docs -> PR -> CI -> merge
 Merge only after full pytest and Ruff succeed. Update this handoff whenever the project state changes materially.
 
 ## 12. Prompt for the next chat
+
+> **Historical.** This prompt is from the Phase 5.1 handoff and names version 0.7.0; the project is
+> now at 0.10.0 with Phases 6A and 7/7.1 also complete. Kept verbatim as the historical record of
+> that session's next step, not as a current-state prompt.
 
 ```text
 Continue the DMR IQ Surveyor project in:

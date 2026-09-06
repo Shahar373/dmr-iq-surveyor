@@ -3,7 +3,9 @@
 Built on `http.server` rather than a web framework on purpose. This runs on
 a Raspberry Pi in a car park, reached from a phone on the same hotspot; a
 tool that fails because a dependency did not install is worse than one with
-a hand-written router. The API surface is nine endpoints.
+a hand-written router. The API surface has grown since this was first
+written; `do_GET`/`do_POST` below are the source of truth for the current
+route list, not a count kept up to date here.
 
 Scope and safety: the server can start an SDR capture, so it binds to
 loopback unless a host is given explicitly, and supports a shared token for

@@ -30,10 +30,14 @@ from typing import Any
 
 from dmr_iq_surveyor.geo.model import LocalProjection
 
-# Bin edge. Above the ~100-200 m suburban decorrelation distance for shadow
-# fading, so two bins are close to independent, and far above the 14 m needed
-# to average out fast fading. Smaller would readmit the correlation this
-# exists to remove; much larger would throw away geometry the drive paid for.
+# Bin edge. Above the ~10-50 m urban decorrelation distance the coverage
+# study below was measured against (so two bins there are close to
+# independent), and far above the 14 m needed to average out fast fading.
+# It sits INSIDE the ~100-200 m suburban decorrelation range rather than
+# above it, so treating suburban bins as independent is still an
+# approximation the same study did not test -- see docs/known-issues-v0.10.md.
+# Smaller would readmit more of the correlation this exists to remove; much
+# larger would throw away geometry the drive paid for.
 DEFAULT_BIN_SIZE_M = 150.0
 
 

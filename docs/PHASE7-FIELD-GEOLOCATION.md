@@ -156,6 +156,16 @@ dmr-surveyor web serve --host 0.0.0.0 --token auto \
   --band central_800_narrow --site mobile --output runs/field
 ```
 
+This serves plain HTTP. Browsers only expose GPS to pages served over a *secure context* -- HTTPS or
+localhost -- so over plain HTTP from a phone the position mark below falls back to tapping the map
+(see step 2), and **Drive mode (README.md's "Live (moving) survey" section) will not run at all**
+without HTTPS. To exercise Drive over HTTPS, add `--tls` on a trusted staging network:
+
+```bash
+dmr-surveyor web serve --host 0.0.0.0 --tls --token auto \
+  --band central_800_narrow --site mobile --output runs/field
+```
+
 Then, at every stop:
 
 1. Stop the vehicle, engine and any inverter off if they raise the noise floor.
@@ -193,7 +203,7 @@ dmr-surveyor geo history BEE00:37D:1:30
 | Status | What to do about it |
 |---|---|
 | `ok` | A bounded region. Read the 90% area, not the mode. |
-| `insufficient_evidence` | Fewer than three detections. Add stops closer to where it is heard. |
+| `insufficient_evidence` | Fewer than two detections, or fewer than two independent constraints -- `(detections - 1) + non-detections`. Add stops closer to where it is heard, or stops anywhere else on record. |
 | `unbounded_region` | Nothing bounds it from outside. Add stops where you expect *not* to hear it. |
 | `weak_geometry` | All detections from one bearing. Add stops on the far side. |
 | `frequency_unknown` | No control channel on record. Nothing to measure until one is found. |

@@ -227,11 +227,13 @@ class FieldSettings:
     # only seeing them, and that is a decision worth leaving to the person in
     # the car. Set it above zero to have it happen on its own.
     live_solve_every_bins: int = 0
-    # Let the measurement span follow the speed: about 100 m crawling through
-    # a town, about 250 m on an open road, so every measurement averages the
-    # same number of windows instead of five on a motorway and eighteen in
-    # traffic. The grid underneath becomes a fixed 50 m ledger of measured
-    # road, which is what stops variable spans from ever overlapping.
+    # The measurement span itself is fixed at 150 m either way (see
+    # live/bins.py: MIN_ADAPTIVE_BIN_M == MAX_ADAPTIVE_BIN_M == 150.0,
+    # measured against correlated shadow fading -- a shorter span was tried
+    # and rejected). What "adaptive" controls is the *pitch*: the grid
+    # underneath becomes a fixed 50 m ledger of measured road, and the next
+    # measurement only starts a full 150 m span from where the last one
+    # began, which is what stops spans from ever overlapping at any speed.
     live_adaptive_bins: bool = True
     # Backstop only, not a plan: a drive normally ends when the operator
     # stops it. Without a cap a forgotten session holds the SDR and burns

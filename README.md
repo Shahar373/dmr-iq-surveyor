@@ -425,7 +425,7 @@ The solver refuses rather than guessing:
 | `status` | Raised when |
 |---|---|
 | `ok` | enough evidence and geometry for a bounded region |
-| `insufficient_evidence` | fewer than `--min-detections` (default 3) usable detections |
+| `insufficient_evidence` | fewer than `--min-detections` (default 2) usable detections, or fewer than 2 independent constraints -- `(detections - 1) + non-detections` -- on the position |
 | `unbounded_region` | the 90% region reaches the edge of the analysed area |
 | `weak_geometry` | detections span under 90 degrees of azimuth around the estimate |
 
@@ -483,6 +483,15 @@ dmr-surveyor geo export map.geojson               # everything, for anything els
 
 ```bash
 dmr-surveyor web serve --host 0.0.0.0 --token auto \
+  --band central_800_narrow --site mobile --output runs/field
+```
+
+This serves plain HTTP: a stationary stop still works (mark a position by tapping the map), but a
+**live drive cannot run** without HTTPS -- see the secure-context note below. To test Drive over
+HTTPS, add `--tls` on a trusted staging network:
+
+```bash
+dmr-surveyor web serve --host 0.0.0.0 --tls --token auto \
   --band central_800_narrow --site mobile --output runs/field
 ```
 
