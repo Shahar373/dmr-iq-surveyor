@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from dmr_iq_surveyor.capture.device import DeviceSettings, device_args_string, probe_soapysdr
 
 
-def test_probe_soapysdr_reports_unavailable_without_bindings() -> None:
-    """SoapySDR is not installed in this environment (by design -- see
-    capture/device.py's docstring); the probe must report that clearly
-    rather than raising, mirroring decode/dsd.py::probe_decoder()."""
+def test_probe_soapysdr_reports_unavailable_without_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SoapySDR is not importable, regardless of whether this happens to be
+    true of the machine running the suite -- a Raspberry Pi field unit with
+    real SoapySDR bindings and an RSP1B attached must see the same "not
+    importable" branch of probe_soapysdr() as a laptop with neither. Setting
+    a module to None in sys.modules is the standard way to force the next
+    `import <name>` to raise ImportError without needing the module to be
+    genuinely absent; the probe must report that clearly rather than
+    raising, mirroring decode/dsd.py::probe_decoder()."""
+    monkeypatch.setitem(sys.modules, "SoapySDR", None)
     probe = probe_soapysdr("sdrplay")
     assert probe.available is False
     assert probe.requested_driver == "sdrplay"

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from fixtures.geo_scenario import Transmitter, build_database, seed_run
 
+from dmr_iq_surveyor.capture.device import DeviceProbe
 from dmr_iq_surveyor.web.jobs import JobRegistry
 from dmr_iq_surveyor.web.server import create_server
 from dmr_iq_surveyor.web.service import (
@@ -75,6 +76,32 @@ class Client:
                 if event.get("stage") == "closed" or len(events) >= limit:
                     break
         return events
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sdr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test in this file exercises the "no SDR available" path on
+    purpose -- none is meant to probe, open or otherwise depend on real
+    hardware. Whether that path is actually taken must not depend on
+    whether the machine running the suite happens to have SoapySDR bindings
+    and an SDRplay device attached (true on a Raspberry Pi field unit, false
+    on a laptop): the same deterministic DeviceProbe is substituted for
+    every call, regardless of what is really installed or connected.
+
+    Patches the name as bound into web.service (`from ... import
+    probe_soapysdr`), which is what every call site in FieldService
+    actually calls; capture.device.probe_soapysdr itself is untouched.
+    """
+    monkeypatch.setattr(
+        "dmr_iq_surveyor.web.service.probe_soapysdr",
+        lambda driver: DeviceProbe(
+            available=False,
+            requested_driver=driver,
+            resolved_label=None,
+            probe_error=f"SoapySDR probing is mocked out for this test suite (driver={driver!r}).",
+            devices_found=[],
+        ),
+    )
 
 
 @pytest.fixture()
