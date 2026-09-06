@@ -83,6 +83,16 @@ STATUS_WEAK_GEOMETRY = "weak_geometry"
 # rather than leaving the assumption implicit.
 SOURCE_MODEL = "single_transmitter_assumed"
 
+# Generic maturity/validation state of THIS ESTIMATOR, independent of any
+# particular band, protocol or deployment. The solver is not P25- or
+# 868 MHz-specific -- it takes a log-distance model and censored/detected
+# levels -- so these constants say only "the method has not been checked
+# against ground truth", never which frequency range that applies to. A
+# caller with a specific workflow in mind (e.g. the P25/868 MHz field
+# campaign) states that context itself, in its own report or UI text.
+GEOLOCATION_MATURITY = "experimental"
+VALIDATION_STATUS = "unvalidated"
+
 # Whether a solution's fitted propagation parameters are separable from each
 # other. Four states, because they are four different things to a reader and
 # collapsing them loses the reason:
@@ -687,11 +697,13 @@ __all__ = [
     "FIT_NOT_FITTED",
     "FIT_UNDERDETERMINED",
     "FIT_UNKNOWN",
+    "GEOLOCATION_MATURITY",
     "SOURCE_MODEL",
     "STATUS_INSUFFICIENT_EVIDENCE",
     "STATUS_OK",
     "STATUS_UNBOUNDED_REGION",
     "STATUS_WEAK_GEOMETRY",
+    "VALIDATION_STATUS",
     "PosteriorSurface",
     "SolveResult",
     "highest_density_threshold",

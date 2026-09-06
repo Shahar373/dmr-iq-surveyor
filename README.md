@@ -359,6 +359,11 @@ Band profiles (`config/bands/*.yaml`, e.g. `central_800.yaml` for 866-870 MHz, `
 
 ## Phase 7 — P25 site geolocation
 
+**Geolocation maturity: experimental.** The estimator itself is exercised by the test suite and CI,
+but the current P25/868 MHz workflow has not received in-band ground-truth validation -- no
+transmitter of known position has yet been measured at 868 MHz to check the model against. Software
+tests passing is not evidence of RF accuracy. See `docs/known-issues-v0.10.md`.
+
 ```bash
 dmr-surveyor geo import-sites config/p25_sites.csv --snapshot-id p25_sites_v1
 dmr-surveyor geo sites

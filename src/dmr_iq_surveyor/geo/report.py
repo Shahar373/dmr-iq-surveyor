@@ -35,11 +35,17 @@ def render_solution_markdown(
     settings: dict[str, Any],
     common_mode: dict[str, Any] | None = None,
     plan: dict[str, Any] | None = None,
+    geolocation_maturity: str | None = None,
+    validation_note: str | None = None,
 ) -> str:
     lines: list[str] = [
         "# P25 site geolocation",
         "",
         f"Solve batch: `{solve_batch_id}`",
+    ]
+    if geolocation_maturity:
+        lines.append(f"**Geolocation maturity: {geolocation_maturity}.** {validation_note or ''}".rstrip())
+    lines += [
         "",
         "## What these results are",
         "",

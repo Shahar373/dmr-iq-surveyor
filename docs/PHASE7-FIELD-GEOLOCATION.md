@@ -4,6 +4,10 @@ The authoritative checklist for a geolocation campaign. Read
 [`docs/phase7-geolocation-design.md`](phase7-geolocation-design.md) first for what the results mean;
 this document is how to produce them.
 
+**Geolocation maturity: experimental.** The current P25/868 MHz workflow has not received in-band
+ground-truth validation. Passing tests confirm the software runs correctly; they do not confirm RF
+accuracy. See `docs/known-issues-v0.10.md` for what is and is not yet validated.
+
 ## 0. Once, before the first drive
 
 ```bash

@@ -36,7 +36,9 @@ from dmr_iq_surveyor.geo.report import render_solution_markdown
 from dmr_iq_surveyor.geo.solver import (
     FIT_NOT_FITTED,
     FIT_UNDERDETERMINED,
+    GEOLOCATION_MATURITY,
     SOURCE_MODEL,
+    VALIDATION_STATUS,
     solve_site,
 )
 from dmr_iq_surveyor.geo.store import (
@@ -54,6 +56,14 @@ from dmr_iq_surveyor.reference.store import import_snapshot, list_sites
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
 
 METHOD = "bayesian_grid_log_distance"
+
+# The estimator itself is generic (geo/solver.py knows nothing about P25 or
+# 868 MHz); this note names the one field workflow this project currently
+# runs it for, so a reader of the report is not left to infer it. Update or
+# remove this note if a second band or protocol is added.
+VALIDATION_NOTE = (
+    "The current P25/868 MHz workflow has not received in-band ground-truth validation."
+)
 
 # Site-level outcomes that are not solver refusals but facts about the
 # inputs. Kept distinct from the solver's own statuses so "we never had a
@@ -689,6 +699,9 @@ def solve_all_sites(
         "solve_batch_id": batch,
         "method": METHOD,
         "source_model": SOURCE_MODEL,
+        "geolocation_maturity": GEOLOCATION_MATURITY,
+        "validation_status": VALIDATION_STATUS,
+        "validation_note": VALIDATION_NOTE,
         "generated_at": datetime.now(UTC).isoformat(),
         "measurement_summary": measurement_summary,
         "settings": resolved.to_dict(),
@@ -716,6 +729,8 @@ def solve_all_sites(
                 settings=resolved.to_dict(),
                 common_mode=report["common_mode"],
                 plan=plan,
+                geolocation_maturity=GEOLOCATION_MATURITY,
+                validation_note=VALIDATION_NOTE,
             ),
             encoding="utf-8",
         )

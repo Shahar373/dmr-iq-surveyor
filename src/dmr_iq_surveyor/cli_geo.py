@@ -20,12 +20,14 @@ from dmr_iq_surveyor.geo.export import to_gpx, to_kml
 from dmr_iq_surveyor.geo.measurements import MeasurementSettings
 from dmr_iq_surveyor.geo.model import SolveSettings
 from dmr_iq_surveyor.geo.pipeline import (
+    VALIDATION_NOTE,
     build_map_geojson,
     import_reference_sites,
     materialise_measurements,
     site_overview,
     solve_all_sites,
 )
+from dmr_iq_surveyor.geo.solver import GEOLOCATION_MATURITY
 from dmr_iq_surveyor.geo.store import (
     connect_geo_database,
     latest_plan,
@@ -250,6 +252,10 @@ def geo_solve(
     console.print(
         "[yellow]A region is a search-area reduction, not a transmitter coordinate.[/yellow]"
     )
+    console.print(
+        f"[yellow]Geolocation maturity: {report['geolocation_maturity']}.[/yellow] "
+        f"{report['validation_note']}"
+    )
 
     offsets = report["common_mode"]
     notable = [
@@ -338,6 +344,7 @@ def geo_sites(database: DatabaseOption = None) -> None:
         )
     console.print(table)
     console.print("[dim]* frequency is on record for more than one site: not attributable[/dim]")
+    console.print(f"[yellow]Geolocation maturity: {GEOLOCATION_MATURITY}.[/yellow] {VALIDATION_NOTE}")
 
 
 @geo_app.command("history")

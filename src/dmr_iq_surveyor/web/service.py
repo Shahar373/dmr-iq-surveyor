@@ -25,11 +25,13 @@ from dmr_iq_surveyor.geo.export import to_gpx, to_kml
 from dmr_iq_surveyor.geo.measurements import MeasurementSettings
 from dmr_iq_surveyor.geo.model import SolveSettings
 from dmr_iq_surveyor.geo.pipeline import (
+    VALIDATION_NOTE,
     build_map_geojson,
     materialise_measurements,
     site_overview,
     solve_all_sites,
 )
+from dmr_iq_surveyor.geo.solver import GEOLOCATION_MATURITY
 from dmr_iq_surveyor.geo.store import (
     EXCLUSION_SCOPE_NON_DETECTIONS,
     clear_run_exclusion,
@@ -391,6 +393,10 @@ class FieldService:
             "plan": self.plan(),
             "jobs": self.jobs.list(),
             "live": self.live_status(),
+            "geolocation": {
+                "maturity": GEOLOCATION_MATURITY,
+                "validation_note": VALIDATION_NOTE,
+            },
         }
 
     def geojson(self) -> dict[str, Any]:
