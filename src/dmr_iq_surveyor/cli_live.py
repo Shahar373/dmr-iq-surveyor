@@ -18,6 +18,7 @@ Mounted additively; no existing command changes.
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -176,8 +177,12 @@ def live_stop(
         f"(holding {held_mb:.0f} MB, writing no IQ)"
     )
 
+    # The run id is the place AND the session. A fixed session id made a
+    # second stop at the same coordinates overwrite the first in silence;
+    # timestamped, the earlier one stays, superseded, and the digest can say
+    # whether the two agreed.
     session = LiveSession(
-        session_id=label or "live_stop",
+        session_id=label or f"live_stop_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}",
         settings=settings,
         band=band_profile,
         site=site_profile,

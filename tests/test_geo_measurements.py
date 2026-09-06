@@ -418,3 +418,44 @@ def test_a_stop_recorded_at_a_different_gain_is_flagged_across_the_campaign(
     }
     connection.close()
     assert flagged == {"run_3"}
+
+
+def test_rebuilding_one_run_still_flags_its_gain_against_the_whole_campaign(tmp_path: Path) -> None:
+    """The field app rebuilds one run at a time. The reference gain must be
+    the campaign's, not the one run's own -- compared with itself, a stop
+    recorded at the wrong gain could never be flagged."""
+    import json as _json
+
+    from dmr_iq_surveyor.geo.store import connect_geo_database
+
+    database = tmp_path / "incremental.sqlite3"
+    connection = build_database(database)
+    for index, gain in enumerate([40.0, 40.0, 40.0, 33.0]):
+        seed_run(
+            connection,
+            run_id=f"run_{index}",
+            latitude=32.04 + index * 0.01,
+            longitude=34.79 + index * 0.01,
+            transmitters=[NEAR],
+            site_id=f"stop_{index}",
+            gain=gain,
+        )
+    connection.close()
+
+    result = materialise_measurements(database_path=database, run_ids=["run_3"])
+    assert result["reference_gain"] == 40.0
+    assert result["gain_drift_runs"] == ["run_3"]
+    assert result["run_count"] == 1
+
+    connection = connect_geo_database(database)
+    try:
+        flags = {
+            flag
+            for row in connection.execute(
+                "SELECT quality_flags_json FROM geo_measurements WHERE survey_run_id = 'run_3'"
+            )
+            for flag in _json.loads(row["quality_flags_json"])
+        }
+    finally:
+        connection.close()
+    assert "gain_differs_from_campaign:33" in flags

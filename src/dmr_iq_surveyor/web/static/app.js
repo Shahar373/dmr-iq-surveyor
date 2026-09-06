@@ -865,6 +865,16 @@ async function startDrive() {
   const button = $("#drive-start");
   button.disabled = true;
   if (live.watchId === null) startLocationSharing();
+  // The server refuses a drive until a fix has reached it, and sharing was
+  // possibly switched on a moment ago by the line above. Waiting here for the
+  // first fix spares the driver a "no GPS fix yet" alert and a second tap.
+  const waitUntil = Date.now() + 15000;
+  while (!live.lastFix && live.watchId !== null && !live.gpsError && Date.now() < waitUntil) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  if (live.lastFix && live.posting) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
   try {
     const job = await api("/api/live/start", {
       method: "POST",

@@ -301,3 +301,51 @@ def test_a_solution_reports_the_flags_its_evidence_carries(tmp_path: Path) -> No
     report = solve_all_sites(database_path=database, settings=fast_solve_settings())
     solution = next(row for row in report["solutions"] if row["site_key"] == "BEE00:37D:1:30")
     assert any("gain_differs_from_campaign" in warning for warning in solution.get("warnings", []))
+
+
+def test_an_exclusion_written_after_the_measurements_is_honoured_by_the_solve(tmp_path: Path) -> None:
+    """The failure this guards against: a drive bin superseded by a later
+    day's pass is excluded AFTER its measurements were built, and the solver
+    reads the measurements. Without a refresh both days count -- the double
+    evidence the supersede exists to prevent."""
+    from dmr_iq_surveyor.geo.pipeline import runs_with_stale_exclusions
+    from dmr_iq_surveyor.geo.store import clear_run_exclusion, exclude_run
+
+    database = tmp_path / "stale.sqlite3"
+    _seed(database, STOPS)
+    materialise_measurements(database_path=database)
+
+    connection = connect_geo_database(database)
+    try:
+        assert runs_with_stale_exclusions(connection) == []
+        exclude_run(connection, "run_00", "superseded by run_00_day2", scope="all")
+        assert runs_with_stale_exclusions(connection) == ["run_00"]
+    finally:
+        connection.close()
+
+    report = solve_all_sites(database_path=database, settings=fast_solve_settings())
+    assert report["measurements_refreshed"] == ["run_00"]
+    connection = connect_geo_database(database)
+    try:
+        assert runs_with_stale_exclusions(connection) == []
+        usable = connection.execute(
+            "SELECT COUNT(*) AS n FROM geo_measurements "
+            "WHERE survey_run_id = 'run_00' AND usability = 'usable'"
+        ).fetchone()["n"]
+        assert usable == 0
+        for row in report["solutions"]:
+            assert "run_00" not in row["input_run_ids"]
+
+        # Lifting it is the same staleness the other way round.
+        clear_run_exclusion(connection, "run_00")
+        assert runs_with_stale_exclusions(connection) == ["run_00"]
+    finally:
+        connection.close()
+    report = solve_all_sites(database_path=database, settings=fast_solve_settings())
+    assert report["measurements_refreshed"] == ["run_00"]
+    assert any("run_00" in row["input_run_ids"] for row in report["solutions"])
+
+    # A campaign that is already consistent refreshes nothing.
+    report = solve_all_sites(database_path=database, settings=fast_solve_settings())
+    assert report["measurements_refreshed"] == []
+    assert report["measurements_refreshed_summary"] is None

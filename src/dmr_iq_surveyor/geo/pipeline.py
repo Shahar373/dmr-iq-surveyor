@@ -132,18 +132,26 @@ def materialise_measurements(
     resolved.validate()
     connection = connect_geo_database(_database(database_path))
     try:
+        every_run = [
+            str(row["survey_run_id"])
+            for row in connection.execute(
+                "SELECT survey_run_id FROM survey_runs ORDER BY "
+                "COALESCE(capture_start_utc, imported_at) ASC"
+            )
+        ]
         if run_ids is None:
-            run_ids = [
-                str(row["survey_run_id"])
-                for row in connection.execute(
-                    "SELECT survey_run_id FROM survey_runs ORDER BY "
-                    "COALESCE(capture_start_utc, imported_at) ASC"
-                )
-            ]
-        gains = _campaign_gains(connection, run_ids)
-        reference_gain = _modal_gain(gains)
-        noise_floors = _campaign_noise_floors(connection, run_ids)
-        reference_noise = _median_noise_floor(noise_floors)
+            run_ids = every_run
+        # The reference gain and noise floor are the CAMPAIGN's, whichever
+        # runs are being rebuilt. Taking them from the requested subset made
+        # the field app's one-run-at-a-time rebuild compare each stop with
+        # itself, so a stop recorded at the wrong gain was never flagged
+        # until someone ran a full `geo measurements` by hand.
+        campaign_gains = _campaign_gains(connection, every_run)
+        reference_gain = _modal_gain(campaign_gains)
+        campaign_noise = _campaign_noise_floors(connection, every_run)
+        reference_noise = _median_noise_floor(campaign_noise)
+        gains = {run_id: campaign_gains.get(run_id) for run_id in run_ids}
+        noise_floors = {run_id: campaign_noise.get(run_id) for run_id in run_ids}
         per_run: list[dict[str, Any]] = []
         total: list[dict[str, Any]] = []
         for run_id in run_ids:
@@ -511,6 +519,41 @@ def _build_plan(
     return plan
 
 
+def runs_with_stale_exclusions(connection: Any) -> list[str]:
+    """Runs whose stored measurements no longer agree with their exclusion.
+
+    A measurement row carries the verdict that was true when it was built.
+    An exclusion written afterwards -- a drive bin superseded by a later day's
+    pass, a hold replacing the bin at its spot, an operator's judgement from
+    the CLI -- changes the verdict without touching the row, and the solver
+    reads the row. Left alone, a superseded bin kept counting beside its
+    replacement: exactly the double evidence the supersede exists to prevent.
+    The reverse holds for an exclusion that was lifted.
+    """
+    exclusions = {
+        str(row["survey_run_id"]): str(row["scope"])
+        for row in connection.execute("SELECT survey_run_id, scope FROM geo_run_exclusions")
+    }
+    stale: set[str] = set()
+    for row in connection.execute(
+        "SELECT DISTINCT survey_run_id, usability, detected FROM geo_measurements "
+        "WHERE usability IN ('usable', 'run_excluded')"
+    ):
+        run_id = str(row["survey_run_id"])
+        scope = exclusions.get(run_id)
+        counts = str(row["usability"]) == "usable"
+        detected = bool(row["detected"])
+        if scope is None:
+            should_count = True
+        elif scope == "non_detections":
+            should_count = detected
+        else:
+            should_count = False
+        if counts != should_count:
+            stale.add(run_id)
+    return sorted(stale)
+
+
 def solve_all_sites(
     *,
     database_path: str | Path | None = None,
@@ -543,6 +586,19 @@ def solve_all_sites(
     planning.validate()
 
     batch = solve_batch_id or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    # Measurements built before their run's exclusion changed are rebuilt
+    # first, so the evidence the solve reads is the evidence the database
+    # says is admissible. A campaign whose exclusions are all older than its
+    # measurements does nothing here.
+    connection = connect_geo_database(_database(database_path))
+    try:
+        stale = runs_with_stale_exclusions(connection)
+    finally:
+        connection.close()
+    refreshed: dict[str, Any] | None = None
+    if stale:
+        refreshed = materialise_measurements(database_path=database_path, run_ids=stale)
+
     connection = connect_geo_database(_database(database_path))
     try:
         sites = list_sites(connection)
@@ -638,6 +694,11 @@ def solve_all_sites(
         "settings": resolved.to_dict(),
         "common_mode": summarise_common_mode(offsets),
         "plan": plan,
+        # Which runs had to be rebuilt before this solve because their
+        # exclusion changed after their measurements were made. Empty for a
+        # campaign that was already consistent.
+        "measurements_refreshed": sorted(stale),
+        "measurements_refreshed_summary": refreshed["summary"] if refreshed else None,
         "solutions": [
             {key: value for key, value in solution.items() if key != "geojson"}
             for solution in rows
@@ -804,6 +865,7 @@ __all__ = [
     "build_map_geojson",
     "import_reference_sites",
     "materialise_measurements",
+    "runs_with_stale_exclusions",
     "site_overview",
     "solve_all_sites",
 ]

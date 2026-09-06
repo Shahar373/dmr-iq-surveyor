@@ -134,3 +134,34 @@ def test_a_stream_that_delivers_nothing_reports_it_rather_than_claiming_success(
     result = _invoke(tmp_path, "--seconds", "1", "--timeout", "2")
     assert result.exit_code == 1
     assert "Nothing was written" in result.output
+
+
+def test_two_live_stops_at_one_place_keep_both_and_count_the_newer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second measurement at the same coordinates must not overwrite the
+    first in silence: both rows stay, the earlier one superseded."""
+    monkeypatch.setattr(live_session, "SoapyIqDevice", lambda: _Carrier())
+    first = _invoke(tmp_path, "--seconds", "4")
+    assert first.exit_code == 0, first.output
+    monkeypatch.setattr(live_session, "SoapyIqDevice", lambda: _Carrier())
+    second = _invoke(tmp_path, "--seconds", "4")
+    assert second.exit_code == 0, second.output
+
+    from dmr_iq_surveyor.geo.store import connect_geo_database
+    from dmr_iq_surveyor.live.session import SUPERSEDED_REASON_PREFIX
+
+    connection = connect_geo_database(tmp_path / "db.sqlite3")
+    try:
+        runs = [row["survey_run_id"] for row in connection.execute(
+            "SELECT survey_run_id FROM survey_runs ORDER BY imported_at"
+        )]
+        exclusions = {
+            row["survey_run_id"]: row["reason"]
+            for row in connection.execute("SELECT survey_run_id, reason FROM geo_run_exclusions")
+        }
+    finally:
+        connection.close()
+    assert len(runs) == 2 and runs[0] != runs[1]
+    assert set(exclusions) == {runs[0]}
+    assert exclusions[runs[0]] == f"{SUPERSEDED_REASON_PREFIX}{runs[1]}"

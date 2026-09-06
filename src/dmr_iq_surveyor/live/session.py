@@ -339,6 +339,11 @@ class LiveSession:
         self._hold_visit: BinVisit | None = None
         self._hold_until: float | None = None
         self._hold_seconds: float = 0.0
+        # A hold asked for while no fresh fix is available. Kept until a
+        # window starts on a fix rather than begun at once: begun blind, the
+        # hold would take the grid's origin cell as its place, name its run
+        # after that cell, and supersede whatever real measurement sits there.
+        self._hold_pending: float | None = None
         # Places a hold has claimed. A drive bin for one of these that is
         # still in the analysis queue when the hold lands would otherwise be
         # written afterwards and count beside it.
@@ -417,7 +422,15 @@ class LiveSession:
                     if self._hold_visit is None and self.hold_provider is not None:
                         wanted = self.hold_provider()
                         if wanted is not None and wanted > 0:
-                            self._begin_hold(float(wanted), started_at, connection)
+                            self._hold_pending = float(wanted)
+                    if (
+                        self._hold_pending is not None
+                        and self._hold_visit is None
+                        and started_at is not None
+                        and self._fresh(started_at)
+                    ):
+                        seconds, self._hold_pending = self._hold_pending, None
+                        self._begin_hold(seconds, started_at, connection)
                 chunk = np.asarray(
                     resolved_device.read_stream_chunk(
                         min(self.settings.chunk_frames, window_frames - filled)
@@ -450,19 +463,23 @@ class LiveSession:
                 self._to_analyse = None
         return self.stats
 
+    def _fresh(self, fix: Position) -> bool:
+        return self.clock() - fix.at <= self.settings.max_position_age_seconds
+
     def _consume_window(
         self, samples: np.ndarray, started_at: Position | None, connection: Any
     ) -> None:
         ended_at = self.position_provider()
-        if (
-            ended_at is None
-            or started_at is None
-            or self.clock() - ended_at.at > self.settings.max_position_age_seconds
-        ):
+        if ended_at is None or started_at is None or not self._fresh(ended_at):
             # Recorded, not guessed at. A window with no fresh fix cannot be
             # placed, and placing it at the last known position is exactly
             # how a drive would smear measurements onto a spot it had left.
             self.stats.windows_without_position += 1
+            if self._hold_visit is not None:
+                # The hold's clock runs on regardless: a driver who pulled
+                # over and lost GPS under a bridge must still be told "done"
+                # when the time is up, not held there until a fix returns.
+                self._tick_hold(connection)
             return
 
         if self._hold_visit is not None:
@@ -666,6 +683,11 @@ class LiveSession:
             if self._grid is not None:
                 visit.cells.add(self._grid.key_for(at.latitude, at.longitude))
             self.stats.windows_recorded += 1
+        self._tick_hold(connection)
+
+    def _tick_hold(self, connection: Any) -> None:
+        if self._hold_until is None:
+            return
         self.stats.hold_seconds_left = max(0.0, self._hold_until - self.clock())
         if self.clock() >= self._hold_until:
             self._finish_hold(connection)
@@ -775,6 +797,12 @@ class LiveSession:
     ) -> None:
         if self._grid is None:
             return
+        if not visit.latitudes:
+            # Nothing to place it at. Cannot happen for a drive bin, whose
+            # windows each carried a fix; guarded here because this runs on
+            # the streaming thread, where an exception would end the drive.
+            self.stats.bins_too_short += 1
+            return
         passband = detection["usable_passband"]
         latitude, longitude = visit.centroid()
         analysed = (
@@ -795,7 +823,9 @@ class LiveSession:
         # names its replacement, and the digest can put the two side by side.
         place_key = visit.key.run_id(self._grid.tag)
         is_hold = visit.kind == VISIT_HOLD
-        run_id = f"{place_key}_{self.session_id}" + ("_hold" if is_hold else "")
+        run_id = _unique_run_id(
+            connection, f"{place_key}_{self.session_id}" + ("_hold" if is_hold else "")
+        )
         # A hold is the better measurement of its place, so it supersedes the
         # drive bin taken there -- this session's or an earlier one's -- and
         # is itself superseded by a later day's hold on the same spot.
@@ -898,6 +928,24 @@ class LiveSession:
                     "holds_written": self.stats.holds_written,
                 }
             )
+
+
+def _unique_run_id(connection: Any, wanted: str) -> str:
+    """`wanted`, or `wanted_2`, `wanted_3`... if a run already carries it.
+
+    Structural rather than clock-based: two stationary measurements of one
+    place inside one session (or one second) must both be kept, and
+    `import_survey_run` would otherwise treat the second as a re-import of
+    the first and replace its observations in silence.
+    """
+    candidate = wanted
+    suffix = 2
+    while connection.execute(
+        "SELECT 1 FROM survey_runs WHERE survey_run_id = ?", (candidate,)
+    ).fetchone() is not None:
+        candidate = f"{wanted}_{suffix}"
+        suffix += 1
+    return candidate
 
 
 def _like_prefix(literal: str) -> str:

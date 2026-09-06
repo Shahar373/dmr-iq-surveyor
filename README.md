@@ -585,6 +585,17 @@ such pairs, the channels heard by both statistics, only by the long average, and
 statistic, with the median level shift between them. `survey run --drive-view` does the same for a
 recording analysed by hand; the field app has it on by default (`drive_view_for_stops`).
 
+**An exclusion takes effect at the next solve, whenever it was written.** A measurement row
+carries the verdict that was true when it was built, and a superseded bin's exclusion is written
+later, by the drive that replaced it. `geo solve` (and the field app's solves) now begin by
+rebuilding the measurements of every run whose stored verdict disagrees with its exclusion, in
+either direction, and the report lists them under `measurements_refreshed`. Before this, a bin
+re-driven on day two kept counting beside its replacement until someone ran a full
+`geo measurements` by hand. In the same spirit, a one-run rebuild now judges gain drift and noise
+floor against the whole campaign rather than against the run itself, and a live run id is made
+unique structurally (`…_2`, `…_3`) rather than by the clock, so two stationary measurements of one
+place in one session are both kept.
+
 **Both halves of the gain are stored.** The SDRplay's manual gain is an IF gain reduction *and* an
 LNA state, and only the first was written to the database, so the digest's gain-discipline check
 covered half the setting. `sites.lna_state` (additive, `NULL` on rows written before it existed) now

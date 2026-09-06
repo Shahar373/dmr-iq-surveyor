@@ -1070,3 +1070,84 @@ def test_window_frame_starts_is_the_shared_spread(tmp_path) -> None:
     # Too short for one frame: nothing, not a crash and not a partial frame.
     assert spread_frame_starts(1000, fft_size=4096, overlap_ratio=0.5, wanted=24) == []
     assert spread_frame_starts(4096, fft_size=4096, overlap_ratio=0.5, wanted=24) == [0]
+
+
+class _Blindfolded(_Parkable):
+    """A parked car whose GPS drops out for a while."""
+
+    def __init__(self, *, blind_from: float, blind_until: float, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.blind_from = blind_from
+        self.blind_until = blind_until
+
+    def position(self) -> Position | None:
+        if self.blind_from <= self.now < self.blind_until:
+            return None
+        return super().position()
+
+    def read_stream_chunk(self, max_frames: int) -> np.ndarray:
+        # The radio still hears the signal where the car really is; only the
+        # phone's fix is missing.
+        blind = (self.blind_from, self.blind_until)
+        self.blind_from, self.blind_until = -1.0, -1.0
+        try:
+            return super().read_stream_chunk(max_frames)
+        finally:
+            self.blind_from, self.blind_until = blind
+
+
+def test_a_hold_asked_for_without_a_fix_waits_for_one_and_still_ends_on_time(tmp_path: Path) -> None:
+    """Two things a hold must survive. Asked for during a GPS gap, it must not
+    begin blind -- begun blind it would take the grid's origin cell as its
+    place and supersede whatever sits there. And once running, losing GPS
+    must not freeze its clock: the driver is told "done" on time."""
+    database = tmp_path / "blind.sqlite3"
+    connection = build_database(database)
+    # Moving until 6 s, GPS gone 5-8 s, the hold asked for at 6 s (blind),
+    # GPS back at 8 s, gone again 10-20 s while the hold is running.
+    drive = _Blindfolded(start=(32.0700, 34.8000), east_step_m=60.0, blind_from=5.0, blind_until=8.0)
+    settings = _settings(min_windows_per_bin=1)
+    hold_started_at: list[float] = []
+
+    def hold_provider() -> float | None:
+        if hold_started_at or drive.now < 6.0:
+            return None
+        hold_started_at.append(drive.now)
+        drive.parked_at = drive.now
+        return 6.0
+
+    session = LiveSession(
+        session_id="b", settings=settings, band=_band(),
+        site=SiteProfile(site_id="mobile", label="mobile"), database_path=database,
+        position_provider=drive.position, device=drive, clock=drive.clock,
+        hold_provider=hold_provider,
+    )
+    seen: list[tuple[float, bool, float]] = []
+    original = session._tick_hold
+
+    def observed_tick(conn):
+        original(conn)
+        seen.append((drive.now, session.stats.hold_active, session.stats.hold_seconds_left))
+
+    session._tick_hold = observed_tick  # type: ignore[method-assign]
+
+    def blind_again_then_stop() -> bool:
+        if session.stats.hold_active and drive.now >= 10.0:
+            drive.blind_from, drive.blind_until = 10.0, 20.0
+        return drive.now >= 22.0
+
+    stats = session.run(stop=blind_again_then_stop, connection=connection)
+    connection.close()
+
+    # Not begun during the gap: the first tick is on or after the fix returned.
+    assert seen, "the hold ran"
+    assert seen[0][0] >= 8.0
+    # Ended on time although GPS was gone for the rest of it.
+    assert not stats.hold_active
+    assert stats.hold_seconds_total == 6.0
+    ended = [now for now, active, _left in seen if not active]
+    assert ended and ended[0] <= 8.0 + 6.0 + 1.5
+    # Its place is where the car actually was, never the grid origin.
+    holds = _runs_by_mode(database).get("live_stop", [])
+    if holds:
+        assert holds[0]["settings"]["bin_x"] != 0 or holds[0]["settings"]["bin_y"] != 0
