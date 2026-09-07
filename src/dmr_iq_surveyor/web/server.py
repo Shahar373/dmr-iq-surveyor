@@ -226,6 +226,11 @@ class _Handler(BaseHTTPRequestHandler):
                 # Posted about once a second for a whole drive, so it stays
                 # the cheapest handler here: validate, store, answer.
                 self._send_json(self.service.push_live_position(payload))
+            elif path == "/api/device/rescan":
+                # Answers from memory either way: it asks for a probe, it
+                # does not wait for one. A phone that taps this while the
+                # SDRplay service is wedged still gets a reply.
+                self._send_json(self.service.rescan_device())
             elif path == "/api/recordings/purge":
                 self._send_json(self.service.purge())
             elif path.startswith("/api/stops/") and path.endswith("/exclude"):

@@ -36,14 +36,6 @@ SITE30_HZ = 867_762_500.0
 SITE30 = Transmitter(SITE30_HZ, 32.050, 34.800, reference_level_db=45.0)
 CENTER = SITE30_HZ - 70_000.0
 
-class _Probe:
-    available = True
-    probe_error = ""
-
-    def to_dict(self) -> dict:
-        return {"available": True, "resolved_label": "fake SDR"}
-
-
 class _Rig:
     """The SDR and the car in one object, so the level matches the place.
 
@@ -152,7 +144,6 @@ def _drive(
 ) -> tuple[_Rig, dict]:
     rig = _Rig(service, start=(32.0400, 34.7800), speed_ms=speed_ms)
     monkeypatch.setattr(live_session, "SoapyIqDevice", lambda: rig)
-    monkeypatch.setattr(web_service, "probe_soapysdr", lambda driver: _Probe())
     service.push_live_position({"latitude": 32.0400, "longitude": 34.7800, "accuracy_m": 6.0})
 
     # A test tone is a few hertz wide, so the analysis is sized to this
@@ -423,7 +414,6 @@ def test_a_solve_can_be_asked_for_mid_drive(
     service = _service(tmp_path)
     rig = _Rig(service, start=(32.0400, 34.7800), speed_ms=20.0)
     monkeypatch.setattr(live_session, "SoapyIqDevice", lambda: rig)
-    monkeypatch.setattr(web_service, "probe_soapysdr", lambda driver: _Probe())
     service.push_live_position({"latitude": 32.0400, "longitude": 34.7800, "accuracy_m": 6.0})
     job = service.start_live(
         {"max_seconds": 60.0, "fft_size": 4096, "frames_per_window": 8}
@@ -478,7 +468,6 @@ def test_a_hold_request_is_bounded_and_handed_to_the_drive(
     service = _service(tmp_path)
     rig = _Rig(service, start=(32.0400, 34.7800), speed_ms=20.0)
     monkeypatch.setattr(live_session, "SoapyIqDevice", lambda: rig)
-    monkeypatch.setattr(web_service, "probe_soapysdr", lambda driver: _Probe())
     service.push_live_position({"latitude": 32.0400, "longitude": 34.7800, "accuracy_m": 6.0})
     job = service.start_live({"max_seconds": 120.0, "fft_size": 4096, "frames_per_window": 8})
     deadline = time.monotonic() + 90.0

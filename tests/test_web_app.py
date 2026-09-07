@@ -15,7 +15,6 @@ import pytest
 from fixtures.device_probe import StubProbeRunner
 from fixtures.geo_scenario import Transmitter, build_database, seed_run
 
-from dmr_iq_surveyor.capture.device import DeviceProbe
 from dmr_iq_surveyor.web.jobs import JobRegistry
 from dmr_iq_surveyor.web.server import create_server
 from dmr_iq_surveyor.web.service import (
@@ -86,28 +85,18 @@ def _no_real_sdr(monkeypatch: pytest.MonkeyPatch) -> None:
     hardware. Whether that path is actually taken must not depend on
     whether the machine running the suite happens to have SoapySDR bindings
     and an SDRplay device attached (true on a Raspberry Pi field unit, false
-    on a laptop): the same deterministic DeviceProbe is substituted for
+    on a laptop): the same deterministic reading is substituted for
     every call, regardless of what is really installed or connected.
 
-    Two seams, because FieldService reaches the hardware two ways:
-    `default_probe_runner`, which is what the device monitor behind
-    /api/state is built from, and the `probe_soapysdr` name as bound into
-    web.service, which the capture paths still call directly. Both are
-    patched where web.service binds them; capture.device is untouched.
+    One seam: `default_probe_runner`, the factory FieldService builds its
+    device monitor from when it is not handed a runner. Every path that
+    reaches the SDR -- /api/state, a capture, a drive -- goes through that
+    monitor, so substituting the factory covers all of them, and the stub
+    reports the same deterministic absence to each.
     """
     monkeypatch.setattr(
         "dmr_iq_surveyor.web.service.default_probe_runner",
         StubProbeRunner,
-    )
-    monkeypatch.setattr(
-        "dmr_iq_surveyor.web.service.probe_soapysdr",
-        lambda driver: DeviceProbe(
-            available=False,
-            requested_driver=driver,
-            resolved_label=None,
-            probe_error=f"SoapySDR probing is mocked out for this test suite (driver={driver!r}).",
-            devices_found=[],
-        ),
     )
 
 

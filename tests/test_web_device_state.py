@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
@@ -497,3 +498,170 @@ def test_a_server_cycle_leaves_no_threads_behind(tmp_path: Path) -> None:
     while threading.active_count() > before and time.monotonic() < deadline:
         time.sleep(0.02)
     assert threading.active_count() <= before, "threads survived the server"
+
+
+# -- Rescan SDR --------------------------------------------------------------
+
+
+def _post(base: str, path: str, body: dict | None = None, timeout: float = 5.0) -> tuple[int, dict]:
+    request = urllib.request.Request(
+        base + path,
+        method="POST",
+        data=json.dumps(body or {}).encode(),
+    )
+    request.add_header("X-Auth-Token", "s3cret")
+    request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = response.read().decode()
+            return response.status, json.loads(payload) if payload else {}
+    except urllib.error.HTTPError as error:
+        payload = error.read().decode()
+        return error.code, json.loads(payload) if payload else {}
+
+
+def test_rescan_asks_for_a_probe_and_answers_without_waiting_for_it(tmp_path: Path) -> None:
+    """Plugging the RSP1A back in must not mean restarting the whole app."""
+    runner = StubProbeRunner()
+    server = _server(tmp_path, runner)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        _settled(server.service.devices)
+        assert runner.calls == 1
+
+        runner.set_outcome(present("SDRplay RSP1A"))
+        started = time.monotonic()
+        status, payload = _post(base, "/api/device/rescan")
+        assert time.monotonic() - started < 2.0
+        assert status == 200
+        assert payload["rescan_started"] is True
+        assert payload["rescan_declined_reason"] is None
+        assert set(payload["device"]) == CONTRACT_KEYS
+
+        _wait_for_probes(server.service.devices, 2)
+        assert _get(base, "/api/state")[1]["device"]["state"] == STATE_AVAILABLE
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_rescan_will_not_stack_a_second_probe_on_a_stuck_one(
+    hung_server: tuple[str, StubProbeRunner],
+) -> None:
+    """The button must not become a way to make more stuck probes."""
+    base, runner = hung_server
+    assert runner.entered.wait(10.0)
+
+    status, payload = _post(base, "/api/device/rescan")
+    assert status == 200
+    assert payload["rescan_started"] is False
+    assert "already running" in payload["rescan_declined_reason"]
+    assert runner.calls == 1
+
+
+# -- readiness before the device is opened -----------------------------------
+
+
+def _capture_service(tmp_path: Path, runner: StubProbeRunner):
+    from dmr_iq_surveyor.web.service import FieldService
+
+    database = tmp_path / "db.sqlite3"
+    build_database(database).close()
+    service = FieldService(
+        FieldSettings(
+            database_path=database,
+            output_root=tmp_path / "out",
+            recordings_dir=tmp_path / "rec",
+        ),
+        probe_runner=runner,
+    )
+    service.set_position({"latitude": 32.05, "longitude": 34.8})
+    return service
+
+
+def test_a_capture_rechecks_the_device_rather_than_trusting_the_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The state page may be showing a reading minutes old. That is fine for
+    a status pill and not fine for the moment before the SDR is opened."""
+    import dmr_iq_surveyor.web.service as web_service
+
+    monkeypatch.setattr(web_service, "READINESS_MAX_AGE_SECONDS", 0.0)
+    runner = StubProbeRunner(present("SDRplay RSP1A"))
+    service = _capture_service(tmp_path, runner)
+    try:
+        _settled(service.devices)
+        assert runner.calls == 1
+
+        with pytest.raises((RuntimeError, ValueError)):
+            # Fails later, on the site profile a clean checkout does not
+            # carry -- but only after the device has been re-checked.
+            service.start_capture({"duration_seconds": 5})
+        assert runner.calls == 2, "the capture path reused a cached reading"
+    finally:
+        service.close()
+
+
+def test_a_readiness_check_that_cannot_finish_refuses_without_starting_a_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wedged SDR must produce a sentence the operator can act on, not a
+    job that starts and then hangs."""
+    import dmr_iq_surveyor.web.service as web_service
+
+    monkeypatch.setattr(web_service, "READINESS_WAIT_SECONDS", 0.3)
+    runner = StubProbeRunner(gate=threading.Event())
+    service = _capture_service(tmp_path, runner)
+    try:
+        assert runner.entered.wait(10.0)
+        started = time.monotonic()
+        with pytest.raises(RuntimeError) as raised:
+            service.start_capture({"duration_seconds": 5})
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0
+        assert "readiness check did not finish" in str(raised.value)
+        assert service.jobs.list() == [], "a job was created despite the refusal"
+        assert runner.calls == 1, "a second probe was stacked on the stuck one"
+    finally:
+        service.close()
+
+
+def test_a_drive_makes_the_same_fresh_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dmr_iq_surveyor.web.service as web_service
+
+    monkeypatch.setattr(web_service, "READINESS_WAIT_SECONDS", 0.3)
+    runner = StubProbeRunner(gate=threading.Event())
+    service = _capture_service(tmp_path, runner)
+    try:
+        assert runner.entered.wait(10.0)
+        service.push_live_position({"latitude": 32.05, "longitude": 34.8, "accuracy_m": 6.0})
+        with pytest.raises(RuntimeError) as raised:
+            service.start_live({"max_seconds": 30.0})
+        assert "readiness check did not finish" in str(raised.value)
+        assert service.jobs.list() == []
+    finally:
+        service.close()
+
+
+def test_a_full_card_is_still_reported_before_the_device_is_checked(
+    tmp_path: Path,
+) -> None:
+    """Order matters: a full card reported as an SDR fault sends the
+    operator off to diagnose the wrong thing."""
+    runner = StubProbeRunner(present("SDRplay RSP1A"))
+    service = _capture_service(tmp_path, runner)
+    try:
+        _settled(service.devices)
+        before = runner.calls
+        with pytest.raises(RuntimeError) as raised:
+            # More than any test machine has free, so disk_status refuses.
+            service.start_capture({"duration_seconds": 5, "sample_rate_hz": 10_000_000_000.0})
+        message = str(raised.value)
+        assert "SDR" not in message, message
+        assert runner.calls == before, "the device was probed before the card was checked"
+    finally:
+        service.close()

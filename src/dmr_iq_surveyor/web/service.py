@@ -20,7 +20,6 @@ from typing import Any
 
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.core import CaptureSettings, run_capture
-from dmr_iq_surveyor.capture.device import probe_soapysdr
 from dmr_iq_surveyor.capture.probe import (
     DEFAULT_PROBE_TIMEOUT_SECONDS,
     ProbeRunner,
@@ -56,6 +55,7 @@ from dmr_iq_surveyor.survey.profiles import (
     resolve_site_profile,
 )
 from dmr_iq_surveyor.survey.store import delete_survey_run
+from dmr_iq_surveyor.web.devices import STATE_CHECKING as DEVICE_STATE_CHECKING
 from dmr_iq_surveyor.web.devices import DeviceMonitor
 from dmr_iq_surveyor.web.jobs import Job, JobRegistry
 from dmr_iq_surveyor.web.recordings import disk_status, enforce_retention, purge_recordings
@@ -407,6 +407,31 @@ class FieldService:
         payload -- SDR probe included -- and throw all but this away."""
         return site_overview(database_path=self.settings.database_path)
 
+    def require_device_ready(self, *, ignore_held: bool = False) -> None:
+        """A fresh, time-bounded readiness check, or a clear refusal.
+
+        Deliberately not the cached snapshot: this runs immediately before
+        the SDR is opened for real, and a five-minute-old "available" is no
+        evidence that the device is still there. Equally deliberately it is
+        bounded -- a check that cannot finish is reported as one, so the
+        operator gets a sentence they can act on rather than a job that
+        starts and then hangs.
+        """
+        snapshot = self.devices.ensure_fresh(
+            max_age=READINESS_MAX_AGE_SECONDS,
+            wait=READINESS_WAIT_SECONDS,
+            ignore_held=ignore_held,
+        )
+        if snapshot.available and (snapshot.age_seconds or 0.0) <= READINESS_MAX_AGE_SECONDS:
+            return
+        if snapshot.state == DEVICE_STATE_CHECKING or snapshot.available:
+            raise RuntimeError(
+                f"the SDR readiness check did not finish within {READINESS_WAIT_SECONDS:g} s, "
+                "so the recording was not started. The SDRplay API service may be wedged; "
+                "try Rescan SDR."
+            )
+        raise RuntimeError(snapshot.probe_error or "no SDR device available")
+
     def close(self) -> None:
         """Release background workers. Called when the server shuts down."""
         self.devices.close()
@@ -674,13 +699,13 @@ class FieldService:
         if not space.ready:
             raise RuntimeError(space.reason)
 
-        # Probed after the cheap preconditions, so a full card is reported as
+        # Checked after the cheap preconditions, so a full card is reported as
         # a full card rather than being masked by an SDR message, and before
         # the job is accepted, so a missing or busy device is an immediate
-        # answer rather than a job that starts and then fails.
-        probe = probe_soapysdr(self.settings.driver)
-        if not probe.available:
-            raise RuntimeError(probe.probe_error or "no SDR device available")
+        # answer rather than a job that starts and then fails. The check is
+        # forced fresh -- the cached state behind /api/state may be minutes
+        # old -- and bounded, so a wedged device cannot hang this request.
+        self.require_device_ready()
 
         # Profiles are resolved NOW, not inside the job: a typo or a wrong
         # working directory would otherwise surface only after the full
@@ -738,9 +763,7 @@ class FieldService:
         solve: bool,
     ) -> dict[str, Any]:
         job.emit("device", "opening the SDR", progress=0.01)
-        probe = probe_soapysdr(capture.driver)
-        if not probe.available:
-            raise RuntimeError(probe.probe_error or "no SDR device available")
+        self.require_device_ready(ignore_held=True)
 
         recordings = Path(self.settings.recordings_dir).expanduser().resolve()
         started = time.time()
@@ -1232,9 +1255,7 @@ class FieldService:
             )
 
         live = self.live_settings(payload)
-        probe = probe_soapysdr(self.settings.driver)
-        if not probe.available:
-            raise RuntimeError(probe.probe_error or "no SDR device available")
+        self.require_device_ready()
         try:
             band = resolve_band_profile(live.band, base_dir=self.settings.profile_base_dir)
             site_profile = resolve_site_profile(
