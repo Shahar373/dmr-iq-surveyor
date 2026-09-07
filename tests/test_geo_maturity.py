@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from fixtures.device_probe import StubProbeRunner
 from fixtures.geo_scenario import Transmitter, build_database, seed_run
 from typer.testing import CliRunner
 
@@ -111,7 +112,9 @@ def test_field_app_state_reports_geolocation_maturity(tmp_path: Path) -> None:
         database_path=tmp_path / "inventory.sqlite3",
         recordings_dir=tmp_path / "recordings",
     )
-    service = FieldService(settings)
+    # A stub runner, so a test about the geolocation block never starts
+    # an SDR probe process -- nor finds a real device on a field unit.
+    service = FieldService(settings, probe_runner=StubProbeRunner())
     state = service.state()
     assert state["geolocation"]["maturity"] == GEOLOCATION_MATURITY
     assert state["geolocation"]["validation_note"] == VALIDATION_NOTE

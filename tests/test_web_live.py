@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from fixtures.device_probe import StubProbeRunner, present
 from fixtures.geo_scenario import Transmitter, build_database, seed_run
 from fixtures.live_profiles import level_at, tone_chunk, write_profiles
 
@@ -133,7 +134,12 @@ def _service(tmp_path: Path, **overrides) -> FieldService:
         "solve_max_cells": 1_200,
     }
     base.update(overrides)
-    return FieldService(FieldSettings(**base))
+    # Injected rather than patched: the monitor starts its first probe
+    # inside FieldService.__init__, before any monkeypatch in the test
+    # body could take effect.
+    return FieldService(
+        FieldSettings(**base), probe_runner=StubProbeRunner(present("fake SDR"))
+    )
 
 
 def _drive(

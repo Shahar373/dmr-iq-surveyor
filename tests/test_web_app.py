@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from fixtures.device_probe import StubProbeRunner
 from fixtures.geo_scenario import Transmitter, build_database, seed_run
 
 from dmr_iq_surveyor.capture.device import DeviceProbe
@@ -88,10 +89,16 @@ def _no_real_sdr(monkeypatch: pytest.MonkeyPatch) -> None:
     on a laptop): the same deterministic DeviceProbe is substituted for
     every call, regardless of what is really installed or connected.
 
-    Patches the name as bound into web.service (`from ... import
-    probe_soapysdr`), which is what every call site in FieldService
-    actually calls; capture.device.probe_soapysdr itself is untouched.
+    Two seams, because FieldService reaches the hardware two ways:
+    `default_probe_runner`, which is what the device monitor behind
+    /api/state is built from, and the `probe_soapysdr` name as bound into
+    web.service, which the capture paths still call directly. Both are
+    patched where web.service binds them; capture.device is untouched.
     """
+    monkeypatch.setattr(
+        "dmr_iq_surveyor.web.service.default_probe_runner",
+        StubProbeRunner,
+    )
     monkeypatch.setattr(
         "dmr_iq_surveyor.web.service.probe_soapysdr",
         lambda driver: DeviceProbe(

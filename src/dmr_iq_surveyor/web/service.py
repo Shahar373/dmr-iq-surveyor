@@ -21,6 +21,11 @@ from typing import Any
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.core import CaptureSettings, run_capture
 from dmr_iq_surveyor.capture.device import probe_soapysdr
+from dmr_iq_surveyor.capture.probe import (
+    DEFAULT_PROBE_TIMEOUT_SECONDS,
+    ProbeRunner,
+    SubprocessProbeRunner,
+)
 from dmr_iq_surveyor.geo.export import to_gpx, to_kml
 from dmr_iq_surveyor.geo.measurements import MeasurementSettings
 from dmr_iq_surveyor.geo.model import SolveSettings
@@ -51,6 +56,7 @@ from dmr_iq_surveyor.survey.profiles import (
     resolve_site_profile,
 )
 from dmr_iq_surveyor.survey.store import delete_survey_run
+from dmr_iq_surveyor.web.devices import DeviceMonitor
 from dmr_iq_surveyor.web.jobs import Job, JobRegistry
 from dmr_iq_surveyor.web.recordings import disk_status, enforce_retention, purge_recordings
 
@@ -262,12 +268,50 @@ class FieldSettings:
         return payload
 
 
+# Kinds of job that hold the SDR open. While one runs, the device must not be
+# probed at all: enumerating a device a capture already has reports it as
+# missing, which is what once sent an operator off to diagnose working
+# hardware (see the note in start_capture below).
+DEVICE_HOLDING_JOB_KINDS = frozenset({"capture", "live"})
+
+# How fresh a device reading has to be before opening the device for real,
+# and how long a caller will wait for one. The wait is deliberately longer
+# than the probe's own timeout, so a probe that times out reports a timeout
+# rather than being cut off and reported as "no answer".
+READINESS_MAX_AGE_SECONDS = 5.0
+READINESS_WAIT_SECONDS = DEFAULT_PROBE_TIMEOUT_SECONDS + 2.0
+
+
+def default_probe_runner() -> ProbeRunner:
+    """The probe runner a FieldService builds when it is not given one.
+
+    A module-level factory rather than a hardcoded constructor call so that
+    tests have one documented place to substitute a stub -- the whole point
+    being that neither FieldService nor DeviceMonitor ever inspects the
+    runner it was handed.
+    """
+    return SubprocessProbeRunner()
+
+
 class FieldService:
     """Stateful glue between HTTP requests and the analysis pipeline."""
 
-    def __init__(self, settings: FieldSettings) -> None:
+    def __init__(
+        self,
+        settings: FieldSettings,
+        *,
+        probe_runner: ProbeRunner | None = None,
+    ) -> None:
         self.settings = settings
         self.jobs = JobRegistry()
+        # Device state is cached and probed out of process: reading it must
+        # never touch the SDR, because a wedged SDRplay service would then
+        # hang the request thread with no timeout and no log line.
+        self.devices = DeviceMonitor(
+            probe_runner if probe_runner is not None else default_probe_runner(),
+            driver=settings.driver,
+            device_held=self._device_is_held,
+        )
         self._position_path = Path(settings.output_root).expanduser().resolve() / "position.json"
         # Live-drive state. Held in memory only: a fix is worth nothing a
         # minute later, and the measurements it produced are already in the
@@ -340,8 +384,32 @@ class FieldService:
 
     # -- read models -------------------------------------------------------
 
+    def _device_is_held(self) -> bool:
+        active = self.jobs.active_job()
+        return active is not None and active.kind in DEVICE_HOLDING_JOB_KINDS
+
     def device_probe(self) -> dict[str, Any]:
-        return probe_soapysdr(self.settings.driver).to_dict()
+        """The last completed probe, plus its age. Never probes inline."""
+        return self.devices.poll().to_dict()
+
+    def rescan_device(self) -> dict[str, Any]:
+        """Ask for a probe now, and answer immediately either way."""
+        declined = self.devices.refresh_declined_reason()
+        started = self.devices.request_refresh(force=True) if declined is None else False
+        return {
+            "rescan_started": started,
+            "rescan_declined_reason": None if started else declined,
+            "device": self.devices.snapshot().to_dict(),
+        }
+
+    def sites_overview(self) -> list[dict[str, Any]]:
+        """Just the sites. `/api/sites` used to build the whole state
+        payload -- SDR probe included -- and throw all but this away."""
+        return site_overview(database_path=self.settings.database_path)
+
+    def close(self) -> None:
+        """Release background workers. Called when the server shuts down."""
+        self.devices.close()
 
     def survey_runs(self, limit: int = 25) -> list[dict[str, Any]]:
         connection = connect_geo_database(Path(self.settings.database_path))
@@ -391,7 +459,7 @@ class FieldService:
             "position_age_seconds": self.position_age_seconds(),
             "device": self.device_probe(),
             "disk": self.disk(),
-            "sites": site_overview(database_path=self.settings.database_path),
+            "sites": self.sites_overview(),
             "runs": self.survey_runs(),
             "stops": self.stops(),
             "plan": self.plan(),

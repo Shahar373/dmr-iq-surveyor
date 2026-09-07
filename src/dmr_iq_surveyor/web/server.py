@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from dmr_iq_surveyor import __version__
+from dmr_iq_surveyor.capture.probe import ProbeRunner
 from dmr_iq_surveyor.web.jobs import Job
 from dmr_iq_surveyor.web.service import FieldService, FieldSettings, PositionStale
 from dmr_iq_surveyor.web.tls import HANDSHAKE_TIMEOUT_SECONDS, Certificate, build_context
@@ -162,7 +163,7 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/api/position":
                 self._send_json(self.service.get_position())
             elif path == "/api/sites":
-                self._send_json({"sites": self.service.state()["sites"]})
+                self._send_json({"sites": self.service.sites_overview()})
             elif path == "/api/geojson":
                 self._send_json(self.service.geojson())
             elif path == "/api/disk":
@@ -378,6 +379,19 @@ class FieldServer(ThreadingHTTPServer):
     def scheme(self) -> str:
         return "https" if self._tls_context is not None else "http"
 
+    def server_close(self) -> None:
+        """Close the listening socket, and the service's workers with it.
+
+        Without this the device monitor's probe thread and any child
+        process it started would outlive the server -- harmless in a
+        one-shot CLI run, a leak in a test suite that starts a server per
+        test, and a stuck child that nobody owns in the field.
+        """
+        try:
+            super().server_close()
+        finally:
+            self.service.close()
+
     def get_request(self) -> tuple[Any, Any]:
         """Accept a connection, wrapping it in TLS if a certificate is set.
 
@@ -409,11 +423,15 @@ def create_server(
     port: int = 8765,
     verbose: bool = False,
     certificate: Certificate | None = None,
+    probe_runner: ProbeRunner | None = None,
 ) -> FieldServer:
     Path(settings.output_root).expanduser().resolve().mkdir(parents=True, exist_ok=True)
     Path(settings.recordings_dir).expanduser().resolve().mkdir(parents=True, exist_ok=True)
     return FieldServer(
-        (host, port), FieldService(settings), verbose=verbose, certificate=certificate
+        (host, port),
+        FieldService(settings, probe_runner=probe_runner),
+        verbose=verbose,
+        certificate=certificate,
     )
 
 
@@ -424,9 +442,15 @@ def serve_forever(
     port: int = 8765,
     verbose: bool = False,
     certificate: Certificate | None = None,
+    probe_runner: ProbeRunner | None = None,
 ) -> None:
     server = create_server(
-        settings, host=host, port=port, verbose=verbose, certificate=certificate
+        settings,
+        host=host,
+        port=port,
+        verbose=verbose,
+        certificate=certificate,
+        probe_runner=probe_runner,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
