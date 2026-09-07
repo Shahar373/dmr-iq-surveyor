@@ -32,6 +32,8 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from dmr_iq_surveyor.capture._soapy_probe import probe_payload
+
 # A stalled real device (dropped USB connection, blocked driver) must not
 # hang run_capture() forever on repeated empty/timeout reads.
 _MAX_CONSECUTIVE_EMPTY_READS = 50
@@ -106,6 +108,10 @@ class DeviceProbe:
     resolved_label: str | None
     probe_error: str | None
     devices_found: list[dict[str, str]] = field(default_factory=list)
+    # One of PROBE_NOT_SUPPORTED / PROBE_DISCONNECTED / PROBE_FAILED, or None
+    # when a device was found. Defaulted, so callers that built a DeviceProbe
+    # before this field existed -- including test doubles -- keep working.
+    reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -113,55 +119,17 @@ class DeviceProbe:
 
 def probe_soapysdr(driver: str = "sdrplay") -> DeviceProbe:
     """Report whether a SoapySDR device matching `driver` is available,
-    without raising. Never imports SoapySDR anywhere except inside this
-    function, so callers (and the whole test suite) work with SoapySDR
-    absent."""
-    try:
-        import SoapySDR
-    except ImportError as exc:
-        return DeviceProbe(
-            available=False,
-            requested_driver=driver,
-            resolved_label=None,
-            probe_error=(
-                "SoapySDR Python bindings are not importable "
-                f"({type(exc).__name__}: {exc}). Run `bash scripts/pi_soapysdr_setup.sh`, "
-                "which installs them and links them into this project's virtualenv "
-                "(Debian installs them outside it, so a venv cannot see them by default)."
-            ),
-            devices_found=[],
-        )
-    try:
-        results = SoapySDR.Device.enumerate({"driver": driver})
-        devices = [dict(result) for result in results]
-    except Exception as exc:  # noqa: BLE001 -- probing must never crash the CLI
-        return DeviceProbe(
-            available=False,
-            requested_driver=driver,
-            resolved_label=None,
-            probe_error=f"SoapySDR device enumeration failed: {type(exc).__name__}: {exc}",
-            devices_found=[],
-        )
-    if not devices:
-        return DeviceProbe(
-            available=False,
-            requested_driver=driver,
-            resolved_label=None,
-            probe_error=(
-                f"No SoapySDR device matched driver={driver!r}. Confirm the RSP1B is "
-                "connected (`lsusb`) and that `SoapySDRUtil --find` lists it. If a "
-                "previous capture crashed, the device can stay marked in use until the "
-                "API service is restarted: `sudo systemctl restart sdrplay`."
-            ),
-            devices_found=[],
-        )
-    return DeviceProbe(
-        available=True,
-        requested_driver=driver,
-        resolved_label=devices[0].get("label", driver),
-        probe_error=None,
-        devices_found=devices,
-    )
+    without raising.
+
+    The probe itself lives in `capture/_soapy_probe.py`, a leaf module with
+    no heavy imports, so the field app can run exactly this logic in a child
+    process it is able to kill. SoapySDR is still imported lazily, inside
+    the probe, so callers (and the whole test suite) work with it absent.
+
+    This function's signature, return type and messages are unchanged; only
+    where the body lives has moved.
+    """
+    return DeviceProbe(**probe_payload(driver))
 
 
 class IqDevice(Protocol):
