@@ -407,7 +407,7 @@ class FieldService:
         payload -- SDR probe included -- and throw all but this away."""
         return site_overview(database_path=self.settings.database_path)
 
-    def require_device_ready(self, *, ignore_held: bool = False) -> None:
+    def require_device_ready(self) -> None:
         """A fresh, time-bounded readiness check, or a clear refusal.
 
         Deliberately not the cached snapshot: this runs immediately before
@@ -416,11 +416,16 @@ class FieldService:
         bounded -- a check that cannot finish is reported as one, so the
         operator gets a sentence they can act on rather than a job that
         starts and then hangs.
+
+        Called only from `start_capture`/`start_live`, before the job is
+        submitted -- never from inside the job itself. `JobRegistry.submit`
+        claims the job atomically before that job's own thread starts
+        (`jobs.py`), so by the time this runs the device can never already be
+        held by the very job that is about to ask for it.
         """
         snapshot = self.devices.ensure_fresh(
             max_age=READINESS_MAX_AGE_SECONDS,
             wait=READINESS_WAIT_SECONDS,
-            ignore_held=ignore_held,
         )
         if snapshot.available and (snapshot.age_seconds or 0.0) <= READINESS_MAX_AGE_SECONDS:
             return
@@ -762,8 +767,13 @@ class FieldService:
         position: dict[str, Any],
         solve: bool,
     ) -> dict[str, Any]:
+        # start_capture() already ran a fresh, bounded readiness check
+        # immediately before submitting this job (JobRegistry claims the job
+        # atomically before this thread starts, so nothing else could have
+        # taken the device in between). Re-checking here would only ever be
+        # asking whether *this job itself* still holds what it is about to
+        # open -- not a real second opinion on the hardware.
         job.emit("device", "opening the SDR", progress=0.01)
-        self.require_device_ready(ignore_held=True)
 
         recordings = Path(self.settings.recordings_dir).expanduser().resolve()
         started = time.time()

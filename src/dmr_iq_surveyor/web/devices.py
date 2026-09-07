@@ -219,25 +219,18 @@ class DeviceMonitor:
             )
         return None
 
-    def ensure_fresh(
-        self,
-        *,
-        max_age: float,
-        wait: float,
-        ignore_held: bool = False,
-    ) -> DeviceSnapshot:
+    def ensure_fresh(self, *, max_age: float, wait: float) -> DeviceSnapshot:
         """A recent answer, waiting no longer than `wait` seconds for one.
 
-        Used by the paths that are about to open the device for real. It
-        never waits indefinitely: if the probe has not reported by the
-        deadline, the caller gets the stale snapshot back and can say so.
-
-        `ignore_held` is for the one caller that *is* the holder -- the
-        capture job checking the device it is about to open. Without it,
-        that job would ask whether the SDR is free and be told, correctly
-        and uselessly, that it is holding it.
+        Used by the one caller that is about to open the device for real
+        (`FieldService.require_device_ready`, called before a capture or a
+        drive is submitted as a job -- never from inside the job itself, so
+        this never needs to ask "is the device free" while its own caller is
+        the one holding it). It never waits indefinitely: if the probe has
+        not reported by the deadline, the caller gets the stale snapshot
+        back and can say so.
         """
-        held = False if ignore_held else self._device_held()
+        held = self._device_held()
         with self._condition:
             result = self._result
             if (

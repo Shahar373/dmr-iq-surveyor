@@ -11,6 +11,7 @@ Nothing here opens an SDR or starts a probe process.
 
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 import time
@@ -22,6 +23,7 @@ from pathlib import Path
 import pytest
 from fixtures.device_probe import StubProbeRunner, mocked_absent, present
 from fixtures.geo_scenario import Transmitter, build_database, seed_run
+from fixtures.live_profiles import write_profiles
 
 from dmr_iq_surveyor.capture._soapy_probe import PROBE_DISCONNECTED, PROBE_NOT_SUPPORTED
 from dmr_iq_surveyor.capture.probe import (
@@ -40,6 +42,7 @@ from dmr_iq_surveyor.web.devices import (
     STATE_CHECKING,
     DeviceMonitor,
 )
+from dmr_iq_surveyor.web.jobs import STATUS_SUCCEEDED
 from dmr_iq_surveyor.web.server import create_server
 from dmr_iq_surveyor.web.service import FieldSettings
 
@@ -665,3 +668,129 @@ def test_a_full_card_is_still_reported_before_the_device_is_checked(
         assert runner.calls == before, "the device was probed before the card was checked"
     finally:
         service.close()
+
+
+
+# -- the redundant in-job probe is gone (fix(web): remove the redundant
+#    in-job device probe) -------------------------------------------------
+
+
+def _working_capture_service(tmp_path: Path, runner: StubProbeRunner):
+    """A FieldService whose profiles actually resolve, so start_capture()
+    can get all the way to submitting a job -- unlike `_capture_service`
+    above, which deliberately fails at profile resolution."""
+    from dmr_iq_surveyor.web.service import FieldService
+
+    database = tmp_path / "db.sqlite3"
+    build_database(database).close()
+    band, site = write_profiles(tmp_path / "profiles", center_hz=868_000_000.0)
+    service = FieldService(
+        FieldSettings(
+            database_path=database,
+            output_root=tmp_path / "out",
+            recordings_dir=tmp_path / "rec",
+            band=str(band),
+            site_profile=str(site),
+        ),
+        probe_runner=runner,
+    )
+    service.set_position({"latitude": 32.05, "longitude": 34.8})
+    return service
+
+
+def _fake_run_capture(output_dir, *, settings, filename=None, **_kwargs):
+    """Stands in for capture.core.run_capture: no device, no real file, an
+    instantly "complete" manifest with the shape _capture_and_analyse reads."""
+    return {
+        "wav_path": Path(output_dir) / (filename or "fake.wav"),
+        "timed_out": False,
+        "overflow_count": 0,
+        "actual_duration_seconds": settings.duration_seconds,
+        "time_coverage": 1.0,
+        "gap_seconds": 0.0,
+        "complete": True,
+    }
+
+
+def _fake_run_survey(*_args, **_kwargs):
+    return {"observation_count": 0, "coverage_status": "not_covered", "drive_view": None}
+
+
+def _fake_materialise_measurements(*_args, **_kwargs):
+    return {"summary": {"detections": 0, "non_detections": 0, "not_covered": 0}}
+
+
+def _wait_for_terminal(job, timeout: float = 10.0):
+    deadline = time.monotonic() + timeout
+    while not job.is_terminal() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert job.is_terminal(), f"the job never reached a terminal state (stuck at {job.stage!r})"
+    return job
+
+
+def test_a_successful_capture_probes_the_device_once_and_the_job_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The behavioural proof that the in-job probe is gone.
+
+    Counts calls to require_device_ready() itself, not just probe
+    subprocesses: under the default (non-zero) freshness window, a
+    reintroduced in-job check would almost always reuse the same cached
+    reading as the pre-submit one and never show up as a second probe --
+    which is exactly why the original ignore_held=True call went untested
+    for as long as it did (see the commit message). Counting the method
+    call directly is what actually catches it coming back.
+
+    The capture/survey/measurement pipeline is faked out (run_capture,
+    run_survey, materialise_measurements) so the job can reach a real
+    terminal state without any SDR or disk I/O.
+    """
+    import dmr_iq_surveyor.web.service as web_service
+    from dmr_iq_surveyor.web.service import FieldService
+
+    monkeypatch.setattr(web_service, "run_capture", _fake_run_capture)
+    monkeypatch.setattr(web_service, "run_survey", _fake_run_survey)
+    monkeypatch.setattr(web_service, "materialise_measurements", _fake_materialise_measurements)
+
+    readiness_calls: list[None] = []
+    original_require_ready = FieldService.require_device_ready
+
+    def _counting_require_ready(self: FieldService) -> None:
+        readiness_calls.append(None)
+        original_require_ready(self)
+
+    monkeypatch.setattr(FieldService, "require_device_ready", _counting_require_ready)
+
+    runner = StubProbeRunner(present("SDRplay RSP1A 230405A498"))
+    service = _working_capture_service(tmp_path, runner)
+    try:
+        _settled(service.devices)
+        assert runner.calls == 1, "the initial background probe did not land"
+
+        job = service.start_capture({"duration_seconds": 1.0, "solve": False})
+        assert len(readiness_calls) == 1, (
+            "start_capture() must call require_device_ready() exactly once"
+        )
+        assert runner.calls == 1, "a fresh reading was available; this should not have re-probed"
+
+        _wait_for_terminal(job)
+        assert job.status == STATUS_SUCCEEDED, job.error
+
+        assert len(readiness_calls) == 1, (
+            "require_device_ready() was called again while the job was executing -- "
+            "the in-job check is back"
+        )
+        assert runner.calls == 1, "a probe ran while the job was executing"
+    finally:
+        service.close()
+
+
+def test_the_ignore_held_parameter_no_longer_exists() -> None:
+    """Supplementary only: the behavioural test above is what actually
+    proves the second probe is gone. This just pins that the bypass it used
+    -- a boolean unrelated to which job was asking -- has no seam left to
+    reintroduce it through."""
+    from dmr_iq_surveyor.web.service import FieldService
+
+    assert "ignore_held" not in inspect.signature(DeviceMonitor.ensure_fresh).parameters
+    assert "ignore_held" not in inspect.signature(FieldService.require_device_ready).parameters
