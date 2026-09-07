@@ -26,6 +26,7 @@ from dmr_iq_surveyor.capture.probe import (
     REASON_BAD_OUTPUT,
     REASON_CHILD_ERROR,
     REASON_ORPHANED,
+    REASON_RUNNER_CLOSED,
     REASON_SPAWN_FAILED,
     REASON_TIMED_OUT,
     REASON_UNCLASSIFIED,
@@ -288,3 +289,73 @@ def test_closing_the_runner_during_a_probe_kills_the_child(tmp_path: Path) -> No
     assert not worker.is_alive(), "run() did not return after the runner was closed"
     assert child.poll() is not None, "the child process outlived the runner"
     assert outcomes, "run() returned nothing"
+
+
+
+class _BarrierPopen:
+    """A fake, ordinarily killable child -- used to prove close() kills a
+    process spawned mid-close(), not to model an unkillable one (see
+    test_a_child_that_cannot_be_reaped_opens_a_breaker_and_closes_it_again
+    for that)."""
+
+    def __init__(self) -> None:
+        self.stdout = None
+        self.stderr = None
+        self.stdin = None
+        self.returncode: int | None = None
+        self.killed = False
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0.0)
+        return "", ""
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+def test_close_during_spawn_kills_the_new_child_rather_than_orphaning_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Popen() is not instantaneous, and nothing holds the runner's lock
+    across it. If close() lands in that exact window -- after run() already
+    passed its own closed-check, before the spawned process is registered
+    into self._current -- close() sees nothing to kill. A barrier around
+    the fake Popen() forces that window deterministically, every run,
+    instead of hoping timing lines up."""
+    spawn_entered = threading.Event()
+    release_spawn = threading.Event()
+    spawned = _BarrierPopen()
+
+    def _slow_popen(*_args: object, **_kwargs: object) -> _BarrierPopen:
+        spawn_entered.set()
+        assert release_spawn.wait(5.0), "the test never released the spawn barrier"
+        return spawned
+
+    monkeypatch.setattr(probe_module.subprocess, "Popen", _slow_popen)
+    runner = SubprocessProbeRunner()
+
+    outcomes: list[object] = []
+    worker = threading.Thread(
+        target=lambda: outcomes.append(runner.run("sdrplay", timeout_seconds=5.0)),
+        daemon=True,
+    )
+    worker.start()
+
+    assert spawn_entered.wait(5.0), "Popen() was never called"
+    # Deterministically inside the race window now: Popen() has been
+    # called and has not yet returned to run().
+    runner.close()
+    release_spawn.set()
+    worker.join(timeout=5.0)
+
+    assert not worker.is_alive(), "run() did not return after close()"
+    assert spawned.killed, "a child spawned during close() was left unowned"
+    assert outcomes, "run() returned nothing"
+    outcome = outcomes[0]
+    assert outcome.state == STATE_FAILED
+    assert outcome.reason == REASON_RUNNER_CLOSED

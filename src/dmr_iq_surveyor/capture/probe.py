@@ -56,6 +56,10 @@ REASON_UNCLASSIFIED = "probe_unclassified"
 REASON_TIMED_OUT = "probe_timed_out"
 REASON_ORPHANED = "probe_orphaned"
 REASON_RUNNER_CLOSED = "probe_runner_closed"
+# The runner's own run() raised instead of returning a ProbeOutcome. Only
+# used by DeviceMonitor's defensive wrapper around an arbitrary ProbeRunner
+# (web/devices.py) -- SubprocessProbeRunner itself never raises out of run().
+REASON_RUNNER_RAISED = "probe_runner_raised"
 
 # Generous next to a healthy probe (a child that imports only the leaf
 # module reaches SoapySDR in about a tenth of a second, and a working
@@ -219,7 +223,22 @@ class SubprocessProbeRunner:
             )
 
         with self._lock:
-            self._current = process
+            # close() may have run while Popen() itself was still in
+            # flight -- spawning is not instantaneous, and nothing held
+            # this lock across it. If it did, close() looked in
+            # `self._current` and found nothing to kill, because this
+            # process was not registered there yet. From here on, this
+            # process is this call's responsibility alone: it must never
+            # be registered as "current" once shutdown is already
+            # declared, or nothing will know to kill it.
+            if self._closed:
+                raced_with_close = True
+            else:
+                self._current = process
+                raced_with_close = False
+        if raced_with_close:
+            return self._kill_after_close(process, started)
+
         try:
             stdout, stderr = process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
@@ -298,6 +317,38 @@ class SubprocessProbeRunner:
             if self._orphan is orphan:
                 self._orphan = None
         return None
+
+    def _kill_after_close(
+        self, process: subprocess.Popen[str], started: float
+    ) -> ProbeOutcome:
+        """A child spawned in the narrow window between run()'s own
+        closed-check and close() actually running.
+
+        close() already looked in `self._current` for something to kill and
+        found nothing there -- this process was never registered. It is
+        this call's job alone to make sure it is not left running with
+        nobody responsible for it, the same way `close()` handles an
+        orphan: kill, try to reap, and if that fails, hand it to
+        `self._orphan` so the breaker (and a later `close()`, if this
+        method's own reap attempt fails) still finds it.
+        """
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.communicate(timeout=_REAP_TIMEOUT_SECONDS)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            with self._lock:
+                self._orphan = process
+        else:
+            _release(process)
+        return ProbeOutcome(
+            state=STATE_FAILED,
+            reason=REASON_RUNNER_CLOSED,
+            detail="the field app is shutting down, so no SDR probe was started",
+            duration_seconds=time.monotonic() - started,
+        )
 
     def _kill(
         self,
@@ -398,6 +449,7 @@ __all__ = [
     "REASON_CHILD_ERROR",
     "REASON_ORPHANED",
     "REASON_RUNNER_CLOSED",
+    "REASON_RUNNER_RAISED",
     "REASON_SPAWN_FAILED",
     "REASON_TIMED_OUT",
     "REASON_UNCLASSIFIED",

@@ -75,10 +75,11 @@ def probe_payload(driver: str = "sdrplay") -> dict[str, Any]:
             "requested_driver": driver,
             "resolved_label": None,
             "probe_error": (
-                f"No SoapySDR device matched driver={driver!r}. Confirm the RSP1B is "
-                "connected (`lsusb`) and that `SoapySDRUtil --find` lists it. If a "
-                "previous capture crashed, the device can stay marked in use until the "
-                "API service is restarted: `sudo systemctl restart sdrplay`."
+                f"No SoapySDR device matched driver={driver!r}. Confirm the SDRplay "
+                "device (RSP1A/RSP1B) is connected (`lsusb`) and that `SoapySDRUtil "
+                "--find` lists it. If a previous capture crashed, the device can stay "
+                "marked in use until the API service is restarted: "
+                "`sudo systemctl restart sdrplay`."
             ),
             "devices_found": [],
             "reason": PROBE_DISCONNECTED,

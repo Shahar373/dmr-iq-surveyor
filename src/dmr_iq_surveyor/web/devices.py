@@ -44,8 +44,10 @@ from typing import Any
 
 from dmr_iq_surveyor.capture.probe import (
     DEFAULT_PROBE_TIMEOUT_SECONDS,
+    REASON_RUNNER_RAISED,
     STATE_AVAILABLE,
     STATE_DISCONNECTED,
+    STATE_FAILED,
     STATE_NOT_SUPPORTED,
     STATE_TIMED_OUT,
     ProbeOutcome,
@@ -113,6 +115,12 @@ class DeviceSnapshot:
     reason: str | None
     probe_seconds: float | None
     last_known_label: str | None
+    # True whenever a probe is currently in flight, whatever state is
+    # reported alongside it. The state and every other field still describe
+    # the last COMPLETED probe -- refreshing never blanks them out to
+    # "checking" -- so a phone mid-Rescan keeps showing what it already knew
+    # while a fresher answer is on its way.
+    refreshing: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -127,6 +135,7 @@ class DeviceSnapshot:
             "reason": self.reason,
             "probe_seconds": self.probe_seconds,
             "last_known_label": self.last_known_label,
+            "refreshing": self.refreshing,
         }
 
 
@@ -196,27 +205,41 @@ class DeviceMonitor:
         """Ask for a probe now. Returns whether one was started.
 
         `force` is what "Rescan SDR" uses: it ignores the age window. It
-        does not, and must not, ignore a probe already in flight or a child
-        the runner could not kill -- that is how a second stuck process
-        would get made.
+        does not, and must not, ignore the device being held by a running
+        capture or drive -- probing a device something else already has is
+        the exact mistake this whole module exists to avoid. It also does
+        not need to know anything about *why* an earlier attempt might
+        still be unfinished: whatever the runner itself refuses to do (an
+        unreaped child, for `SubprocessProbeRunner`) is decided safely the
+        moment `run()` is actually called, on its own terms, and comes back
+        as an ordinary `ProbeOutcome` like any other result.
         """
         if not force:
             return self.refresh_if_due()
+        if self._device_held():
+            return False
         with self._condition:
             return self._start_locked()
 
     def refresh_declined_reason(self) -> str | None:
-        """Why `request_refresh(force=True)` would decline, or None."""
+        """Why `request_refresh(force=True)` would decline, or None.
+
+        Only reasons this monitor can see for itself: the device is held,
+        the monitor is shutting down, or a probe thread is already running.
+        Whether the *runner* would refuse to start a real child (an
+        unreaped orphan, for `SubprocessProbeRunner`) is not this monitor's
+        business to know about or predict -- request_refresh() is free to
+        start a thread that calls the runner, and the runner's own answer
+        (timed_out / probe_orphaned, same as any other outcome) is what
+        actually reports that back, through the ordinary snapshot.
+        """
+        if self._device_held():
+            return "a recording is running and holds the SDR, so it is not being re-checked"
         with self._condition:
             if self._closed:
                 return "the field app is shutting down"
             if self._thread is not None and self._thread.is_alive():
                 return "an SDR check is already running"
-        if getattr(self._runner, "orphaned", False):
-            return (
-                "an earlier SDR check is still stuck and could not be stopped, so a new one "
-                "would risk a second stuck process"
-            )
         return None
 
     def ensure_fresh(self, *, max_age: float, wait: float) -> DeviceSnapshot:
@@ -229,16 +252,30 @@ class DeviceMonitor:
         the one holding it). It never waits indefinitely: if the probe has
         not reported by the deadline, the caller gets the stale snapshot
         back and can say so.
+
+        Two things make a cached answer unfit to hand back as-is: the
+        device being held (nothing here describes it right now -- see
+        `_snapshot_locked`'s "busy" branch, and no probe is started either,
+        for the same reason `request_refresh` refuses one), and a probe
+        already being in flight, whether started by a background refresh or
+        a concurrent Rescan. Answering from a cache that is stale relative
+        to a check already under way would be answering with the wrong
+        number on purpose, so both cases wait for the generation to move
+        (or the deadline to pass) rather than taking the fast path.
         """
-        held = self._device_held()
+        if self._device_held():
+            with self._condition:
+                return self._snapshot_locked(held=True)
+
         with self._condition:
             result = self._result
+            active = self._thread is not None and self._thread.is_alive()
             if (
-                not held
+                not active
                 and result is not None
                 and self._clock() - result.at_monotonic <= max_age
             ):
-                return self._snapshot_locked(held=held)
+                return self._snapshot_locked(held=False)
             generation = self._generation
             self._start_locked()
             deadline = self._clock() + wait
@@ -275,7 +312,21 @@ class DeviceMonitor:
         return True
 
     def _probe(self) -> None:
-        outcome = self._runner.run(self._driver, timeout_seconds=self._timeout_seconds)
+        try:
+            outcome = self._runner.run(self._driver, timeout_seconds=self._timeout_seconds)
+        except Exception as exc:  # noqa: BLE001 -- a broken runner must not wedge the monitor
+            # The monitor's contract is that every probe attempt ends in a
+            # recorded, waiter-waking result. Without this, a runner bug
+            # would let this thread die here: self._result never updates,
+            # self._generation never advances, and every reader -- this one
+            # included, on the very next poll -- is left on "checking" (or
+            # whatever the last answer was) forever, with nothing left to
+            # notice or retry.
+            outcome = ProbeOutcome(
+                state=STATE_FAILED,
+                reason=REASON_RUNNER_RAISED,
+                detail=f"the SDR probe runner raised {type(exc).__name__}: {exc}",
+            )
         now = self._clock()
         wall = datetime.now(UTC).isoformat()
         with self._condition:
@@ -297,8 +348,32 @@ class DeviceMonitor:
             self._condition.notify_all()
 
     def _snapshot_locked(self, *, held: bool) -> DeviceSnapshot:
+        # Caller holds self._condition, so this is a consistent read: the
+        # thread cannot go from alive to not (or vice versa) mid-computation.
+        refreshing = self._thread is not None and self._thread.is_alive()
         result = self._result
         if result is None:
+            if held:
+                # Held from before this monitor ever completed a probe --
+                # reachable only in a device_held() that is true from
+                # construction, since a real FieldService cannot submit a
+                # job before its own DeviceMonitor exists. "checking" would
+                # be actively misleading here: none is coming while the
+                # device stays held.
+                return DeviceSnapshot(
+                    state=STATE_BUSY,
+                    available=False,
+                    probe_error=_BUSY_DETAIL,
+                    resolved_label=None,
+                    checked_at=None,
+                    age_seconds=None,
+                    stale=True,
+                    devices_found=[],
+                    reason=None,
+                    probe_seconds=None,
+                    last_known_label=self._last_label,
+                    refreshing=refreshing,
+                )
             return DeviceSnapshot(
                 state=STATE_CHECKING,
                 available=False,
@@ -311,6 +386,7 @@ class DeviceMonitor:
                 reason=None,
                 probe_seconds=None,
                 last_known_label=self._last_label,
+                refreshing=refreshing,
             )
 
         age = max(0.0, self._clock() - result.at_monotonic)
@@ -333,6 +409,7 @@ class DeviceMonitor:
                 reason=None,
                 probe_seconds=result.outcome.duration_seconds,
                 last_known_label=self._last_label,
+                refreshing=refreshing,
             )
 
         outcome = result.outcome
@@ -348,6 +425,7 @@ class DeviceMonitor:
             reason=outcome.reason,
             probe_seconds=outcome.duration_seconds,
             last_known_label=self._last_label,
+            refreshing=refreshing,
         )
 
 

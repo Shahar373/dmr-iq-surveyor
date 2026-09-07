@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import subprocess
 import threading
 import time
 import urllib.error
@@ -27,6 +28,7 @@ from fixtures.live_profiles import write_profiles
 
 from dmr_iq_surveyor.capture._soapy_probe import PROBE_DISCONNECTED, PROBE_NOT_SUPPORTED
 from dmr_iq_surveyor.capture.probe import (
+    REASON_RUNNER_RAISED,
     REASON_SPAWN_FAILED,
     STATE_AVAILABLE,
     STATE_DISCONNECTED,
@@ -34,6 +36,7 @@ from dmr_iq_surveyor.capture.probe import (
     STATE_NOT_SUPPORTED,
     STATE_TIMED_OUT,
     ProbeOutcome,
+    SubprocessProbeRunner,
 )
 from dmr_iq_surveyor.web.devices import (
     AVAILABLE_TTL_SECONDS,
@@ -61,6 +64,7 @@ CONTRACT_KEYS = {
     "reason",
     "probe_seconds",
     "last_known_label",
+    "refreshing",
 }
 
 
@@ -794,3 +798,330 @@ def test_the_ignore_held_parameter_no_longer_exists() -> None:
 
     assert "ignore_held" not in inspect.signature(DeviceMonitor.ensure_fresh).parameters
     assert "ignore_held" not in inspect.signature(FieldService.require_device_ready).parameters
+
+
+
+# -- requirement 1: force=True must not probe a held device -----------------
+
+
+def test_rescan_during_an_active_capture_is_refused_and_never_touches_the_runner(
+    tmp_path: Path,
+) -> None:
+    """A capture in progress holds the SDR; the button that is supposed to
+    help with a *disconnected* device must not itself go poking at one that
+    is in use."""
+    runner = StubProbeRunner(present("SDRplay RSP1A"))
+    service = _capture_service(tmp_path, runner)
+    try:
+        _settled(service.devices)
+        before = runner.calls
+
+        release = threading.Event()
+        job = service.jobs.submit(
+            kind="capture", label="fake capture", work=lambda job: (release.wait(10.0), {})[1]
+        )
+        try:
+            result = service.rescan_device()
+            assert result["rescan_started"] is False
+            assert result["rescan_declined_reason"]
+            assert result["device"]["state"] == STATE_BUSY
+            assert runner.calls == before, "a probe ran while a job held the device"
+        finally:
+            release.set()
+            _wait_for_terminal(job)
+    finally:
+        service.close()
+
+
+def test_request_refresh_force_true_itself_refuses_a_held_device() -> None:
+    """FieldService.rescan_device() already declines before calling
+    request_refresh() at all (via refresh_declined_reason()) -- this pins
+    that request_refresh(force=True) refuses on its own too, for any other
+    caller that reaches it directly, rather than depending on every caller
+    to check device_held() first."""
+    held = {"value": True}
+    runner = StubProbeRunner(present("SDRplay RSP1A"))
+    monitor = _monitor(runner, device_held=lambda: held["value"])
+    try:
+        assert runner.calls == 0, "the constructor probed a device held from the start"
+        assert monitor.request_refresh(force=True) is False
+        assert runner.calls == 0, "request_refresh(force=True) probed a held device directly"
+
+        held["value"] = False
+        assert monitor.request_refresh(force=True) is True
+        _wait_for_probes(monitor, 1)
+        assert monitor.snapshot().state == STATE_AVAILABLE
+    finally:
+        monitor.close()
+
+
+# -- requirement 2: ensure_fresh() must not probe a held device -------------
+
+
+def test_ensure_fresh_returns_busy_without_probing_when_the_device_is_held() -> None:
+    """Even the monitor's OWN construction-time refresh must respect a
+    device that is held from the very start -- not just a later Rescan."""
+    held = {"value": True}
+    runner = StubProbeRunner(present("SDRplay RSP1A"))
+    monitor = _monitor(runner, device_held=lambda: held["value"])
+    try:
+        assert runner.calls == 0, "the constructor probed a device held from the start"
+
+        snapshot = monitor.ensure_fresh(max_age=5.0, wait=0.2)
+        assert snapshot.state == STATE_BUSY
+        assert snapshot.available is False
+        assert runner.calls == 0, "ensure_fresh probed a held device"
+
+        # The device is freed; a later, ordinary call still works normally,
+        # proving the monitor was never wedged by having been held.
+        held["value"] = False
+        assert monitor.request_refresh(force=True) is True
+        _wait_for_probes(monitor, 1)
+        assert monitor.snapshot().state == STATE_AVAILABLE
+    finally:
+        monitor.close()
+
+
+# -- requirement 3: DeviceMonitor defers entirely to the runner's own -------
+# -- orphan handling; recovery needs no restart -----------------------------
+
+
+class _RevivableStuckPopen:
+    """A child that ignores kill() until revive() is called -- the kernel
+    finally releasing a process stuck in an uninterruptible wait. Local to
+    this file on purpose: it exercises DeviceMonitor's integration with the
+    REAL SubprocessProbeRunner, not a stand-in for either of them."""
+
+    def __init__(self) -> None:
+        self.stdout = self.stderr = self.stdin = None
+        self.returncode: int | None = None
+        self.kills = 0
+
+    def kill(self) -> None:
+        self.kills += 1
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0.0)
+        return "", ""
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def revive(self) -> None:
+        self.returncode = -9
+
+
+def test_an_orphan_that_finally_exits_recovers_on_rescan_without_a_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DeviceMonitor never asks the runner "are you orphaned" -- it just
+    starts a probe via request_refresh(force=True) and trusts whatever the
+    runner's own run() reports. The real SubprocessProbeRunner is used here
+    specifically to prove that integration holds with the getattr("orphaned")
+    check gone from DeviceMonitor."""
+    import dmr_iq_surveyor.capture.probe as probe_module
+
+    stuck = _RevivableStuckPopen()
+    spawned: list[_RevivableStuckPopen] = []
+
+    def _popen(*_args: object, **_kwargs: object) -> _RevivableStuckPopen:
+        spawned.append(stuck)
+        return stuck
+
+    monkeypatch.setattr(probe_module.subprocess, "Popen", _popen)
+    runner = SubprocessProbeRunner()
+    monitor = _monitor(runner, timeout_seconds=0.05)
+    try:
+        _wait_for_probes(monitor, 1)
+        assert monitor.snapshot().state == STATE_TIMED_OUT
+        assert len(spawned) == 1
+
+        # DeviceMonitor does not pre-emptively decline here: no thread is
+        # currently alive, so it has no reason of its own to refuse. It is
+        # the runner's own _orphan_verdict, invoked a moment later inside
+        # request_refresh(), that safely says no to a second child.
+        assert monitor.refresh_declined_reason() is None, (
+            "the monitor declined based on runner-internal orphan state it has no business knowing"
+        )
+
+        # Still stuck: Rescan must not spawn a second child while this one
+        # is unaccounted for.
+        assert monitor.request_refresh(force=True) is True
+        _wait_for_probes(monitor, 2)
+        assert monitor.snapshot().state == STATE_TIMED_OUT
+        assert len(spawned) == 1, "a second child was spawned while the first was still stuck"
+
+        # The kernel finally lets it go -- no restart of anything involved.
+        stuck.revive()
+        assert monitor.request_refresh(force=True) is True
+        _wait_for_probes(monitor, 3)
+        assert len(spawned) == 2, "no fresh child was spawned once the orphan was reaped"
+    finally:
+        monitor.close()
+
+
+# -- requirement 4: "refreshing", and waiting for an in-flight probe --------
+
+
+def test_rescan_reports_refreshing_until_the_new_result_lands() -> None:
+    """A cached "available" reading stays meaningful while a fresher one is
+    in flight -- the phone keeps showing what it last knew, flagged as
+    being re-checked, rather than blanking out to "checking"."""
+    runner = StubProbeRunner(present("SDRplay RSP1A"))
+    monitor = _monitor(runner)
+    try:
+        _settled(monitor)
+        first = monitor.snapshot()
+        assert first.state == STATE_AVAILABLE
+        assert first.refreshing is False
+
+        gate = threading.Event()
+        runner.gate = gate
+        runner.entered = threading.Event()
+        runner.set_outcome(present("SDRplay RSP1A (rechecked)"))
+
+        assert monitor.request_refresh(force=True) is True
+        assert runner.entered.wait(10.0), "the rescan probe never started"
+
+        mid_flight = monitor.snapshot()
+        assert mid_flight.state == STATE_AVAILABLE, "the last known state must be preserved"
+        assert mid_flight.resolved_label == "SDRplay RSP1A", "showed the not-yet-landed reading"
+        assert mid_flight.checked_at == first.checked_at, "checked_at moved before landing"
+        assert mid_flight.refreshing is True
+
+        gate.set()
+        deadline = time.monotonic() + 10.0
+        while monitor.snapshot().checked_at == first.checked_at and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        landed = monitor.snapshot()
+        assert landed.checked_at != first.checked_at
+        assert landed.resolved_label == "SDRplay RSP1A (rechecked)"
+        assert landed.refreshing is False
+    finally:
+        monitor.close()
+
+
+def test_ensure_fresh_waits_for_an_already_active_probe_instead_of_the_stale_cache() -> None:
+    """A caller about to open the device must see whatever the in-flight
+    probe reports, not race ahead with what was cached before it started."""
+    runner = StubProbeRunner(present("SDRplay RSP1A"))
+    monitor = _monitor(runner)
+    try:
+        _settled(monitor)
+        assert monitor.snapshot().state == STATE_AVAILABLE
+
+        gate = threading.Event()
+        runner.gate = gate
+        runner.entered = threading.Event()
+        runner.set_outcome(mocked_absent)
+
+        assert monitor.request_refresh(force=True) is True
+        assert runner.entered.wait(10.0)
+
+        result_holder: list[object] = []
+
+        def _call() -> None:
+            # A generous max_age that WOULD accept the stale "available"
+            # cache if ensure_fresh took the fast path.
+            result_holder.append(monitor.ensure_fresh(max_age=3600.0, wait=10.0))
+
+        caller = threading.Thread(target=_call, daemon=True)
+        caller.start()
+
+        time.sleep(0.05)
+        assert not result_holder, "ensure_fresh answered before the in-flight probe finished"
+
+        gate.set()
+        caller.join(timeout=10.0)
+        assert result_holder, "ensure_fresh never returned"
+        assert result_holder[0].state == STATE_DISCONNECTED, (
+            "ensure_fresh answered from the stale cache instead of waiting"
+        )
+    finally:
+        monitor.close()
+
+
+# -- requirement 6: no Rescan in the readiness-to-submit transition ---------
+
+
+def test_rescan_is_refused_during_the_claim_window_between_readiness_and_submit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Profile resolution sits between require_device_ready() succeeding
+    and JobRegistry.submit() actually claiming the job. A concurrent Rescan
+    must not be able to slip a probe into that gap."""
+    import dmr_iq_surveyor.web.service as web_service
+
+    entered_transition = threading.Event()
+    release_transition = threading.Event()
+    original_resolve_band_profile = web_service.resolve_band_profile
+
+    def _slow_resolve_band_profile(*args: object, **kwargs: object):
+        entered_transition.set()
+        assert release_transition.wait(10.0), "the test never released the transition barrier"
+        return original_resolve_band_profile(*args, **kwargs)
+
+    monkeypatch.setattr(web_service, "resolve_band_profile", _slow_resolve_band_profile)
+    monkeypatch.setattr(web_service, "run_capture", _fake_run_capture)
+    monkeypatch.setattr(web_service, "run_survey", _fake_run_survey)
+    monkeypatch.setattr(web_service, "materialise_measurements", _fake_materialise_measurements)
+
+    runner = StubProbeRunner(present("SDRplay RSP1A"))
+    service = _working_capture_service(tmp_path, runner)
+    try:
+        _settled(service.devices)
+        assert runner.calls == 1
+
+        results: list[object] = []
+        worker = threading.Thread(
+            target=lambda: results.append(
+                service.start_capture({"duration_seconds": 1.0, "solve": False})
+            ),
+            daemon=True,
+        )
+        worker.start()
+        assert entered_transition.wait(10.0), "start_capture() never reached profile resolution"
+
+        # Deterministically inside the claim window now.
+        rescan = service.rescan_device()
+        assert rescan["rescan_started"] is False
+        assert rescan["rescan_declined_reason"]
+        assert rescan["device"]["state"] == STATE_BUSY
+        assert runner.calls == 1, "a probe ran during the readiness-to-submit claim window"
+
+        release_transition.set()
+        worker.join(timeout=10.0)
+        assert results, "start_capture() never returned"
+        _wait_for_terminal(results[0])
+    finally:
+        service.close()
+
+
+# -- requirement 7: a runner that raises must not wedge the monitor --------
+
+
+def test_a_runner_that_raises_produces_failed_not_a_stuck_checking() -> None:
+    def _raiser(driver: str) -> ProbeOutcome:
+        raise RuntimeError("the runner itself is broken")
+
+    runner = StubProbeRunner(_raiser)
+    monitor = _monitor(runner)
+    try:
+        _wait_for_probes(monitor, 1)
+        snapshot = monitor.snapshot()
+        assert snapshot.state == STATE_FAILED
+        assert snapshot.available is False
+        assert "RuntimeError" in (snapshot.probe_error or "")
+        assert snapshot.reason == REASON_RUNNER_RAISED
+
+        # The thread that raised must not have wedged the monitor: a later,
+        # working probe still lands normally rather than staying "checking"
+        # (or the same failure) forever.
+        runner.set_outcome(present("SDRplay RSP1A"))
+        assert monitor.request_refresh(force=True) is True
+        _wait_for_probes(monitor, 2)
+        assert monitor.snapshot().state == STATE_AVAILABLE
+    finally:
+        monitor.close()
