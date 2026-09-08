@@ -1,10 +1,11 @@
 # Pi smoke test — v0.10.0 stabilization
 
-**Status: NOT YET RUN.** This is a template and protocol only. It is committed empty as part of
-`stabilize/p25-geolocation-v0.10` (gate G1); results are filled in, committed, and pushed as a
-separate, later step (gate G4b) after the smoke test in gate G4 actually runs on the Raspberry Pi.
-Every field below must be filled with a real, observed value or explicitly marked "not run" /
-"not applicable" -- never left as a plausible-looking placeholder.
+**Status: FAILED/PARTIAL on `9e5dfbe`; not yet rerun on the fix.** See "Field attempt" below for what
+was and was not actually exercised. This file's own checklist (§§0-9) is still a template only, empty
+because the attempt did not reach most of it; results are filled in, committed, and pushed as a
+separate, later step (gate G4b) once the smoke test in gate G4 is actually rerun on the Raspberry Pi
+against a commit at or after `f436405`. Every field below must be filled with a real, observed value
+or explicitly marked "not run" / "not applicable" -- never left as a plausible-looking placeholder.
 
 Do not use `--host 0.0.0.0` for this test. Bind explicitly to a Tailscale or hotspot address (see
 §0). See Plan v2, §§8-9, for the staging model this protocol assumes (detached-HEAD clone or
@@ -12,13 +13,26 @@ worktree at a known commit; the Pi's existing checkout and `.venv` are never tou
 
 ## Field attempt — operational failure on commit `9e5dfbe`
 
-**G4 has not passed.** This section is a record of the one real field attempt made against this
-protocol, not a run of it: the attempt failed before reaching most of the checklist below, and none
-of §§1-9 were completed. The fix described in this branch (`stabilize/p25-geolocation-v0.10`,
-commits `b8133d4`..`de893fd`) has been exercised only against a stub SDR in the automated test suite
-and in local browser smoke tests (see `tests/test_web_device_state.py`, `tests/test_web_bootstrap.py`)
--- **it has not yet been field-validated on real hardware.** A PASS on this document requires an
-actual re-run of the full protocol below on the Pi, on a commit at or after `de893fd`.
+This section is a record of the one real field attempt made against this protocol, not a full run of
+it -- but it was not a total miss against the checklist below either:
+
+| Section | Status |
+|---|---|
+| §1 Software checks (pytest / ruff / CLI diff) | Done |
+| §2 Database upgrade, on a copy | Done |
+| §3 Preflight | Done |
+| §4 `drive_view_for_stops` replay (plain and `--drive-view`) | Done, though the section's table below was not fully filled in at the time |
+| §5 Field app: stationary stop | Server start and TLS acceptance done; the stop capture itself was not reached |
+| §6 Field app: drive | Not done -- never reached |
+| §7 After stopping | SDR-release check done; `campaign_digest.py` not run |
+| §8 Hardware health | Metrics collected |
+| §9 Outcome | fail/partial (this attempt) |
+
+The fix described in this branch (`stabilize/p25-geolocation-v0.10`, commits `b8133d4` through
+`f436405`) has been exercised only against a stub SDR in the automated test suite and in local
+browser smoke tests (see `tests/test_web_device_state.py`, `tests/test_web_bootstrap.py`) --
+**it has not yet been field-validated on real hardware.** A PASS on this document requires an
+actual re-run of the full protocol below on the Pi, on a commit at or after `f436405`.
 
 - **Commit under test:** `9e5dfbeaf7f49fb35fff3b550a22658b667278fb` (dated 2026-09-06; the branch
   head at the time of the attempt, before any of the fix commits in this document existed).
@@ -31,14 +45,18 @@ actual re-run of the full protocol below on the Pi, on a commit at or after `de8
   (run separately, before starting the server) reported acceptable throughput (~18 MB/s measured
   against a ~3.1 MB/s requirement) and passed its other checks.
 - **What failed:** the app UI never left its initial `connecting…` / `disk…` placeholders. No
-  capture settings loaded, no recording was made, and no completed `/api/state` request appears in
-  the server log -- consistent with the request hanging before `send_response()`, which is the only
-  place `BaseHTTPRequestHandler` logs from (see `web/server.py`'s `log_message`). This matches the
-  root cause fixed in this branch: `GET /api/state` called `probe_soapysdr()` synchronously, on the
-  request thread, with no timeout, no cache, and nothing on the client side to abort or report it.
-- **Not attempted at the time:** because the app never became usable, none of the drive, hold,
-  reconnect, or SDR-disconnect scenarios in §§5-7 below were exercised on hardware during this
-  attempt.
+  capture settings loaded and no recording was made. No completed `/api/state` request appears in the
+  server log -- consistent with the request hanging before `send_response()`, which is the only place
+  `BaseHTTPRequestHandler` logs from (see `web/server.py`'s `log_message`). `GET /api/state` called
+  `probe_soapysdr()` synchronously, on the request thread, with no timeout, no cache, and nothing on
+  the client side to abort or report it, and that path contained one unbounded call,
+  `SoapySDR.Device.enumerate()`. No stack trace was captured during the failure, so it is not
+  established as fact that `enumerate()` itself was the call stuck at that moment -- but it is the
+  leading diagnosis, and the only one consistent with every observation above. The fix in this branch
+  removes the unbounded path regardless, whichever call it actually was.
+- **Not attempted at the time:** the §6 drive scenario, and the §5 stop-capture itself (server start
+  and TLS acceptance were reached, per the table above, but the capture never ran because the app
+  never became usable). §7's SDR-release check was done; `campaign_digest.py` was not run.
 
 ### Two residual limitations, not fixed here, documented rather than guessed around
 
@@ -50,13 +68,13 @@ actual re-run of the full protocol below on the Pi, on a commit at or after `de8
    thread does not release whatever the C library is blocked on, and can corrupt shared state). The
    only safe direction identified is running the capture itself in its own killable child process,
    which is a separate, not-yet-written plan and out of scope for this branch.
-2. **`DeviceMonitor.close()` is best-effort against a child stuck in an uninterruptible wait
-   (D-state).** It kills the probe subprocess and gives it a bounded window to be reaped; if the
-   kernel has the child parked in D-state (typically stuck in an uninterruptible driver/USB call),
-   `kill()` cannot remove it and `close()` returns without waiting further, so the API/server never
-   blocks on it. This is a guarantee about the *server*, not about the *child*: `close()` never
-   claims the orphaned process itself is guaranteed to be gone, only that normal operation does not
-   wait on it.
+2. **`DeviceMonitor.close()` is bounded and best-effort against a child stuck in an uninterruptible
+   wait (D-state), not a guarantee.** It kills the probe subprocess and waits up to its own bounded
+   join window for it to be reaped; if the kernel has the child parked in D-state (typically stuck in
+   an uninterruptible driver/USB call), `kill()` cannot remove it, that wait still elapses, and
+   `close()` then returns anyway rather than blocking the server further. This is a guarantee about
+   the *server* -- normal operation does not wait on such a child past that bounded window -- not
+   about the *child*: `close()` never claims the orphaned process itself is guaranteed to be gone.
 
 ## 0. Environment (fill in at run time)
 

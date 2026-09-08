@@ -117,22 +117,28 @@ currently be reproduced offline from what was recorded during the drive that exh
 ## Field app: `/api/state` SDR-probe hang (fixed in this branch, not yet field-validated)
 
 A field attempt on commit `9e5dfbe` failed operationally: the app never left its `connecting…` /
-`disk…` placeholders, because `GET /api/state` called `probe_soapysdr()` synchronously on the
-request thread, with no timeout, no cache, and no client-side abort -- an unbounded
-`SoapySDR.Device.enumerate()` call blocked the request forever. Full details of that attempt
-(hardware, settings, what worked and what did not) are recorded in
+`disk…` placeholders. `GET /api/state` called `probe_soapysdr()` synchronously on the request
+thread, with no timeout, no cache, and no client-side abort, and that request path contained a
+single unbounded call, `SoapySDR.Device.enumerate()`. No stack trace was captured during the
+failure, so it is not established as fact that `enumerate()` specifically was the call stuck at that
+moment -- but it is the leading diagnosis, and the only one consistent with every observation (the
+server itself stayed responsive to static files, no `/api/state` request ever completed, and
+preflight -- which does not call `enumerate()` on this path -- worked). The fix removes the
+unbounded path itself regardless: probing now always happens out-of-process, on its own bounded
+timeout, so nothing on the request thread can block indefinitely any more, whichever call it was.
+Full details of that attempt (hardware, settings, what worked and what did not) are recorded in
 `docs/validation/pi-smoke-v0.10.md`, "Field attempt — operational failure on commit `9e5dfbe`".
 
-This branch (`stabilize/p25-geolocation-v0.10`, commits `b8133d4`..`de893fd`) fixes the hang: the SDR
-probe now runs out-of-process on its own bounded timeout (`capture/probe.py`), a cached single-flight
-monitor serves `/api/state` from memory (`web/devices.py`), a `Rescan SDR` control lets the operator
-recheck without restarting the server, and the frontend's own fetch has a hard timeout and shows
-every device state instead of hanging on the placeholder. **The fix is proven against a stub SDR in
-the automated test suite (`tests/test_web_device_state.py`, `tests/test_capture_probe_runner.py`,
-`tests/test_web_bootstrap.py`) and in local browser smoke tests, but it has not yet been
-field-validated on real hardware** -- that requires an actual re-run of
-`docs/validation/pi-smoke-v0.10.md`'s full protocol on the Pi, which has not happened yet (its status
-remains NOT YET RUN).
+This branch (`stabilize/p25-geolocation-v0.10`, commits `b8133d4` through `f436405`) fixes the hang:
+the SDR probe now runs out-of-process on its own bounded timeout (`capture/probe.py`), a cached
+single-flight monitor serves `/api/state` from memory (`web/devices.py`), a `Rescan SDR` control lets
+the operator recheck without restarting the server, and the frontend's own fetch has a hard timeout
+and shows every device state instead of hanging on the placeholder. **The fix is proven against a
+stub SDR in the automated test suite (`tests/test_web_device_state.py`,
+`tests/test_capture_probe_runner.py`, `tests/test_web_bootstrap.py`) and in local browser smoke
+tests, but it has not yet been field-validated on real hardware.** G4's status is
+**FAILED/PARTIAL on `9e5dfbe`; not yet rerun on the fix** -- a PASS requires an actual re-run of
+`docs/validation/pi-smoke-v0.10.md`'s full protocol on the Pi, on a commit at or after `f436405`.
 
 Two limitations in the surrounding capture path are known and intentionally not addressed here:
 
@@ -141,9 +147,10 @@ Two limitations in the surrounding capture path are known and intentionally not 
   was deliberately not attempted, since a stuck C call cannot be safely cancelled from another
   thread; the only safe direction is a capture worker in its own killable process, which is a
   separate, not-yet-written plan.
-- **`DeviceMonitor.close()` is best-effort against a probe child stuck in an uninterruptible wait
-  (D-state).** It kills and tries to reap the child within a bounded window; if the kernel has it
-  parked in D-state, `close()` returns anyway rather than blocking the server on it. This guarantees
+- **`DeviceMonitor.close()` is bounded and best-effort against a probe child stuck in an
+  uninterruptible wait (D-state), not a guarantee.** It kills the child and waits up to its own
+  bounded join window for it to be reaped; if the kernel has it parked in D-state, that wait still
+  elapses and `close()` then returns anyway rather than blocking the server further. This guarantees
   the server never hangs on such a child -- it does not guarantee the child itself is gone.
 
 ## Documentation accuracy (fixed in this stabilization branch, listed for the PR record)
