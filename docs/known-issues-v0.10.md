@@ -114,6 +114,38 @@ at 1 Hz) that is never persisted to disk. There is no `live replay` command and 
 device-timestamped GPS trace, so a field anomaly (such as the repeating-bin symptom above) cannot
 currently be reproduced offline from what was recorded during the drive that exhibited it.
 
+## Field app: `/api/state` SDR-probe hang (fixed in this branch, not yet field-validated)
+
+A field attempt on commit `9e5dfbe` failed operationally: the app never left its `connecting…` /
+`disk…` placeholders, because `GET /api/state` called `probe_soapysdr()` synchronously on the
+request thread, with no timeout, no cache, and no client-side abort -- an unbounded
+`SoapySDR.Device.enumerate()` call blocked the request forever. Full details of that attempt
+(hardware, settings, what worked and what did not) are recorded in
+`docs/validation/pi-smoke-v0.10.md`, "Field attempt — operational failure on commit `9e5dfbe`".
+
+This branch (`stabilize/p25-geolocation-v0.10`, commits `b8133d4`..`de893fd`) fixes the hang: the SDR
+probe now runs out-of-process on its own bounded timeout (`capture/probe.py`), a cached single-flight
+monitor serves `/api/state` from memory (`web/devices.py`), a `Rescan SDR` control lets the operator
+recheck without restarting the server, and the frontend's own fetch has a hard timeout and shows
+every device state instead of hanging on the placeholder. **The fix is proven against a stub SDR in
+the automated test suite (`tests/test_web_device_state.py`, `tests/test_capture_probe_runner.py`,
+`tests/test_web_bootstrap.py`) and in local browser smoke tests, but it has not yet been
+field-validated on real hardware** -- that requires an actual re-run of
+`docs/validation/pi-smoke-v0.10.md`'s full protocol on the Pi, which has not happened yet (its status
+remains NOT YET RUN).
+
+Two limitations in the surrounding capture path are known and intentionally not addressed here:
+
+- **`SoapyIqDevice.open()` still has no timeout.** The fix bounds `enumerate()` (the probe), not
+  `open()` (which happens later, once a capture actually starts). A thread-based timeout around it
+  was deliberately not attempted, since a stuck C call cannot be safely cancelled from another
+  thread; the only safe direction is a capture worker in its own killable process, which is a
+  separate, not-yet-written plan.
+- **`DeviceMonitor.close()` is best-effort against a probe child stuck in an uninterruptible wait
+  (D-state).** It kills and tries to reap the child within a bounded window; if the kernel has it
+  parked in D-state, `close()` returns anyway rather than blocking the server on it. This guarantees
+  the server never hangs on such a child -- it does not guarantee the child itself is gone.
+
 ## Documentation accuracy (fixed in this stabilization branch, listed for the PR record)
 
 - `README.md` and `docs/PHASE7-FIELD-GEOLOCATION.md` described `--min-detections` as defaulting to
