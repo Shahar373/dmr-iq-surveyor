@@ -66,6 +66,7 @@ html, body {
 }
 .pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
 .pill.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+.pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
 
 #sheet {
   position: fixed;
@@ -157,6 +158,7 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
   margin-bottom: 10px;
 }
 .notice.error { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.notice button { display: block; margin-top: 8px; }
 
 .progress { height: 8px; background: var(--line); border-radius: 999px; overflow: hidden; margin: 6px 0 8px; }
 #progress-bar { height: 100%; width: 0; background: var(--accent); transition: width .3s ease; }

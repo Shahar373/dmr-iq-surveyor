@@ -91,11 +91,39 @@ document.addEventListener("visibilitychange", () => {
 
 /* ---------------------------------------------------------------- helpers */
 
+/* Every call the field app makes to its own server goes through here, and
+ * every one of them is now bounded: the backend never blocks on the SDR
+ * (a probe runs out-of-process, on its own timeout -- see
+ * web/devices.py), but this is the one place that turned an already-fixed
+ * server hang into an unbounded phone hang, so it gets its own ceiling
+ * regardless of what the server does. 20 s is comfortably above the
+ * server's own worst case (an ~8 s probe plus a couple of seconds of
+ * margin, see require_device_ready()'s wait), so this should never fire
+ * against a healthy server; it exists for the case where something else,
+ * not yet known, blocks anyway. */
+const API_TIMEOUT_MS = 20000;
+
 async function api(path, options = {}) {
   const headers = Object.assign({}, options.headers || {});
   if (TOKEN) headers["X-Auth-Token"] = TOKEN;
   if (options.body) headers["Content-Type"] = "application/json";
-  const response = await fetch(path, Object.assign({}, options, { headers }));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(path, Object.assign({}, options, { headers, signal: controller.signal }));
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      const timeoutError = new Error(
+        `${path} did not answer within ${(API_TIMEOUT_MS / 1000).toFixed(0)}s`
+      );
+      timeoutError.timedOut = true;
+      throw timeoutError;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
   const text = await response.text();
   let payload = null;
   try { payload = text ? JSON.parse(text) : null; } catch (_) { payload = { error: text }; }
@@ -129,6 +157,107 @@ function setConnection(text, kind) {
   const node = $("#connection");
   node.textContent = text;
   node.className = "pill" + (kind ? " " + kind : "");
+}
+
+const DEVICE_STATE_LABEL = {
+  checking: "checking SDR…",
+  disconnected: "no SDR",
+  busy: "SDR in use",
+  failed: "SDR error",
+  timed_out: "SDR check timed out",
+  not_supported: "SoapySDR not installed",
+};
+
+/* Maps every state the field server can report for the SDR onto the
+ * connection pill and the notice under the Record button. "available" and
+ * "checking" are not errors and never show the notice; every other state
+ * does, with Rescan SDR offered as the way back -- reconnecting the RSP1A
+ * must not require restarting the whole app.
+ *
+ * `refreshing` and `stale` are layered onto whichever state is being
+ * shown, never blanking it out: a Rescan in flight keeps showing the last
+ * thing the phone knew (flagged as being re-checked), and a cached
+ * "available" old enough to have aged past its window says so instead of
+ * quietly passing for a fresh one. */
+function renderDeviceStatus(device) {
+  const notice = $("#device-status");
+  const text = $("#device-status-text");
+
+  let label;
+  let kind;
+  if (device.state === "available") {
+    label = device.resolved_label || "SDR ready";
+    kind = "ok";
+  } else if (device.state === "checking") {
+    label = DEVICE_STATE_LABEL.checking;
+    kind = "";
+  } else if (device.state === "busy") {
+    label = DEVICE_STATE_LABEL.busy;
+    kind = "warn";
+  } else {
+    label = DEVICE_STATE_LABEL[device.state] || device.state;
+    kind = "bad";
+  }
+  if (device.refreshing) label += " · rechecking…";
+  if (
+    device.stale &&
+    device.state !== "checking" &&
+    device.age_seconds !== null &&
+    device.age_seconds !== undefined
+  ) {
+    const minutes = Math.round(device.age_seconds / 60);
+    label += minutes >= 1 ? ` · checked ${minutes} min ago` : " · checked just now";
+  }
+  setConnection(label, kind);
+
+  const showNotice = device.state !== "available" && device.state !== "checking";
+  notice.hidden = !showNotice;
+  if (showNotice) {
+    text.textContent = device.probe_error || "no SDR device found";
+  }
+}
+
+/* Guards against a second Rescan tap stacking a second poll loop on top of
+ * one already running -- the button is also disabled for the duration, but
+ * this holds even if something else calls rescanDevice() directly. Not a
+ * new thread either way: the wait between polls is a plain setTimeout, and
+ * the server itself is what actually bounds how many probes can run (at
+ * most one, see web/devices.py). */
+let rescanInFlight = false;
+
+async function rescanDevice() {
+  if (rescanInFlight) return;
+  rescanInFlight = true;
+  const button = $("#rescan-sdr");
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "Rescanning…";
+  try {
+    const result = await api("/api/device/rescan", { method: "POST", body: "{}" });
+    renderDeviceStatus(result.device);
+    if (!result.rescan_started) {
+      $("#device-status-text").textContent =
+        result.rescan_declined_reason || "could not start a recheck";
+      return;
+    }
+    // Bounded polling, not a new thread per tick: one fetch, then wait, up
+    // to 20 s -- comfortably above the server's own worst-case probe
+    // timeout -- and it stops the moment the server reports the check has
+    // landed (refreshing goes false), not just on a fixed schedule.
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      const payload = await api("/api/state");
+      renderDeviceStatus(payload.device);
+      if (!payload.device.refreshing) break;
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+  } catch (err) {
+    $("#device-status-text").textContent = "Rescan failed: " + err.message;
+  } finally {
+    rescanInFlight = false;
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
 }
 
 function formatGiB(bytes) {
@@ -1196,16 +1325,7 @@ async function refreshState() {
     readout.textContent += minutes >= 1 ? ` · marked ${minutes} min ago` : " · marked just now";
   }
 
-  const device = payload.device;
-  const notice = $("#device-status");
-  if (device.available) {
-    setConnection(device.resolved_label || "SDR ready", "ok");
-    notice.hidden = true;
-  } else {
-    setConnection("no SDR", "bad");
-    notice.hidden = false;
-    notice.textContent = device.probe_error || "no SDR device found";
-  }
+  renderDeviceStatus(payload.device);
   return payload;
 }
 
@@ -1260,6 +1380,7 @@ function wireUi() {
     });
   }
   $("#resolve").addEventListener("click", startSolve);
+  $("#rescan-sdr").addEventListener("click", rescanDevice);
   $("#cancel-job").addEventListener("click", async () => {
     if (state.jobId) await api("/api/jobs/" + state.jobId + "/cancel", { method: "POST" });
   });
@@ -1311,9 +1432,42 @@ function wireUi() {
   window.addEventListener("touchend", stop);
 }
 
+/* A stuck "connecting…" with nothing on screen to explain it was itself a
+ * field failure once: a throw anywhere in boot() -- including inside
+ * wireUi(), which used to run outside this function's own try -- escaped
+ * as an unhandled rejection with no visible trace. Every path here now
+ * ends in something on screen. */
+function showFatalError(message) {
+  setConnection("offline", "bad");
+  const sheet = $("#sheet");
+  if (sheet) {
+    sheet.prepend(el("div", "notice error", "Could not reach the server: " + message));
+  }
+}
+
+let reportedFatalError = false;
+
+function reportFatalErrorOnce(message) {
+  // Defence-in-depth beyond boot()'s own try/catch: a later runtime error
+  // in an event handler that nothing else wraps still lands on screen
+  // instead of silently doing nothing. Only ever shows the first one --
+  // several stacked red banners is not more informative than one.
+  if (reportedFatalError) return;
+  reportedFatalError = true;
+  showFatalError(message);
+}
+
+window.addEventListener("error", (event) => {
+  reportFatalErrorOnce((event && event.message) || "an unexpected error occurred");
+});
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event && event.reason;
+  reportFatalErrorOnce((reason && reason.message) || String(reason));
+});
+
 async function boot() {
-  wireUi();
   try {
+    wireUi();
     const payload = await refreshState();
     applyDefaults();
     await ensureLeaflet();
@@ -1334,8 +1488,8 @@ async function boot() {
       pollLive();
     }
   } catch (error) {
-    setConnection("offline", "bad");
-    $("#sheet").prepend(el("div", "notice error", "Could not reach the server: " + error.message));
+    reportedFatalError = true; // boot()'s own catch already shows this one
+    showFatalError(error.message);
   }
 }
 
