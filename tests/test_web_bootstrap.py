@@ -228,3 +228,100 @@ def test_a_fatal_boot_error_is_shown_rather_than_a_silent_hang() -> None:
     assert 'window.addEventListener("error"' in APP_JS
     assert 'window.addEventListener("unhandledrejection"' in APP_JS
     assert "reportFatalErrorOnce" in APP_JS
+
+
+def test_a_fatal_boot_error_offers_a_way_back() -> None:
+    """A red banner with no recourse is not much better than the silent
+    hang it replaced -- there must be a visible retry."""
+    match = re.search(r"function showFatalError\(message\) \{(.*?)\n\}\n", APP_JS, re.DOTALL)
+    assert match, "showFatalError() was not found in app.js as expected"
+    body = match.group(1)
+    assert "Try again" in body
+    assert "location.reload()" in body
+
+
+# -- SDR disconnects must appear without a manual action --------------------
+
+
+def _function_body(name: str, *, async_fn: bool = True) -> str:
+    prefix = "async function" if async_fn else "function"
+    match = re.search(rf"{prefix} {re.escape(name)}\([^)]*\) \{{(.*?)\n\}}\n", APP_JS, re.DOTALL)
+    assert match, f"{name}() was not found in app.js as expected"
+    return match.group(1)
+
+
+def test_a_repeating_poll_keeps_the_device_pill_current_without_user_action() -> None:
+    """refreshState() only ever runs once, at boot, plus whenever the
+    operator does something -- nothing made a disconnected SDR show up on
+    its own. pollDeviceState() must reschedule itself exactly once per
+    tick (one loop, not a new timer stacked on top of the last one each
+    time) and must never fire while a Rescan's own polling is already
+    hitting the same endpoint."""
+    body = _function_body("pollDeviceState")
+    assert "/api/state" in body
+    assert re.search(r"devicePollTimer\s*=\s*setTimeout\(pollDeviceState,", body), (
+        "pollDeviceState() must reschedule itself -- otherwise a disconnect "
+        "is only ever noticed once, at boot"
+    )
+    assert "clearTimeout(devicePollTimer)" in body, (
+        "must clear any previous timer before scheduling a new one, or two "
+        "overlapping poll loops can end up running at once"
+    )
+    assert "rescanInFlight" in body, (
+        "must skip its own fetch while a Rescan is already polling /api/state, "
+        "or the two loops can race each other"
+    )
+
+    boot_body = _function_body("boot")
+    assert "pollDeviceState()" in boot_body, "boot() never starts the repeating poll"
+
+
+def test_pollLive_retries_on_a_dropped_link_instead_of_ending_the_drive() -> None:
+    """The comment already says a dropped link is not a reason to stop
+    polling -- but the code must actually retry rather than tearing down
+    live.jobId and the wake lock on the very first failed poll, which
+    would silently end a drive that is still running on the Pi."""
+    body = _function_body("pollLive")
+    assert "let ok = false;" in body and "ok = true;" in body, (
+        "pollLive() must track whether the poll actually got a response, not "
+        "just whether `payload` is truthy"
+    )
+
+    # Anchored to the exact, known-fixed condition (rather than a generic
+    # `if (...) {` search) on purpose: a lazy `.*?` between arbitrary parens
+    # can walk straight past the intended `if` into an unrelated `) {` later
+    # in the function (e.g. `catch (_) {`), matching the wrong block
+    # entirely -- this caught that on the first version of this test.
+    match = re.search(r"if \(ok && !payload\.running\) \{(.*?)\n  \}", body, re.DOTALL)
+    assert match, (
+        "the teardown branch (ending the drive) must be gated on a successful "
+        "response, `ok && !payload.running` -- not just a falsy/unset payload, "
+        "which a caught network error produces exactly like a real 'drive "
+        "stopped' would"
+    )
+    teardown_body = match.group(1)
+    assert "live.jobId = null" in teardown_body and "releaseScreen()" in teardown_body
+
+    after_teardown = body[body.index(match.group(0)) + len(match.group(0)) :]
+    assert re.search(r"live\.timer\s*=\s*setTimeout\(pollLive,", after_teardown), (
+        "there must be an unconditional retry reachable on the failure path, "
+        "not only inside the success branch"
+    )
+
+
+def test_rescan_bounds_each_state_call_by_its_own_remaining_budget() -> None:
+    """The loop deadline alone does not bound total wall-clock time: a
+    single /api/state call inside it can itself take up to its own
+    timeout, so a fixed per-call timeout let one Rescan run for close to
+    twice its intended budget. Each call must be capped by whatever of the
+    budget is actually left."""
+    body = _function_body("rescanDevice")
+    assert re.search(r"timeoutMs:\s*Math\.min\(STATE_TIMEOUT_MS,\s*remaining\)", body), (
+        "each /api/state call inside the Rescan loop must be capped to "
+        "min(STATE_TIMEOUT_MS, time remaining until the deadline), not a "
+        "fixed timeout independent of how much budget is left"
+    )
+    assert "remaining <= 0" in body or "remaining<=0" in body, (
+        "the loop must stop once the budget is exhausted rather than making "
+        "one more full-timeout call past the deadline"
+    )

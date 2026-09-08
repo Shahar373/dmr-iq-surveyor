@@ -1243,36 +1243,75 @@ def test_rescan_is_refused_while_require_device_ready_is_about_to_return(
 
 
 def test_a_second_concurrent_rescan_is_refused_immediately_without_probing(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Two Rescan taps in quick succession contend on the same
     _device_transition_lock a capture/drive startup does. The second must
     be refused immediately, with a general reason that does not claim a
     recording or drive is starting (it might just be the first Rescan),
-    and it must never touch the runner."""
+    and it must never touch the runner.
+
+    Grabbing _device_transition_lock directly (as an earlier version of
+    this test did) only proves the second call backs off from a lock held
+    by *something* -- not that a real first rescan_device() call actually
+    holds it while it is doing its own work. This pauses a genuine first
+    call inside refresh_declined_reason(), which only runs once
+    rescan_device() already holds the lock, so a real second call racing
+    it is the thing actually under test."""
+    entered_pause = threading.Event()
+    release_pause = threading.Event()
+    original_refresh_declined_reason = DeviceMonitor.refresh_declined_reason
+
+    def _pausing_refresh_declined_reason(self: DeviceMonitor) -> str | None:
+        entered_pause.set()
+        assert release_pause.wait(10.0), "the test never released the pause barrier"
+        return original_refresh_declined_reason(self)
+
+    monkeypatch.setattr(DeviceMonitor, "refresh_declined_reason", _pausing_refresh_declined_reason)
+
     runner = StubProbeRunner(present("SDRplay RSP1A"))
     service = _capture_service(tmp_path, runner)
+    worker: threading.Thread | None = None
     try:
         _settled(service.devices)
         before = runner.calls
 
-        # Holds the lock directly, the same way rescan_device() itself (or
-        # start_capture()/start_live()) would while it is doing its own
-        # work -- no need to actually race two real Rescan calls to prove
-        # the second one backs off correctly.
-        assert service._device_transition_lock.acquire(blocking=False)  # noqa: SLF001
-        try:
-            second = service.rescan_device()
-            assert second["rescan_started"] is False
-            assert second["rescan_declined_reason"]
-            assert "already in progress" in second["rescan_declined_reason"]
-            assert runner.calls == before, "a probe ran while the transition lock was held"
-        finally:
-            service._device_transition_lock.release()  # noqa: SLF001
+        results: list[dict] = []
+        worker = threading.Thread(
+            target=lambda: results.append(service.rescan_device()), daemon=True
+        )
+        worker.start()
+        assert entered_pause.wait(10.0), (
+            "the first rescan_device() never reached refresh_declined_reason() -- "
+            "it must hold _device_transition_lock by the time it gets there"
+        )
 
-        # Once released, an ordinary Rescan proceeds normally.
-        assert service.rescan_device()["rescan_started"] is True
+        # Deterministically inside the window now: the first, real
+        # rescan_device() call holds the transition lock and is paused
+        # inside refresh_declined_reason(). A second call racing it now is
+        # not a simulation of contention -- it is contention.
+        second = service.rescan_device()
+        assert second["rescan_started"] is False
+        assert second["rescan_declined_reason"]
+        assert "already in progress" in second["rescan_declined_reason"]
+        assert runner.calls == before, "a probe ran while the transition lock was held"
+
+        release_pause.set()
+        worker.join(timeout=10.0)
+        assert not worker.is_alive(), "the first rescan_device() never returned"
+        assert results, "the first rescan_device() never returned a result"
+        assert results[0]["rescan_started"] is True, (
+            "the first, uncontended rescan_device() should have proceeded normally "
+            "once nothing else held the lock"
+        )
     finally:
+        # Always released, even when an assertion above failed: otherwise the
+        # paused worker thread stays blocked on release_pause for up to its
+        # own 10 s wait, well after this test has already moved on. set() is
+        # idempotent, so re-setting it on the success path above is harmless.
+        release_pause.set()
+        if worker is not None:
+            worker.join(timeout=10.0)
         service.close()
 
 

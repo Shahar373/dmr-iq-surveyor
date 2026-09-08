@@ -100,22 +100,32 @@ document.addEventListener("visibilitychange", () => {
  * server's own worst case (an ~8 s probe plus a couple of seconds of
  * margin, see require_device_ready()'s wait), so this should never fire
  * against a healthy server; it exists for the case where something else,
- * not yet known, blocks anyway. */
+ * not yet known, blocks anyway.
+ *
+ * `/api/state` gets its own, tighter ceiling (`STATE_TIMEOUT_MS`, passed as
+ * `options.timeoutMs`): it is called far more often -- every periodic poll,
+ * and repeatedly inside a Rescan -- so a single call sitting at the full 20 s
+ * default would let one Rescan take nearly twice its intended 20 s budget
+ * (one call almost using up the whole thing, then a second). See
+ * `rescanDevice()`, which also shrinks this further as its own deadline
+ * approaches. */
 const API_TIMEOUT_MS = 20000;
+const STATE_TIMEOUT_MS = 10000;
 
 async function api(path, options = {}) {
   const headers = Object.assign({}, options.headers || {});
   if (TOKEN) headers["X-Auth-Token"] = TOKEN;
   if (options.body) headers["Content-Type"] = "application/json";
+  const timeoutMs = options.timeoutMs || API_TIMEOUT_MS;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let response;
   try {
     response = await fetch(path, Object.assign({}, options, { headers, signal: controller.signal }));
   } catch (err) {
     if (err && err.name === "AbortError") {
       const timeoutError = new Error(
-        `${path} did not answer within ${(API_TIMEOUT_MS / 1000).toFixed(0)}s`
+        `${path} did not answer within ${(timeoutMs / 1000).toFixed(0)}s`
       );
       timeoutError.timedOut = true;
       throw timeoutError;
@@ -225,6 +235,14 @@ function renderDeviceStatus(device) {
  * most one, see web/devices.py). */
 let rescanInFlight = false;
 
+// The wall-clock budget for one Rescan click, start to finish. Each
+// /api/state call inside the loop below is itself capped to whatever time
+// remains of this budget (never the full STATE_TIMEOUT_MS) -- a fixed
+// per-call timeout without that cap would let the loop run for up to
+// RESCAN_BUDGET_MS *plus* one more full per-call timeout past it, since the
+// deadline check only runs between calls, not during one.
+const RESCAN_BUDGET_MS = 20000;
+
 async function rescanDevice() {
   if (rescanInFlight) return;
   rescanInFlight = true;
@@ -240,16 +258,20 @@ async function rescanDevice() {
         result.rescan_declined_reason || "could not start a recheck";
       return;
     }
-    // Bounded polling, not a new thread per tick: one fetch, then wait, up
-    // to 20 s -- comfortably above the server's own worst-case probe
-    // timeout -- and it stops the moment the server reports the check has
-    // landed (refreshing goes false), not just on a fixed schedule.
-    const deadline = Date.now() + 20000;
-    while (Date.now() < deadline) {
-      const payload = await api("/api/state");
+    // Bounded polling, not a new thread per tick: one fetch, then wait,
+    // stopping the moment the server reports the check has landed
+    // (refreshing goes false) or the budget above runs out, not just on a
+    // fixed schedule.
+    const deadline = Date.now() + RESCAN_BUDGET_MS;
+    while (true) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const payload = await api("/api/state", { timeoutMs: Math.min(STATE_TIMEOUT_MS, remaining) });
       renderDeviceStatus(payload.device);
       if (!payload.device.refreshing) break;
-      await new Promise((resolve) => setTimeout(resolve, 700));
+      const wait = deadline - Date.now();
+      if (wait <= 0) break;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(700, wait)));
     }
   } catch (err) {
     $("#device-status-text").textContent = "Rescan failed: " + err.message;
@@ -1265,27 +1287,33 @@ function renderLive(payload) {
 async function pollLive() {
   if (live.timer) clearTimeout(live.timer);
   let payload = null;
+  let ok = false;
   try {
     payload = await api("/api/live");
+    ok = true;
     renderLive(payload);
   } catch (_) {
-    /* a dropped link is not a reason to stop polling */
+    /* a dropped link is not a reason to stop polling -- the drive is
+     * running on the Pi regardless of whether this phone can currently
+     * reach it, so a failed poll retries instead of tearing anything down.
+     * Only a *successful* response saying the drive is no longer running
+     * ends this loop; the drive itself is still what stopDrive() stops. */
   }
   renderDriveGps();
-  if (payload && payload.running) {
-    live.timer = setTimeout(pollLive, 2000);
-  } else {
-    if (live.jobId && payload) speak(`Drive stopped. ${payload.bin_count || 0} bins.`);
+  if (ok && !payload.running) {
+    if (live.jobId) speak(`Drive stopped. ${payload.bin_count || 0} bins.`);
     live.timer = null;
     live.jobId = null;
     releaseScreen();
+    return;
   }
+  live.timer = setTimeout(pollLive, 2000);
 }
 
 /* ----------------------------------------------------------------- setup */
 
 async function refreshState() {
-  const payload = await api("/api/state");
+  const payload = await api("/api/state", { timeoutMs: STATE_TIMEOUT_MS });
   state.settings = payload.settings;
   state.position = payload.position;
   state.sites = payload.sites;
@@ -1327,6 +1355,37 @@ async function refreshState() {
 
   renderDeviceStatus(payload.device);
   return payload;
+}
+
+// A disconnected SDR must show up on its own, not only after the operator
+// happens to trigger some other request -- refreshState() only ever runs
+// once, at boot, plus whenever the user does something. This is the single
+// repeating loop that keeps the connection pill honest afterwards. It polls
+// only /api/state and renders only the device sub-object -- not the full
+// refreshState(), which would also re-render sites/stops/plan/the map on
+// every tick and reset whatever the operator is doing with them.
+//
+// One loop, never two: `devicePollTimer` is always cleared before being
+// rescheduled, and this function is only ever kicked off once, from
+// boot(). It skips a tick's fetch (without breaking the chain) while a
+// Rescan's own tighter polling is already in flight, so the two never fire
+// /api/state at the same time, and again while the tab is hidden, since
+// nobody is watching the pill and a backgrounded phone should not spend
+// battery polling.
+const DEVICE_POLL_INTERVAL_MS = 5000;
+let devicePollTimer = null;
+
+async function pollDeviceState() {
+  if (devicePollTimer) clearTimeout(devicePollTimer);
+  if (!rescanInFlight && document.visibilityState !== "hidden") {
+    try {
+      const payload = await api("/api/state", { timeoutMs: STATE_TIMEOUT_MS });
+      renderDeviceStatus(payload.device);
+    } catch (_) {
+      /* the next tick tries again -- a dropped link here is not fatal */
+    }
+  }
+  devicePollTimer = setTimeout(pollDeviceState, DEVICE_POLL_INTERVAL_MS);
 }
 
 function applyDefaults() {
@@ -1436,12 +1495,24 @@ function wireUi() {
  * field failure once: a throw anywhere in boot() -- including inside
  * wireUi(), which used to run outside this function's own try -- escaped
  * as an unhandled rejection with no visible trace. Every path here now
- * ends in something on screen. */
+ * ends in something on screen, with a way back that does not require
+ * knowing to pull down and refresh the browser manually.
+ *
+ * Only ever called once: `reportFatalErrorOnce()` guards every path that
+ * can reach this (boot()'s own catch sets the same flag before calling it
+ * directly), so the "Try again" listener attached below can never be
+ * registered twice. */
 function showFatalError(message) {
   setConnection("offline", "bad");
   const sheet = $("#sheet");
   if (sheet) {
-    sheet.prepend(el("div", "notice error", "Could not reach the server: " + message));
+    const banner = el("div", "notice error", "Could not reach the server: " + message);
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.textContent = "Try again";
+    retry.addEventListener("click", () => location.reload());
+    banner.appendChild(retry);
+    sheet.prepend(banner);
   }
 }
 
@@ -1469,6 +1540,7 @@ async function boot() {
   try {
     wireUi();
     const payload = await refreshState();
+    pollDeviceState();
     applyDefaults();
     await ensureLeaflet();
     if (initMap()) {
