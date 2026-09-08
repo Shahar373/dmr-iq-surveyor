@@ -315,6 +315,19 @@ class FieldService:
         # _device_is_held() synchronously, before this constructor returns.
         self._device_claim_lock = threading.Lock()
         self._device_claim_count = 0
+        # A real lock, separate from the counter above and never consulted
+        # by _device_is_held(): held from BEFORE require_device_ready() is
+        # even called through AFTER JobRegistry.submit(), by start_capture()
+        # and start_live(), so a concurrent Rescan can never land in that
+        # whole window -- not just the part of it after readiness succeeds,
+        # which _device_claim_count alone left open (a Rescan arriving while
+        # require_device_ready() had already got its answer and was merely
+        # about to return could still slip a probe in). It must NOT be what
+        # _device_is_held() checks: require_device_ready() calls
+        # ensure_fresh() while holding this very lock, and ensure_fresh()
+        # asking "is the device held" would then be asking about its own
+        # caller, reporting itself busy on every single call.
+        self._device_transition_lock = threading.Lock()
         # Device state is cached and probed out of process: reading it must
         # never touch the SDR, because a wedged SDRplay service would then
         # hang the request thread with no timeout and no log line.
@@ -428,14 +441,42 @@ class FieldService:
         return self.devices.poll().to_dict()
 
     def rescan_device(self) -> dict[str, Any]:
-        """Ask for a probe now, and answer immediately either way."""
-        declined = self.devices.refresh_declined_reason()
-        started = self.devices.request_refresh(force=True) if declined is None else False
-        return {
-            "rescan_started": started,
-            "rescan_declined_reason": None if started else declined,
-            "device": self.devices.snapshot().to_dict(),
-        }
+        """Ask for a probe now, and answer immediately either way.
+
+        Tries `_device_transition_lock` non-blocking, first. A capture or
+        drive between require_device_ready() succeeding and its job being
+        submitted holds that lock for the whole window, and this must
+        never wait for it -- Rescan either proceeds immediately or is
+        refused immediately, with a real reason either way.
+        """
+        if not self._device_transition_lock.acquire(blocking=False):
+            return {
+                "rescan_started": False,
+                "rescan_declined_reason": (
+                    "a recording or drive is starting up and briefly has exclusive "
+                    "access to the SDR; try again in a moment"
+                ),
+                "device": self.devices.snapshot().to_dict(),
+            }
+        try:
+            declined = self.devices.refresh_declined_reason()
+            started = self.devices.request_refresh(force=True) if declined is None else False
+            if not started and not declined:
+                # refresh_declined_reason() said go ahead, but
+                # request_refresh() itself declined a moment later -- the
+                # device became held, or a probe thread started, in
+                # between. A refusal must never come back with no reason;
+                # ask again, now, for what actually happened.
+                declined = self.devices.refresh_declined_reason() or (
+                    "the SDR check could not be started"
+                )
+            return {
+                "rescan_started": started,
+                "rescan_declined_reason": None if started else declined,
+                "device": self.devices.snapshot().to_dict(),
+            }
+        finally:
+            self._device_transition_lock.release()
 
     def sites_overview(self) -> list[dict[str, Any]]:
         """Just the sites. `/api/sites` used to build the whole state
@@ -745,58 +786,66 @@ class FieldService:
         # answer rather than a job that starts and then fails. The check is
         # forced fresh -- the cached state behind /api/state may be minutes
         # old -- and bounded, so a wedged device cannot hang this request.
-        self.require_device_ready()
+        # The transition lock is held from here -- BEFORE
+        # require_device_ready() is even called -- through submit() below,
+        # so a concurrent Rescan can never land between the readiness check
+        # succeeding and this job actually claiming the device, including
+        # the narrow moment where require_device_ready() has already got
+        # its answer and is merely about to return.
+        with self._device_transition_lock:
+            self.require_device_ready()
 
-        # From here until the job is claimed below, the device counts as
-        # held: nothing else -- a concurrent Rescan, another request's own
-        # readiness check -- may probe it while profile resolution is the
-        # only thing standing between "confirmed ready" and "about to open".
-        with self._claiming_device():
-            # Profiles are resolved NOW, not inside the job: a typo or a
-            # wrong working directory would otherwise surface only after
-            # the full capture had already been paid for.
-            band = str(payload.get("band") or self.settings.band)
-            try:
-                resolve_band_profile(band, base_dir=self.settings.profile_base_dir)
-                site_profile = resolve_site_profile(
-                    self.settings.site_profile, base_dir=self.settings.profile_base_dir
+            # From here until the job is claimed below, the device also
+            # counts as held for display purposes (state["device"] reports
+            # "busy" rather than a stale reading): profile resolution is the
+            # only thing standing between "confirmed ready" and "about to
+            # open".
+            with self._claiming_device():
+                # Profiles are resolved NOW, not inside the job: a typo or a
+                # wrong working directory would otherwise surface only after
+                # the full capture had already been paid for.
+                band = str(payload.get("band") or self.settings.band)
+                try:
+                    resolve_band_profile(band, base_dir=self.settings.profile_base_dir)
+                    site_profile = resolve_site_profile(
+                        self.settings.site_profile, base_dir=self.settings.profile_base_dir
+                    )
+                except (ProfileError, FileNotFoundError, OSError) as exc:
+                    raise ValueError(f"profile could not be resolved: {exc}") from exc
+
+                # Record the gain actually applied at this stop, not the
+                # profile's placeholder. Cross-stop comparability is the
+                # method's foundation, so the number it depends on has to be
+                # stored per stop to be checkable.
+                site_profile = replace(
+                    site_profile,
+                    gain=capture.if_gain_reduction_db,
+                    gain_mode="agc" if capture.agc else "manual",
+                    lna_state=capture.lna_state,
                 )
-            except (ProfileError, FileNotFoundError, OSError) as exc:
-                raise ValueError(f"profile could not be resolved: {exc}") from exc
+                solve = bool(payload.get("solve", self.settings.solve_after_capture))
 
-            # Record the gain actually applied at this stop, not the
-            # profile's placeholder. Cross-stop comparability is the
-            # method's foundation, so the number it depends on has to be
-            # stored per stop to be checkable.
-            site_profile = replace(
-                site_profile,
-                gain=capture.if_gain_reduction_db,
-                gain_mode="agc" if capture.agc else "manual",
-                lna_state=capture.lna_state,
-            )
-            solve = bool(payload.get("solve", self.settings.solve_after_capture))
+                def work(job: Job) -> dict[str, Any]:
+                    return self._capture_and_analyse(
+                        job,
+                        capture=capture,
+                        band=band,
+                        site_profile=site_profile,
+                        run_id=run_id,
+                        stop_id=stop_id,
+                        label=label,
+                        position=position,
+                        solve=solve,
+                    )
 
-            def work(job: Job) -> dict[str, Any]:
-                return self._capture_and_analyse(
-                    job,
-                    capture=capture,
-                    band=band,
-                    site_profile=site_profile,
-                    run_id=run_id,
-                    stop_id=stop_id,
-                    label=label,
-                    position=position,
-                    solve=solve,
+                return self.jobs.submit(
+                    kind="capture",
+                    label=(
+                        f"{capture.duration_seconds:.0f}s at "
+                        f"{capture.center_frequency_hz / 1e6:.4f} MHz"
+                    ),
+                    work=work,
                 )
-
-            return self.jobs.submit(
-                kind="capture",
-                label=(
-                    f"{capture.duration_seconds:.0f}s at "
-                    f"{capture.center_frequency_hz / 1e6:.4f} MHz"
-                ),
-                work=work,
-            )
 
     def _capture_and_analyse(
         self,
@@ -1309,75 +1358,80 @@ class FieldService:
             )
 
         live = self.live_settings(payload)
-        self.require_device_ready()
-        # Same transition guard as start_capture(): profile resolution and
-        # the registry read below sit between "confirmed ready" and the job
-        # actually claiming the device, and a concurrent Rescan must not be
-        # able to probe it in that gap.
-        with self._claiming_device():
-            try:
-                band = resolve_band_profile(live.band, base_dir=self.settings.profile_base_dir)
-                site_profile = resolve_site_profile(
-                    self.settings.site_profile, base_dir=self.settings.profile_base_dir
+        # Same transition lock as start_capture(): held from before
+        # require_device_ready() is even called through submit() below, so
+        # a concurrent Rescan can never land between the readiness check
+        # succeeding and this drive actually claiming the device.
+        with self._device_transition_lock:
+            self.require_device_ready()
+            # From here, the device also counts as held for display
+            # purposes: profile resolution and the registry read below sit
+            # between "confirmed ready" and the drive actually claiming it.
+            with self._claiming_device():
+                try:
+                    band = resolve_band_profile(live.band, base_dir=self.settings.profile_base_dir)
+                    site_profile = resolve_site_profile(
+                        self.settings.site_profile, base_dir=self.settings.profile_base_dir
+                    )
+                except (ProfileError, FileNotFoundError, OSError) as exc:
+                    raise ValueError(f"profile could not be resolved: {exc}") from exc
+
+                max_seconds = float(payload.get("max_seconds") or self.settings.live_max_seconds)
+                # Zero means "only when asked". Kept as zero rather than
+                # clamped to one, or the default would silently become
+                # "solve after every bin".
+                solve_every = max(0, int(
+                    payload.get("solve_every_bins", self.settings.live_solve_every_bins) or 0
+                ))
+                session_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+
+                # Cleared BEFORE the job is submitted, because submitting
+                # starts the thread: clearing afterwards could wipe the
+                # first bins of the drive that is already running.
+                # Registry control channels for naming near-threshold
+                # hints. Read once here: the registry does not change
+                # mid-drive and the phone polls status every couple of
+                # seconds.
+                registry = connect_geo_database(Path(self.settings.database_path))
+                try:
+                    cc_index = [
+                        (float(channel["frequency_hz"]), str(site_row["site_key"]))
+                        for site_row in list_sites(registry)
+                        for channel in site_row.get("channels", [])
+                    ]
+                finally:
+                    registry.close()
+
+                with self._live_lock:
+                    self._live_bins = []
+                    self._live_pending_runs = []
+                    self._live_stats = {}
+                    self._live_last_solve = None
+                    self._live_hold_request = None
+                    self._live_cc_index = cc_index
+                    self._live_cc_tolerance_hz = float(band.comparison.frequency_tolerance_hz)
+
+                def work(job: Job) -> dict[str, Any]:
+                    return self._run_live(
+                        job,
+                        live=live,
+                        band=band,
+                        site_profile=site_profile,
+                        session_id=session_id,
+                        max_seconds=max_seconds,
+                        solve_every=solve_every,
+                    )
+
+                job = self.jobs.submit(
+                    kind="live",
+                    label=(
+                        f"live drive at {live.center_frequency_hz / 1e6:.4f} MHz, "
+                        f"{live.bin_size_m:.0f} m bins"
+                    ),
+                    work=work,
                 )
-            except (ProfileError, FileNotFoundError, OSError) as exc:
-                raise ValueError(f"profile could not be resolved: {exc}") from exc
-
-            max_seconds = float(payload.get("max_seconds") or self.settings.live_max_seconds)
-            # Zero means "only when asked". Kept as zero rather than clamped
-            # to one, or the default would silently become "solve after
-            # every bin".
-            solve_every = max(0, int(
-                payload.get("solve_every_bins", self.settings.live_solve_every_bins) or 0
-            ))
-            session_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-
-            # Cleared BEFORE the job is submitted, because submitting starts
-            # the thread: clearing afterwards could wipe the first bins of
-            # the drive that is already running.
-            # Registry control channels for naming near-threshold hints.
-            # Read once here: the registry does not change mid-drive and the
-            # phone polls status every couple of seconds.
-            registry = connect_geo_database(Path(self.settings.database_path))
-            try:
-                cc_index = [
-                    (float(channel["frequency_hz"]), str(site_row["site_key"]))
-                    for site_row in list_sites(registry)
-                    for channel in site_row.get("channels", [])
-                ]
-            finally:
-                registry.close()
-
-            with self._live_lock:
-                self._live_bins = []
-                self._live_pending_runs = []
-                self._live_stats = {}
-                self._live_last_solve = None
-                self._live_hold_request = None
-                self._live_cc_index = cc_index
-                self._live_cc_tolerance_hz = float(band.comparison.frequency_tolerance_hz)
-
-            def work(job: Job) -> dict[str, Any]:
-                return self._run_live(
-                    job,
-                    live=live,
-                    band=band,
-                    site_profile=site_profile,
-                    session_id=session_id,
-                    max_seconds=max_seconds,
-                    solve_every=solve_every,
-                )
-
-            job = self.jobs.submit(
-                kind="live",
-                label=(
-                    f"live drive at {live.center_frequency_hz / 1e6:.4f} MHz, "
-                    f"{live.bin_size_m:.0f} m bins"
-                ),
-                work=work,
-            )
-            self._live_job_id = job.job_id
-            return job
+                self._live_job_id = job.job_id
+                return job
 
     def _run_live(
         self,

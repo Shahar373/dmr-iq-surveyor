@@ -44,6 +44,7 @@ from dmr_iq_surveyor.web.devices import (
     STATE_BUSY,
     STATE_CHECKING,
     DeviceMonitor,
+    DeviceSnapshot,
 )
 from dmr_iq_surveyor.web.jobs import STATUS_SUCCEEDED
 from dmr_iq_surveyor.web.server import create_server
@@ -912,6 +913,38 @@ class _RevivableStuckPopen:
         self.returncode = -9
 
 
+class _GoodPopen:
+    """A normal, fast, successful child -- the replacement spawned once the
+    earlier stuck one is finally reaped. A distinct class from
+    `_RevivableStuckPopen` on purpose: reusing the same object across both
+    spawns would leave the "second child returns a real device" half of
+    this test unproven."""
+
+    def __init__(self, payload: dict) -> None:
+        self.stdout = self.stderr = self.stdin = None
+        self.returncode: int | None = 0
+        self._payload = payload
+
+    def kill(self) -> None:
+        pass
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        return json.dumps(self._payload), ""
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+_GOOD_PAYLOAD = {
+    "available": True,
+    "requested_driver": "sdrplay",
+    "resolved_label": "SDRplay RSP1A 230405A498",
+    "probe_error": None,
+    "devices_found": [{"driver": "sdrplay", "label": "SDRplay RSP1A 230405A498"}],
+    "reason": None,
+}
+
+
 def test_an_orphan_that_finally_exits_recovers_on_rescan_without_a_restart(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -919,15 +952,28 @@ def test_an_orphan_that_finally_exits_recovers_on_rescan_without_a_restart(
     starts a probe via request_refresh(force=True) and trusts whatever the
     runner's own run() reports. The real SubprocessProbeRunner is used here
     specifically to prove that integration holds with the getattr("orphaned")
-    check gone from DeviceMonitor."""
+    check gone from DeviceMonitor: a first child gets stuck then finally
+    exits, a second, separate child is spawned and reports a real device,
+    and at no point does a second child exist while the first is still
+    unaccounted for."""
     import dmr_iq_surveyor.capture.probe as probe_module
 
     stuck = _RevivableStuckPopen()
-    spawned: list[_RevivableStuckPopen] = []
+    spawned: list[object] = []
 
-    def _popen(*_args: object, **_kwargs: object) -> _RevivableStuckPopen:
-        spawned.append(stuck)
-        return stuck
+    def _popen(*_args: object, **_kwargs: object) -> object:
+        if not spawned:
+            spawned.append(stuck)
+            return stuck
+        # A second spawn must only ever happen once the first child is
+        # confirmed dead -- _orphan_verdict() clears self._orphan only
+        # after poll() stops returning None. This is the "never more than
+        # one active/stuck child" guarantee, checked at the moment it would
+        # actually be violated, not just at the end.
+        assert stuck.poll() is not None, "a second child was spawned while the first was still live"
+        good = _GoodPopen(_GOOD_PAYLOAD)
+        spawned.append(good)
+        return good
 
     monkeypatch.setattr(probe_module.subprocess, "Popen", _popen)
     runner = SubprocessProbeRunner()
@@ -936,6 +982,7 @@ def test_an_orphan_that_finally_exits_recovers_on_rescan_without_a_restart(
         _wait_for_probes(monitor, 1)
         assert monitor.snapshot().state == STATE_TIMED_OUT
         assert len(spawned) == 1
+        assert runner.orphaned is True
 
         # DeviceMonitor does not pre-emptively decline here: no thread is
         # currently alive, so it has no reason of its own to refuse. It is
@@ -951,17 +998,49 @@ def test_an_orphan_that_finally_exits_recovers_on_rescan_without_a_restart(
         _wait_for_probes(monitor, 2)
         assert monitor.snapshot().state == STATE_TIMED_OUT
         assert len(spawned) == 1, "a second child was spawned while the first was still stuck"
+        assert runner.orphaned is True
 
         # The kernel finally lets it go -- no restart of anything involved.
         stuck.revive()
         assert monitor.request_refresh(force=True) is True
         _wait_for_probes(monitor, 3)
+
         assert len(spawned) == 2, "no fresh child was spawned once the orphan was reaped"
+        final = monitor.snapshot()
+        assert final.state == STATE_AVAILABLE
+        assert final.resolved_label == "SDRplay RSP1A 230405A498"
+        assert final.available is True
+        assert runner.orphaned is False
     finally:
         monitor.close()
 
 
 # -- requirement 4: "refreshing", and waiting for an in-flight probe --------
+
+
+def _settled_and_not_refreshing(
+    monitor: DeviceMonitor, *, not_checked_at: str | None = None, timeout: float = 10.0
+) -> DeviceSnapshot:
+    """A snapshot that has BOTH landed (a fresh `checked_at`, when
+    `not_checked_at` is given) AND `refreshing is False`.
+
+    `_Result` is recorded, and `probe_count`/`checked_at` updated, inside
+    the same lock the probe thread's target function returns right after
+    releasing -- but the thread itself is not marked dead by the
+    interpreter until a moment after that function actually returns.
+    Waiting on `checked_at` alone can observe the new result while
+    `refreshing` (computed from `Thread.is_alive()`) is still True; waiting
+    on `refreshing` alone has the same gap in the other direction on the
+    very first probe. Only waiting for both together closes it.
+    """
+    deadline = time.monotonic() + timeout
+    snapshot = monitor.snapshot()
+    while (
+        (not_checked_at is not None and snapshot.checked_at == not_checked_at) or snapshot.refreshing
+    ) and time.monotonic() < deadline:
+        time.sleep(0.005)
+        snapshot = monitor.snapshot()
+    return snapshot
 
 
 def test_rescan_reports_refreshing_until_the_new_result_lands() -> None:
@@ -971,8 +1050,7 @@ def test_rescan_reports_refreshing_until_the_new_result_lands() -> None:
     runner = StubProbeRunner(present("SDRplay RSP1A"))
     monitor = _monitor(runner)
     try:
-        _settled(monitor)
-        first = monitor.snapshot()
+        first = _settled_and_not_refreshing(monitor)
         assert first.state == STATE_AVAILABLE
         assert first.refreshing is False
 
@@ -991,11 +1069,7 @@ def test_rescan_reports_refreshing_until_the_new_result_lands() -> None:
         assert mid_flight.refreshing is True
 
         gate.set()
-        deadline = time.monotonic() + 10.0
-        while monitor.snapshot().checked_at == first.checked_at and time.monotonic() < deadline:
-            time.sleep(0.005)
-
-        landed = monitor.snapshot()
+        landed = _settled_and_not_refreshing(monitor, not_checked_at=first.checked_at)
         assert landed.checked_at != first.checked_at
         assert landed.resolved_label == "SDRplay RSP1A (rechecked)"
         assert landed.refreshing is False
@@ -1092,6 +1166,66 @@ def test_rescan_is_refused_during_the_claim_window_between_readiness_and_submit(
         assert runner.calls == 1, "a probe ran during the readiness-to-submit claim window"
 
         release_transition.set()
+        worker.join(timeout=10.0)
+        assert results, "start_capture() never returned"
+        _wait_for_terminal(results[0])
+    finally:
+        service.close()
+
+
+def test_rescan_is_refused_while_require_device_ready_is_about_to_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The transition lock must be held from BEFORE require_device_ready()
+    is even called, not just after it succeeds -- _device_claim_count alone
+    (entered only once require_device_ready() has already returned) left
+    open the exact gap where the readiness check has already got its
+    answer and is merely about to hand control back to start_capture()."""
+    from dmr_iq_surveyor.web.service import FieldService
+
+    entered_pause = threading.Event()
+    release_pause = threading.Event()
+    original_require_device_ready = FieldService.require_device_ready
+
+    def _pausing_require_device_ready(self: FieldService) -> None:
+        original_require_device_ready(self)  # the real readiness check succeeds first
+        entered_pause.set()
+        assert release_pause.wait(10.0), "the test never released the pause barrier"
+
+    monkeypatch.setattr(FieldService, "require_device_ready", _pausing_require_device_ready)
+
+    import dmr_iq_surveyor.web.service as web_service
+
+    monkeypatch.setattr(web_service, "run_capture", _fake_run_capture)
+    monkeypatch.setattr(web_service, "run_survey", _fake_run_survey)
+    monkeypatch.setattr(web_service, "materialise_measurements", _fake_materialise_measurements)
+
+    runner = StubProbeRunner(present("SDRplay RSP1A"))
+    service = _working_capture_service(tmp_path, runner)
+    try:
+        _settled(service.devices)
+        assert runner.calls == 1
+
+        results: list[object] = []
+        worker = threading.Thread(
+            target=lambda: results.append(
+                service.start_capture({"duration_seconds": 1.0, "solve": False})
+            ),
+            daemon=True,
+        )
+        worker.start()
+        assert entered_pause.wait(10.0), "start_capture() never reached the post-readiness pause"
+
+        # Deterministically inside the window now: the readiness check has
+        # already succeeded and start_capture() has not yet even regained
+        # control from require_device_ready(), let alone reached profile
+        # resolution or submit().
+        rescan = service.rescan_device()
+        assert rescan["rescan_started"] is False
+        assert rescan["rescan_declined_reason"]
+        assert runner.calls == 1, "a probe ran while the transition lock was held"
+
+        release_pause.set()
         worker.join(timeout=10.0)
         assert results, "start_capture() never returned"
         _wait_for_terminal(results[0])
