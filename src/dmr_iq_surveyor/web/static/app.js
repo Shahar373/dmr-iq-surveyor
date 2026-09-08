@@ -235,13 +235,25 @@ function renderDeviceStatus(device) {
  * most one, see web/devices.py). */
 let rescanInFlight = false;
 
-// The wall-clock budget for one Rescan click, start to finish. Each
-// /api/state call inside the loop below is itself capped to whatever time
-// remains of this budget (never the full STATE_TIMEOUT_MS) -- a fixed
-// per-call timeout without that cap would let the loop run for up to
-// RESCAN_BUDGET_MS *plus* one more full per-call timeout past it, since the
-// deadline check only runs between calls, not during one.
+// The wall-clock budget for one Rescan click, start to finish -- the POST
+// included, not just the polling loop after it. Every request rescanDevice()
+// makes is capped to whatever of this budget actually remains (never the
+// full STATE_TIMEOUT_MS on its own): a fixed per-call timeout without that
+// cap would let the POST alone use its own full timeout before the loop's
+// deadline even existed, on top of whatever the loop then took.
 const RESCAN_BUDGET_MS = 20000;
+
+/* renderDeviceStatus() hides #device-status while the device is
+ * available/checking -- exactly the states a Rescan is likely to be
+ * starting from. Its own failure/decline paths must unhide the notice
+ * themselves and say why, rather than writing text into a span nobody can
+ * see. */
+function showRescanNotice(message, { isError = false } = {}) {
+  const notice = $("#device-status");
+  notice.hidden = false;
+  notice.className = "notice" + (isError ? " error" : "");
+  $("#device-status-text").textContent = message;
+}
 
 async function rescanDevice() {
   if (rescanInFlight) return;
@@ -250,19 +262,22 @@ async function rescanDevice() {
   const originalLabel = button.textContent;
   button.disabled = true;
   button.textContent = "Rescanning…";
+  const deadline = Date.now() + RESCAN_BUDGET_MS;
   try {
-    const result = await api("/api/device/rescan", { method: "POST", body: "{}" });
+    const result = await api("/api/device/rescan", {
+      method: "POST",
+      body: "{}",
+      timeoutMs: Math.min(STATE_TIMEOUT_MS, deadline - Date.now()),
+    });
     renderDeviceStatus(result.device);
     if (!result.rescan_started) {
-      $("#device-status-text").textContent =
-        result.rescan_declined_reason || "could not start a recheck";
+      showRescanNotice(result.rescan_declined_reason || "could not start a recheck");
       return;
     }
     // Bounded polling, not a new thread per tick: one fetch, then wait,
     // stopping the moment the server reports the check has landed
     // (refreshing goes false) or the budget above runs out, not just on a
     // fixed schedule.
-    const deadline = Date.now() + RESCAN_BUDGET_MS;
     while (true) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
@@ -274,7 +289,7 @@ async function rescanDevice() {
       await new Promise((resolve) => setTimeout(resolve, Math.min(700, wait)));
     }
   } catch (err) {
-    $("#device-status-text").textContent = "Rescan failed: " + err.message;
+    showRescanNotice("Rescan failed: " + err.message, { isError: true });
   } finally {
     rescanInFlight = false;
     button.disabled = false;

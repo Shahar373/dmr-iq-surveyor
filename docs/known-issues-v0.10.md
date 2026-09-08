@@ -121,15 +121,17 @@ A field attempt on commit `9e5dfbe` failed operationally: the app never left its
 thread, with no timeout, no cache, and no client-side abort, and that request path contained a
 single unbounded call, `SoapySDR.Device.enumerate()`. No stack trace was captured during the
 failure, so it is not established as fact that `enumerate()` specifically was the call stuck at that
-moment -- but it is the leading diagnosis, and the only one consistent with every observation (the
-server itself stayed responsive to static files, no `/api/state` request ever completed, and
-preflight -- which does not call `enumerate()` on this path -- worked). The fix removes the
-unbounded path itself regardless: probing now always happens out-of-process, on its own bounded
-timeout, so nothing on the request thread can block indefinitely any more, whichever call it was.
+moment -- but it is the leading suspect: `probe_soapysdr()` reaches `enumerate()` on every call,
+including preflight's own (a separate, successful run, not evidence that `enumerate()` itself is
+safe under whatever condition caused the hang). The fix removes that one unbounded call from the
+request path regardless of whether it was the actual cause: probing now always happens
+out-of-process, on its own bounded timeout. This does not make every request thread block-proof --
+`state()` still does synchronous SQLite and disk work -- only that this specific unbounded hardware
+call can no longer be one of the things it waits on.
 Full details of that attempt (hardware, settings, what worked and what did not) are recorded in
 `docs/validation/pi-smoke-v0.10.md`, "Field attempt — operational failure on commit `9e5dfbe`".
 
-This branch (`stabilize/p25-geolocation-v0.10`, commits `b8133d4` through `f436405`) fixes the hang:
+This branch (`stabilize/p25-geolocation-v0.10`, commits `b8133d4` through `3412f6e`) fixes the hang:
 the SDR probe now runs out-of-process on its own bounded timeout (`capture/probe.py`), a cached
 single-flight monitor serves `/api/state` from memory (`web/devices.py`), a `Rescan SDR` control lets
 the operator recheck without restarting the server, and the frontend's own fetch has a hard timeout
@@ -138,7 +140,7 @@ stub SDR in the automated test suite (`tests/test_web_device_state.py`,
 `tests/test_capture_probe_runner.py`, `tests/test_web_bootstrap.py`) and in local browser smoke
 tests, but it has not yet been field-validated on real hardware.** G4's status is
 **FAILED/PARTIAL on `9e5dfbe`; not yet rerun on the fix** -- a PASS requires an actual re-run of
-`docs/validation/pi-smoke-v0.10.md`'s full protocol on the Pi, on a commit at or after `f436405`.
+`docs/validation/pi-smoke-v0.10.md`'s full protocol on the Pi, on a commit at or after `3412f6e`.
 
 Two limitations in the surrounding capture path are known and intentionally not addressed here:
 

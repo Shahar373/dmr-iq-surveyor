@@ -4,7 +4,7 @@
 was and was not actually exercised. This file's own checklist (§§0-9) is still a template only, empty
 because the attempt did not reach most of it; results are filled in, committed, and pushed as a
 separate, later step (gate G4b) once the smoke test in gate G4 is actually rerun on the Raspberry Pi
-against a commit at or after `f436405`. Every field below must be filled with a real, observed value
+against a commit at or after `3412f6e`. Every field below must be filled with a real, observed value
 or explicitly marked "not run" / "not applicable" -- never left as a plausible-looking placeholder.
 
 Do not use `--host 0.0.0.0` for this test. Bind explicitly to a Tailscale or hotspot address (see
@@ -21,7 +21,7 @@ it -- but it was not a total miss against the checklist below either:
 | §1 Software checks (pytest / ruff / CLI diff) | Done |
 | §2 Database upgrade, on a copy | Done |
 | §3 Preflight | Done |
-| §4 `drive_view_for_stops` replay (plain and `--drive-view`) | Done, though the section's table below was not fully filled in at the time |
+| §4 `drive_view_for_stops` replay (plain and `--drive-view`) | Partially completed -- both replay runs and their metrics were done, but the section's table and recommendation below were not fully filled in at the time |
 | §5 Field app: stationary stop | Server start and TLS acceptance done; the stop capture itself was not reached |
 | §6 Field app: drive | Not done -- never reached |
 | §7 After stopping | SDR-release check done; `campaign_digest.py` not run |
@@ -29,10 +29,10 @@ it -- but it was not a total miss against the checklist below either:
 | §9 Outcome | fail/partial (this attempt) |
 
 The fix described in this branch (`stabilize/p25-geolocation-v0.10`, commits `b8133d4` through
-`f436405`) has been exercised only against a stub SDR in the automated test suite and in local
+`3412f6e`) has been exercised only against a stub SDR in the automated test suite and in local
 browser smoke tests (see `tests/test_web_device_state.py`, `tests/test_web_bootstrap.py`) --
 **it has not yet been field-validated on real hardware.** A PASS on this document requires an
-actual re-run of the full protocol below on the Pi, on a commit at or after `f436405`.
+actual re-run of the full protocol below on the Pi, on a commit at or after `3412f6e`.
 
 - **Commit under test:** `9e5dfbeaf7f49fb35fff3b550a22658b667278fb` (dated 2026-09-06; the branch
   head at the time of the attempt, before any of the fix commits in this document existed).
@@ -52,8 +52,12 @@ actual re-run of the full protocol below on the Pi, on a commit at or after `f43
   the client side to abort or report it, and that path contained one unbounded call,
   `SoapySDR.Device.enumerate()`. No stack trace was captured during the failure, so it is not
   established as fact that `enumerate()` itself was the call stuck at that moment -- but it is the
-  leading diagnosis, and the only one consistent with every observation above. The fix in this branch
-  removes the unbounded path regardless, whichever call it actually was.
+  leading suspect: `probe_soapysdr()` reaches `enumerate()` on every call, including the preflight
+  that succeeded earlier in this same attempt (a separate, successful run of the same call, not
+  evidence that `enumerate()` is safe under whatever condition caused the hang). The fix in this
+  branch removes that one unbounded call from the request path regardless of whether it was the
+  actual cause -- it does not make the request thread block-proof in general, since `state()` still
+  does synchronous SQLite and disk work.
 - **Not attempted at the time:** the §6 drive scenario, and the §5 stop-capture itself (server start
   and TLS acceptance were reached, per the table above, but the capture never ran because the app
   never became usable). §7's SDR-release check was done; `campaign_digest.py` was not run.

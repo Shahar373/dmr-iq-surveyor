@@ -325,3 +325,55 @@ def test_rescan_bounds_each_state_call_by_its_own_remaining_budget() -> None:
         "the loop must stop once the budget is exhausted rather than making "
         "one more full-timeout call past the deadline"
     )
+
+
+def test_rescan_budget_covers_the_initial_post_not_just_the_polling_loop() -> None:
+    """A deadline created only after the POST to /api/device/rescan leaves
+    that POST itself unbounded by the Rescan budget: an unresponsive POST
+    could burn its own full default timeout before the polling loop's
+    deadline even existed, on top of whatever the loop then took. The
+    deadline must be set before that first request, and the POST must
+    itself be capped by what remains of it."""
+    body = _function_body("rescanDevice")
+    deadline_pos = body.find("const deadline = Date.now() + RESCAN_BUDGET_MS;")
+    assert deadline_pos != -1, "rescanDevice() must set a deadline"
+    post_pos = body.find('api("/api/device/rescan"')
+    assert post_pos != -1, "rescanDevice() must POST to /api/device/rescan"
+    assert deadline_pos < post_pos, (
+        "the deadline must be created before the POST, not only before the "
+        "polling loop that follows it -- otherwise the POST is not covered "
+        "by the budget at all"
+    )
+
+    post_call_end = body.find("});", post_pos)
+    assert post_call_end != -1, "the POST call's options object was not found as expected"
+    post_call = body[post_pos:post_call_end]
+    assert re.search(r"timeoutMs:\s*Math\.min\(STATE_TIMEOUT_MS,\s*deadline\s*-\s*Date\.now\(\)\)", post_call), (
+        "the POST must itself be capped to min(STATE_TIMEOUT_MS, time remaining "
+        "until the deadline) -- the same budget the polling loop after it uses, "
+        "not the unbounded default"
+    )
+
+
+def test_rescan_failure_or_decline_is_shown_even_from_available_or_checking() -> None:
+    """renderDeviceStatus() hides #device-status while the device is
+    available/checking -- exactly the states a Rescan click is likely to
+    start from. Writing only .textContent there, without unhiding the
+    notice, leaves the operator staring at a pill that never explains why
+    nothing happened."""
+    assert "function showRescanNotice(message" in APP_JS, (
+        "rescanDevice()'s failure/decline paths must go through something "
+        "that actually unhides the notice, not just set its text"
+    )
+    notice_body = _function_body("showRescanNotice", async_fn=False)
+    assert "notice.hidden = false" in notice_body, (
+        "showRescanNotice() must explicitly unhide #device-status -- "
+        "renderDeviceStatus() may have just hidden it"
+    )
+
+    body = _function_body("rescanDevice")
+    assert body.count("showRescanNotice(") == 2, (
+        "both the decline branch (rescan_started === false) and the catch "
+        "block must go through showRescanNotice(), not write to "
+        "#device-status-text directly"
+    )
