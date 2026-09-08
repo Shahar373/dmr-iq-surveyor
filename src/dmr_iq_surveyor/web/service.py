@@ -443,18 +443,21 @@ class FieldService:
     def rescan_device(self) -> dict[str, Any]:
         """Ask for a probe now, and answer immediately either way.
 
-        Tries `_device_transition_lock` non-blocking, first. A capture or
-        drive between require_device_ready() succeeding and its job being
-        submitted holds that lock for the whole window, and this must
-        never wait for it -- Rescan either proceeds immediately or is
-        refused immediately, with a real reason either way.
+        Tries `_device_transition_lock` non-blocking, first. Whoever holds
+        it -- a capture or drive between require_device_ready() succeeding
+        and its job being submitted, or another Rescan already in its own
+        try/finally below -- this must never wait for it: Rescan either
+        proceeds immediately or is refused immediately, with a real reason
+        either way. The reason names both possible holders rather than
+        assuming a recording or drive: two Rescan taps in quick succession
+        hit this same lock, not just a capture starting up.
         """
         if not self._device_transition_lock.acquire(blocking=False):
             return {
                 "rescan_started": False,
                 "rescan_declined_reason": (
-                    "a recording or drive is starting up and briefly has exclusive "
-                    "access to the SDR; try again in a moment"
+                    "another SDR check or recording/drive startup is already in "
+                    "progress; try again in a moment"
                 ),
                 "device": self.devices.snapshot().to_dict(),
             }

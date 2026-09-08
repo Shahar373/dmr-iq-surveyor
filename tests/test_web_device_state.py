@@ -1202,6 +1202,7 @@ def test_rescan_is_refused_while_require_device_ready_is_about_to_return(
 
     runner = StubProbeRunner(present("SDRplay RSP1A"))
     service = _working_capture_service(tmp_path, runner)
+    worker: threading.Thread | None = None
     try:
         _settled(service.devices)
         assert runner.calls == 1
@@ -1229,6 +1230,48 @@ def test_rescan_is_refused_while_require_device_ready_is_about_to_return(
         worker.join(timeout=10.0)
         assert results, "start_capture() never returned"
         _wait_for_terminal(results[0])
+    finally:
+        # Always released, even when an assertion above failed: otherwise
+        # the paused worker thread stays blocked on release_pause for up to
+        # its own 10 s wait, well after this test has already moved on.
+        # set() is idempotent, so re-setting it on the success path above is
+        # harmless.
+        release_pause.set()
+        if worker is not None:
+            worker.join(timeout=10.0)
+        service.close()
+
+
+def test_a_second_concurrent_rescan_is_refused_immediately_without_probing(
+    tmp_path: Path,
+) -> None:
+    """Two Rescan taps in quick succession contend on the same
+    _device_transition_lock a capture/drive startup does. The second must
+    be refused immediately, with a general reason that does not claim a
+    recording or drive is starting (it might just be the first Rescan),
+    and it must never touch the runner."""
+    runner = StubProbeRunner(present("SDRplay RSP1A"))
+    service = _capture_service(tmp_path, runner)
+    try:
+        _settled(service.devices)
+        before = runner.calls
+
+        # Holds the lock directly, the same way rescan_device() itself (or
+        # start_capture()/start_live()) would while it is doing its own
+        # work -- no need to actually race two real Rescan calls to prove
+        # the second one backs off correctly.
+        assert service._device_transition_lock.acquire(blocking=False)  # noqa: SLF001
+        try:
+            second = service.rescan_device()
+            assert second["rescan_started"] is False
+            assert second["rescan_declined_reason"]
+            assert "already in progress" in second["rescan_declined_reason"]
+            assert runner.calls == before, "a probe ran while the transition lock was held"
+        finally:
+            service._device_transition_lock.release()  # noqa: SLF001
+
+        # Once released, an ordinary Rescan proceeds normally.
+        assert service.rescan_device()["rescan_started"] is True
     finally:
         service.close()
 
