@@ -279,6 +279,21 @@ cmd_status() {
     journalctl -u "$FIELD_UNIT" -n 5 --no-pager 2>/dev/null || true
 }
 
+cmd_url() {
+    # The one command that deliberately prints the token: the operator is
+    # asking for their own bookmark, on their own terminal. Everything else
+    # in this script goes out of its way to keep the value out of argv and
+    # out of the journal, so the warning goes to stderr and the URL to
+    # stdout -- `fieldctl url | qrencode -t ansiutf8` stays useful.
+    local host token
+    host="$(resolve_host)" || die "no address to bind: FIELD_HOST is unset and no Tailscale IPv4 address is available"
+    [[ -r "$FIELD_TOKEN_FILE" ]] || die "cannot read ${FIELD_TOKEN_FILE}"
+    token="$(tr -d '\r\n' < "$FIELD_TOKEN_FILE")"
+    [[ -n "$token" ]] || die "${FIELD_TOKEN_FILE} is empty"
+    log "This URL contains the API token. Do not paste it into a log, an issue or a chat."
+    printf 'https://%s:%s/?token=%s\n' "$host" "$FIELD_PORT" "$token"
+}
+
 cmd_render_unit() {
     # Used by the installer. Kept here so the substitution and the template
     # never disagree about which placeholders exist.
@@ -297,6 +312,7 @@ usage: fieldctl <command>
   start | stop | restart      control the service (uses sudo)
   status                      one screen of diagnosis
   logs [journalctl args...]   default: -n 50
+  url                         the phone bookmark, token included
 
   print-command [--null]      the exact argv the service would run
   wait-network                block until a bind address exists (ExecStartPre)
@@ -317,6 +333,7 @@ main() {
         restart)        cmd_restart "$@" ;;
         status)         cmd_status "$@" ;;
         logs)           cmd_logs "$@" ;;
+        url)            cmd_url "$@" ;;
         print-command)  cmd_print_command "$@" ;;
         wait-network)   cmd_wait_network "$@" ;;
         exec)           cmd_exec "$@" ;;

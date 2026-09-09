@@ -288,3 +288,39 @@ def test_fieldctl_is_executable_and_follows_the_repository_shell_conventions() -
     lines = FIELDCTL.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "#!/usr/bin/env bash"
     assert "set -euo pipefail" in lines
+
+
+# -- the phone bookmark ---------------------------------------------------
+
+
+def test_url_prints_the_bookmark_the_phone_needs(tmp_path: Path) -> None:
+    """The one command that reveals the token on purpose: the operator is
+    asking for their own bookmark, on their own terminal."""
+    result = _run(_config(tmp_path), "url")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"https://100.90.110.54:8765/?token={TOKEN_VALUE}"
+
+
+def test_url_puts_its_warning_on_stderr_so_the_url_stays_pipeable(
+    tmp_path: Path,
+) -> None:
+    """`fieldctl url | qrencode -t ansiutf8` has to keep working."""
+    result = _run(_config(tmp_path), "url")
+    assert TOKEN_VALUE not in result.stderr
+    assert "token" in result.stderr.lower()
+
+
+def test_url_refuses_rather_than_inventing_an_address(tmp_path: Path) -> None:
+    result = _run(_config(tmp_path, FIELD_TAILSCALE_IP=""), "url")
+    assert result.returncode != 0
+    assert "0.0.0.0" not in result.stdout
+
+
+def test_url_refuses_when_the_token_file_is_empty(tmp_path: Path) -> None:
+    """An empty token file means the app would serve unauthenticated; a URL
+    built from it would look fine and prove nothing."""
+    empty = tmp_path / "empty-token"
+    empty.write_text("\n", encoding="utf-8")
+    empty.chmod(0o600)
+    result = _run(_config(tmp_path, FIELD_TOKEN_FILE=str(empty)), "url")
+    assert result.returncode != 0
