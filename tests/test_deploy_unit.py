@@ -242,3 +242,40 @@ def test_the_banner_is_not_lost_to_block_buffering() -> None:
     """Without PYTHONUNBUFFERED the startup banner only reaches the journal
     when the process exits, which is when it stops being useful."""
     assert "PYTHONUNBUFFERED=1" in " ".join(_values("Environment", "Service"))
+
+
+# -- the example's defaults must be the CLI's defaults --------------------
+
+
+@pytest.mark.parametrize(
+    ("variable", "parameter"),
+    [
+        ("FIELD_PORT", "port"),
+        ("FIELD_BAND", "band"),
+        ("FIELD_CENTER_FREQUENCY", "center_frequency"),
+        ("FIELD_SAMPLE_RATE", "sample_rate"),
+        ("FIELD_DURATION", "duration"),
+        ("FIELD_DRIVER", "driver"),
+        ("FIELD_SOLVE_RESOLUTION_M", "solve_resolution"),
+        ("FIELD_KEEP_RECORDINGS", "keep_recordings"),
+    ],
+)
+def test_the_example_ships_the_same_defaults_the_cli_would_have_used(
+    variable: str, parameter: str
+) -> None:
+    """The example claims that installing without choosing anything changes
+    nothing, and the service passes all of these explicitly so they show up in
+    `fieldctl status`. Both claims hold only while the two sets agree, and
+    nothing else would notice them drifting apart -- a changed CLI default
+    would leave the example quietly asserting the old value as if it were
+    still the app's."""
+    import inspect
+
+    from dmr_iq_surveyor.cli_web import web_serve
+
+    documented = _env_example()[variable]
+    default = inspect.signature(web_serve).parameters[parameter].default
+    if isinstance(default, float):
+        assert float(documented) == default
+    else:
+        assert documented == str(default)

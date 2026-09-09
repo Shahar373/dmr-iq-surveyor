@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # Install (or remove) the dmr-iq-surveyor field service on a Raspberry Pi.
 #
-#   sudo ./scripts/install_field_service.sh --site /etc/dmr-field/sites/g4_field.yaml
+#   sudo ./scripts/install_field_service.sh --site /etc/dmr-field/sites/<your-site>.yaml
 #   ./scripts/install_field_service.sh --dry-run --site /path/to/site.yaml
 #   sudo ./scripts/install_field_service.sh --uninstall [--purge]
 #
 # Paths: --prefix (default /opt/dmr-field), --conf-dir (/etc/dmr-field),
 # --state-dir (/var/lib/dmr-field), --user (shahar).
+#
+# Capture settings, each optional and each left at the example's value when
+# omitted: --band, --center-frequency, --sample-rate, --duration, --driver,
+# --solve-resolution-m. Take them from `dmr-surveyor survey preflight` against
+# this Pi's storage rather than guessing -- the CLI's own fallback of 5 MS/s
+# for 90 s has already been shown here to outrun the write rate, and storage
+# that cannot keep up drops samples instead of refusing.
+#
+# IF gain reduction and LNA state are not settable here: they come from the
+# site profile given by --site.
 #
 # Run it from the deployment checkout, not from a development machine. It is
 # safe to re-run: the token and the TLS pair are created once and then left
@@ -27,6 +37,15 @@ FIELDCTL_TARGET="/usr/local/bin/fieldctl"
 SERVICE_USER="shahar"
 SERVICE_GROUP=""
 SITE_PROFILE=""
+# Empty means "leave the example's value alone". The installer does not
+# invent capture settings: the values that belong here come from
+# `dmr-surveyor survey preflight` against the storage this Pi actually has.
+BAND_PROFILE=""
+CENTER_FREQUENCY=""
+SAMPLE_RATE=""
+DURATION=""
+DRIVER=""
+SOLVE_RESOLUTION_M=""
 DRY_RUN=0
 UNINSTALL=0
 PURGE=0
@@ -62,6 +81,12 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --site)      SITE_PROFILE="${2:?--site needs a path}"; shift 2 ;;
         --prefix)    PREFIX="${2:?--prefix needs a path}"; shift 2 ;;
+        --band)              BAND_PROFILE="${2:?--band needs a name or path}"; shift 2 ;;
+        --center-frequency)  CENTER_FREQUENCY="${2:?--center-frequency needs a value in Hz}"; shift 2 ;;
+        --sample-rate)       SAMPLE_RATE="${2:?--sample-rate needs a value in samples/s}"; shift 2 ;;
+        --duration)          DURATION="${2:?--duration needs a value in seconds}"; shift 2 ;;
+        --driver)            DRIVER="${2:?--driver needs a SoapySDR driver name}"; shift 2 ;;
+        --solve-resolution-m) SOLVE_RESOLUTION_M="${2:?--solve-resolution-m needs a value in metres}"; shift 2 ;;
         --conf-dir)  CONF_DIR="${2:?--conf-dir needs a path}"; shift 2 ;;
         --state-dir) STATE_DIR="${2:?--state-dir needs a path}"; shift 2 ;;
         --user)      SERVICE_USER="${2:?--user needs a name}"; shift 2 ;;
@@ -186,14 +211,40 @@ if [[ -f "$ENV_FILE" ]]; then
     ok "keeping the existing ${ENV_FILE}; delete it to regenerate from the example"
 else
     render_env() {
-        sed -e "s|^FIELD_SURVEYOR_BIN=.*|FIELD_SURVEYOR_BIN=${VENV_DIR}/bin/dmr-surveyor|" \
-            -e "s|^FIELD_SITE=.*|FIELD_SITE=${SITE_PROFILE}|" \
-            -e "s|^FIELD_TOKEN_FILE=.*|FIELD_TOKEN_FILE=${TOKEN_FILE}|" \
-            -e "s|^FIELD_OUTPUT=.*|FIELD_OUTPUT=${STATE_DIR}|" \
-            -e "s|^FIELD_DATABASE=.*|FIELD_DATABASE=${STATE_DIR}/inventory/dmr_inventory.sqlite3|" \
-            -e "s|^FIELD_TLS_CERT=.*|FIELD_TLS_CERT=${STATE_DIR}/tls/field-app.crt|" \
-            -e "s|^FIELD_TLS_KEY=.*|FIELD_TLS_KEY=${STATE_DIR}/tls/field-app.key|" \
-            "${ROOT_DIR}/deploy/field.env.example"
+        # Only the paths this installer actually decides are rewritten
+        # unconditionally. Every capture setting is rewritten only when it
+        # was given, so omitting a flag leaves the example's documented
+        # value rather than blanking it -- a blank there would put the
+        # service back on the CLI's implicit defaults, which is the failure
+        # this option set exists to prevent.
+        local -a edits=(
+            -e "s|^FIELD_SURVEYOR_BIN=.*|FIELD_SURVEYOR_BIN=${VENV_DIR}/bin/dmr-surveyor|"
+            -e "s|^FIELD_SITE=.*|FIELD_SITE=${SITE_PROFILE}|"
+            -e "s|^FIELD_TOKEN_FILE=.*|FIELD_TOKEN_FILE=${TOKEN_FILE}|"
+            -e "s|^FIELD_OUTPUT=.*|FIELD_OUTPUT=${STATE_DIR}|"
+            -e "s|^FIELD_DATABASE=.*|FIELD_DATABASE=${STATE_DIR}/inventory/dmr_inventory.sqlite3|"
+            -e "s|^FIELD_TLS_CERT=.*|FIELD_TLS_CERT=${STATE_DIR}/tls/field-app.crt|"
+            -e "s|^FIELD_TLS_KEY=.*|FIELD_TLS_KEY=${STATE_DIR}/tls/field-app.key|"
+        )
+        if [[ -n "$BAND_PROFILE" ]]; then
+            edits+=( -e "s|^FIELD_BAND=.*|FIELD_BAND=${BAND_PROFILE}|" )
+        fi
+        if [[ -n "$CENTER_FREQUENCY" ]]; then
+            edits+=( -e "s|^FIELD_CENTER_FREQUENCY=.*|FIELD_CENTER_FREQUENCY=${CENTER_FREQUENCY}|" )
+        fi
+        if [[ -n "$SAMPLE_RATE" ]]; then
+            edits+=( -e "s|^FIELD_SAMPLE_RATE=.*|FIELD_SAMPLE_RATE=${SAMPLE_RATE}|" )
+        fi
+        if [[ -n "$DURATION" ]]; then
+            edits+=( -e "s|^FIELD_DURATION=.*|FIELD_DURATION=${DURATION}|" )
+        fi
+        if [[ -n "$DRIVER" ]]; then
+            edits+=( -e "s|^FIELD_DRIVER=.*|FIELD_DRIVER=${DRIVER}|" )
+        fi
+        if [[ -n "$SOLVE_RESOLUTION_M" ]]; then
+            edits+=( -e "s|^FIELD_SOLVE_RESOLUTION_M=.*|FIELD_SOLVE_RESOLUTION_M=${SOLVE_RESOLUTION_M}|" )
+        fi
+        sed "${edits[@]}" "${ROOT_DIR}/deploy/field.env.example"
     }
     if (( DRY_RUN )); then
         printf '    would: write %s containing --\n' "$ENV_FILE"
@@ -216,7 +267,7 @@ if [[ -f "$CERT_FILE" ]]; then
     # the old certificate is sent back to the browser's warning page.
     ok "keeping the existing certificate at ${CERT_FILE}"
 elif (( DRY_RUN )); then
-    printf '    would: issue a certificate into %s/tls covering the Tailscale address and MagicDNS name\n' "$STATE_DIR"
+    printf '    would: issue a certificate into %s covering the Tailscale address and MagicDNS name\n' "${STATE_DIR}/tls"
 else
     TS_HOSTS=()
     if command -v tailscale >/dev/null 2>&1; then
@@ -230,14 +281,21 @@ else
     fi
     TS_HOSTS+=("$(hostname)" "$(hostname).local")
     printf '    covering: %s\n' "${TS_HOSTS[*]}"
-    FIELD_TLS_HOSTS="${TS_HOSTS[*]}" "$VENV_DIR/bin/python" - <<'PYEOF' || die "could not issue a certificate"
+    FIELD_TLS_HOSTS="${TS_HOSTS[*]}" "$VENV_DIR/bin/python" - "${STATE_DIR}/tls" <<'PYEOF' || die "could not issue a certificate"
 import os
 import sys
 
 from dmr_iq_surveyor.web.tls import ensure_self_signed
 
+# The directory is an argument, with no default. This program used to fall
+# back to a hardcoded path when given none, and the caller gave none -- so an
+# install using --state-dir wrote its certificate somewhere the service never
+# looked, and the service then failed to start on a missing --tls-cert, after
+# the installer had reported success. Guessing is worse than stopping.
+if len(sys.argv) < 2:
+    raise SystemExit("internal error: the TLS directory was not passed")
 hosts = [h for h in os.environ.get("FIELD_TLS_HOSTS", "").split() if h]
-certificate = ensure_self_signed(sys.argv[1] if len(sys.argv) > 1 else "/var/lib/dmr-field/tls", hosts=hosts)
+certificate = ensure_self_signed(sys.argv[1], hosts=hosts)
 print(f"    certificate {certificate.certificate_path}")
 print(f"    valid for:  {', '.join(certificate.hosts)}")
 print(f"    expires:    {certificate.not_after}")

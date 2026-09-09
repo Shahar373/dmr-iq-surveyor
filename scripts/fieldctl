@@ -55,6 +55,11 @@ load_env() {
     : "${FIELD_PORT:=8765}"
     : "${FIELD_SITE:=}"
     : "${FIELD_BAND:=central_800_narrow}"
+    : "${FIELD_CENTER_FREQUENCY:=867406250}"
+    : "${FIELD_SAMPLE_RATE:=5000000}"
+    : "${FIELD_DURATION:=90}"
+    : "${FIELD_DRIVER:=sdrplay}"
+    : "${FIELD_SOLVE_RESOLUTION_M:=250}"
     : "${FIELD_OUTPUT:=/var/lib/dmr-field}"
     : "${FIELD_DATABASE:=/var/lib/dmr-field/inventory/dmr_inventory.sqlite3}"
     : "${FIELD_KEEP_RECORDINGS:=1}"
@@ -111,12 +116,31 @@ build_argv() {
     #
     # --verbose is deliberately absent. It logs request lines, and those carry
     # ?token= for the event stream and the export download.
+    #
+    # The capture settings are passed explicitly rather than left to the
+    # CLI's defaults. Nobody is watching this process start, so a default
+    # that is never named is a default nobody reads -- and the pair the CLI
+    # falls back to, 5 MS/s for 90 s, is 1.68 GiB per stop and has already
+    # been shown on this hardware to outrun what the storage can sustain.
+    # Storage that cannot keep up drops samples rather than refusing, so the
+    # failure arrives as a quietly damaged recording. Naming them here also
+    # means `fieldctl print-command` and `fieldctl status` show what is
+    # actually in effect.
+    #
+    # IF gain reduction and LNA state are deliberately absent: they come from
+    # the site profile, which is where the field guide puts them, and the app
+    # reports at startup which source it used.
     ARGV=(
         "$FIELD_SURVEYOR_BIN" web serve
         --host "$host"
         --port "$FIELD_PORT"
         --site "$FIELD_SITE"
         --band "$FIELD_BAND"
+        --center-frequency "$FIELD_CENTER_FREQUENCY"
+        --sample-rate "$FIELD_SAMPLE_RATE"
+        --duration "$FIELD_DURATION"
+        --driver "$FIELD_DRIVER"
+        --solve-resolution-m "$FIELD_SOLVE_RESOLUTION_M"
         --database "$FIELD_DATABASE"
         --output "$FIELD_OUTPUT"
         --keep-recordings "$FIELD_KEEP_RECORDINGS"
@@ -268,6 +292,13 @@ cmd_status() {
     fi
 
     printf 'site     %s\n' "${FIELD_SITE:-UNSET -- the service cannot start}"
+    printf 'band     %s\n' "$FIELD_BAND"
+    # Printed because these decide whether a stop is recordable at all on
+    # this storage, and because the values in effect are otherwise invisible
+    # until a capture has already failed.
+    printf 'capture  %s Hz, %s S/s, %ss, driver %s, solve %s m\n' \
+        "$FIELD_CENTER_FREQUENCY" "$FIELD_SAMPLE_RATE" "$FIELD_DURATION" \
+        "$FIELD_DRIVER" "$FIELD_SOLVE_RESOLUTION_M"
 
     if api_get /api/state >/dev/null 2>&1; then
         printf 'api      reachable\n'

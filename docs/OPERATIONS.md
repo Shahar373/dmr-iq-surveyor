@@ -61,20 +61,64 @@ campaign-specific and stays out of Git.
 
 ```bash
 sudo install -d -m 0755 /etc/dmr-field/sites
-sudo cp /opt/dmr-field/app/config/sites/home.example.yaml /etc/dmr-field/sites/g4_field.yaml
-sudoedit /etc/dmr-field/sites/g4_field.yaml     # record the real antenna, receiver, gain, lna_state
+sudo cp /opt/dmr-field/app/config/sites/home.example.yaml /etc/dmr-field/sites/<your-site>.yaml
+sudoedit /etc/dmr-field/sites/<your-site>.yaml   # record the real antenna, receiver, gain, lna_state
 ```
 
 There is no default. `web serve` reads its capture gain from this file, so a
 guessed one records every stop against the wrong equipment context.
 
-### 4. Read what the installer would do, then do it
+### 4. Choose the capture settings with preflight, not by guessing
+
+The service passes the capture settings explicitly on every start, so they are
+visible in `fieldctl status` rather than left to the CLI's defaults. Those
+defaults are 5 MS/s for 90 s — 1.68 GiB per stop — and storage that cannot
+sustain that write rate **drops samples rather than refusing**, so the failure
+arrives as a quietly damaged recording rather than an error.
+
+Measure this Pi's storage first:
+
+```bash
+/opt/dmr-field/venv/bin/dmr-surveyor survey preflight /var/lib/dmr-field/recordings \
+  --band <band> --sample-rate <rate> --duration <seconds>
+```
+
+It reports the highest sample rate the storage can actually sustain. Pass what
+you settle on to the installer.
+
+### 5. Read what the installer would do, then do it
 
 ```bash
 cd /opt/dmr-field/app
-./scripts/install_field_service.sh --dry-run --site /etc/dmr-field/sites/g4_field.yaml
-sudo ./scripts/install_field_service.sh --site /etc/dmr-field/sites/g4_field.yaml
+./scripts/install_field_service.sh --dry-run \
+  --site /etc/dmr-field/sites/<your-site>.yaml \
+  --band <name or absolute path> \
+  --center-frequency <Hz> --sample-rate <samples/s> --duration <seconds> \
+  --driver sdrplay --solve-resolution-m <metres>
 ```
+
+Then the same command with `sudo` and without `--dry-run`.
+
+Every capture flag is optional; omitting one keeps the value documented in
+`deploy/field.env.example` rather than blanking it. They can also be edited
+later in `/etc/dmr-field/field.env` followed by `fieldctl restart`.
+
+| Flag | Variable | Passed to `web serve` as |
+|---|---|---|
+| `--band` | `FIELD_BAND` | `--band` |
+| `--center-frequency` | `FIELD_CENTER_FREQUENCY` | `--center-frequency` |
+| `--sample-rate` | `FIELD_SAMPLE_RATE` | `--sample-rate` |
+| `--duration` | `FIELD_DURATION` | `--duration` |
+| `--driver` | `FIELD_DRIVER` | `--driver` |
+| `--solve-resolution-m` | `FIELD_SOLVE_RESOLUTION_M` | `--solve-resolution-m` |
+
+IF gain reduction and LNA state are **not** settable here. They come from the
+site profile, which is where the field guide puts them, and the app prints at
+startup which source it used. A second place to set them would be a second
+thing to keep in step.
+
+A campaign-specific band profile belongs outside the checkout, named by
+absolute path, the same way the site profile is.
 
 `--dry-run` prints every action and changes nothing; it calls neither `sudo`
 nor `systemctl` nor `openssl`. Run it first.
@@ -84,7 +128,7 @@ The real run generates the token once, issues the TLS pair once, writes
 service at boot. It is safe to re-run: an existing token and an existing
 certificate are kept, never replaced.
 
-### 5. Start it and look
+### 6. Start it and look
 
 ```bash
 sudo systemctl start dmr-field.service
@@ -115,7 +159,7 @@ tailnet, and the bookmark works.
 cd /opt/dmr-field/app
 sudo git pull
 sudo /opt/dmr-field/venv/bin/pip install -e .
-sudo ./scripts/install_field_service.sh --site /etc/dmr-field/sites/g4_field.yaml
+sudo ./scripts/install_field_service.sh --site /etc/dmr-field/sites/<your-site>.yaml
 sudo systemctl restart dmr-field.service
 fieldctl status
 ```
@@ -145,6 +189,11 @@ hotspot address in `/etc/dmr-field/field.env.local` and restart.
 trying. That is a fast, repeating failure — an unreadable token file, a site
 profile that does not resolve — not a slow tailnet. Read `fieldctl logs -n 50`,
 fix the cause, then `sudo systemctl reset-failed dmr-field.service` and start it.
+
+**Recordings are damaged, or a stop reports dropped samples.** The sample
+rate is beyond what this storage sustains. Re-run `survey preflight` (step 4),
+then lower `FIELD_SAMPLE_RATE` or `FIELD_DURATION` in `/etc/dmr-field/field.env`
+and `fieldctl restart`. `fieldctl status` shows the values in effect.
 
 **The app loads but every capture fails.** Almost always the virtualenv:
 `/opt/dmr-field/venv/bin/python -c 'import SoapySDR'`. If that fails, re-run

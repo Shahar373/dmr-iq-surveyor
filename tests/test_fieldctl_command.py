@@ -372,3 +372,98 @@ def test_render_unit_requires_all_four_substitutions(tmp_path: Path) -> None:
     result = _run(_config(tmp_path), "render-unit", "svcuser")
     assert result.returncode != 0
     assert "usage: fieldctl" in result.stderr
+
+
+# -- capture settings -----------------------------------------------------
+
+CAPTURE_SETTINGS = {
+    "FIELD_BAND": "/etc/dmr-field/bands/p25_868_smoke.yaml",
+    "FIELD_CENTER_FREQUENCY": "868200000",
+    "FIELD_SAMPLE_RATE": "768000",
+    "FIELD_DURATION": "30",
+    "FIELD_DRIVER": "sdrplay",
+    "FIELD_SOLVE_RESOLUTION_M": "250",
+}
+
+
+@pytest.mark.parametrize(
+    ("variable", "flag"),
+    [
+        ("FIELD_BAND", "--band"),
+        ("FIELD_CENTER_FREQUENCY", "--center-frequency"),
+        ("FIELD_SAMPLE_RATE", "--sample-rate"),
+        ("FIELD_DURATION", "--duration"),
+        ("FIELD_DRIVER", "--driver"),
+        ("FIELD_SOLVE_RESOLUTION_M", "--solve-resolution-m"),
+    ],
+)
+def test_each_capture_setting_reaches_the_argv(
+    tmp_path: Path, variable: str, flag: str
+) -> None:
+    """Left out of the argv, each of these silently fell back to the CLI's
+    own default. Nobody is watching the service start, so a default nobody
+    passes is a default nobody reads."""
+    argv = _argv(tmp_path, **CAPTURE_SETTINGS)
+    assert flag in argv
+    assert argv[argv.index(flag) + 1] == CAPTURE_SETTINGS[variable]
+
+
+def test_the_capture_settings_are_always_passed_even_when_unconfigured(
+    tmp_path: Path,
+) -> None:
+    """The point is that the values are explicit, not that they differ from
+    the CLI's defaults. An install that chose nothing must still name what it
+    is using, so `print-command` and `status` can show it."""
+    argv = _argv(tmp_path)
+    for flag in (
+        "--center-frequency", "--sample-rate", "--duration",
+        "--driver", "--solve-resolution-m",
+    ):
+        assert flag in argv, f"{flag} must be passed even at its default value"
+
+
+def test_the_sample_rate_and_duration_that_outran_the_storage_are_overridable(
+    tmp_path: Path,
+) -> None:
+    """The concrete failure this exists to prevent: 5 MS/s for 90 s is
+    1.68 GiB per stop, and storage that cannot sustain the write rate drops
+    samples rather than refusing, so it arrives as a quietly damaged
+    recording rather than an error."""
+    argv = _argv(tmp_path, FIELD_SAMPLE_RATE="768000", FIELD_DURATION="30")
+    assert argv[argv.index("--sample-rate") + 1] == "768000"
+    assert argv[argv.index("--duration") + 1] == "30"
+    assert "5000000" not in argv
+    assert "90" not in argv
+
+
+def test_gain_and_lna_are_left_to_the_site_profile(tmp_path: Path) -> None:
+    """Deliberately not settable here. The site profile is the one file the
+    field guide tells an operator to fill in, and the app reports at startup
+    which source it used; a second place to set them would be a second thing
+    to keep in step."""
+    argv = _argv(tmp_path, **CAPTURE_SETTINGS)
+    assert "--if-gain-reduction" not in argv
+    assert "--lna-state" not in argv
+
+
+def test_capture_settings_can_come_from_the_environment_file(tmp_path: Path) -> None:
+    """The real path: systemd reads them from /etc/dmr-field/field.env."""
+    env_file = tmp_path / "field.env"
+    env_file.write_text(
+        "\n".join(f"{key}={value}" for key, value in CAPTURE_SETTINGS.items()) + "\n",
+        encoding="utf-8",
+    )
+    argv = _argv(tmp_path, FIELD_ENV_FILE=str(env_file))
+    assert argv[argv.index("--sample-rate") + 1] == "768000"
+    assert argv[argv.index("--band") + 1] == CAPTURE_SETTINGS["FIELD_BAND"]
+
+
+def test_status_reports_the_capture_settings_in_effect(tmp_path: Path) -> None:
+    """They decide whether a stop is recordable at all on this storage, and
+    are otherwise invisible until a capture has already failed."""
+    result = _run(_config(tmp_path, **CAPTURE_SETTINGS), "status")
+    assert result.returncode == 0, result.stderr
+    assert "768000" in result.stdout
+    assert "868200000" in result.stdout
+    assert "sdrplay" in result.stdout
+    assert CAPTURE_SETTINGS["FIELD_BAND"] in result.stdout

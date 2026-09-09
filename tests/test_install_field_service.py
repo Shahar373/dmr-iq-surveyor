@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "scripts" / "install_field_service.sh"
@@ -166,3 +169,101 @@ def test_the_installer_follows_the_repository_shell_conventions() -> None:
     lines = INSTALLER.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "#!/usr/bin/env bash"
     assert "set -euo pipefail" in lines
+
+
+# -- capture settings the installer can set -------------------------------
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "variable"),
+    [
+        ("--band", "/etc/dmr-field/bands/p25_868_smoke.yaml", "FIELD_BAND"),
+        ("--center-frequency", "868200000", "FIELD_CENTER_FREQUENCY"),
+        ("--sample-rate", "768000", "FIELD_SAMPLE_RATE"),
+        ("--duration", "30", "FIELD_DURATION"),
+        ("--driver", "sdrplay", "FIELD_DRIVER"),
+        ("--solve-resolution-m", "250", "FIELD_SOLVE_RESOLUTION_M"),
+    ],
+)
+def test_each_capture_setting_can_be_chosen_at_install_time(
+    tmp_path: Path, flag: str, value: str, variable: str
+) -> None:
+    """The values belong to a campaign and to the storage measured by
+    preflight, not to the repository, so they are given here rather than
+    baked into the example."""
+    result = _run(tmp_path, "--dry-run", *_sandbox(tmp_path), flag, value)
+    assert result.returncode == 0, result.stderr
+    assert f"{variable}={value}" in result.stdout
+
+
+def test_an_omitted_capture_setting_keeps_the_documented_value(
+    tmp_path: Path,
+) -> None:
+    """Blanking it instead would put the service back on the CLI's implicit
+    defaults, which is the failure these options exist to prevent."""
+    result = _run(tmp_path, "--dry-run", *_sandbox(tmp_path), "--sample-rate", "768000")
+    assert "FIELD_SAMPLE_RATE=768000" in result.stdout
+    assert "FIELD_DURATION=90" in result.stdout, "unset settings keep the example's value"
+    assert "FIELD_DURATION=\n" not in result.stdout
+
+
+def test_gain_and_lna_are_not_installer_options(tmp_path: Path) -> None:
+    """They come from the site profile; a second place to set them would be a
+    second thing to keep in step."""
+    result = _run(tmp_path, "--dry-run", *_sandbox(tmp_path),
+                  "--if-gain-reduction", "25")
+    assert result.returncode != 0
+    assert "unknown argument" in result.stderr
+
+
+# -- the certificate must follow --state-dir ------------------------------
+
+
+def _embedded_python_program() -> str:
+    """The heredoc the installer feeds to the deployment venv's interpreter."""
+    source = INSTALLER.read_text(encoding="utf-8")
+    # Everything after the newline that ends the invocation line, up to the
+    # closing delimiter -- the rest of that line is shell, not Python.
+    after_delimiter = source.split("<<'PYEOF'", 1)[1]
+    return after_delimiter.split("\n", 1)[1].split("\nPYEOF", 1)[0]
+
+
+def test_the_certificate_is_issued_into_the_configured_state_directory(
+    tmp_path: Path,
+) -> None:
+    """The dry run has to name the directory the real run would use. This one
+    was already correct before the fix -- the three tests below are what
+    distinguish the broken real path from the repaired one -- but it is what
+    an operator reads before committing to an install, so it is pinned too."""
+    result = _run(tmp_path, "--dry-run", *_sandbox(tmp_path))
+    assert f"{tmp_path / 'state' / 'tls'}" in result.stdout
+    assert "/var/lib/dmr-field/tls" not in result.stdout
+
+
+def test_the_installer_passes_the_state_directory_to_the_interpreter() -> None:
+    """The old implementation ran `python -` with no argument at all, so no
+    amount of correctness inside the program could have saved it."""
+    source = INSTALLER.read_text(encoding="utf-8")
+    assert '"$VENV_DIR/bin/python" - "${STATE_DIR}/tls" <<' in source
+
+
+def test_the_embedded_program_has_no_hardcoded_certificate_directory() -> None:
+    source = _embedded_python_program()
+    assert "/var/lib/dmr-field/tls" not in source
+    assert "sys.argv[1]" in source
+
+
+def test_the_embedded_program_refuses_to_guess_when_given_no_directory(
+    tmp_path: Path,
+) -> None:
+    """Behavioural, and the sharpest distinction between the old code and the
+    new: run the program the installer actually embeds, with no argument. The
+    old one silently issued into /var/lib/dmr-field/tls; this one exits."""
+    program = tmp_path / "issue_cert.py"
+    program.write_text(_embedded_python_program(), encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(program)],
+        capture_output=True, text=True, timeout=60, cwd=REPO_ROOT, check=False,
+    )
+    assert result.returncode != 0
+    assert "TLS directory was not passed" in (result.stdout + result.stderr)
