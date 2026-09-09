@@ -134,3 +134,11 @@ def test_web_serve_accepts_a_token_file_option_that_defaults_to_off() -> None:
     """Additive: the new option exists and changes nothing unless passed."""
     parameter = inspect.signature(web_serve).parameters["token_file"]
     assert parameter.default is None
+
+
+def test_an_empty_token_flag_still_prints_a_bare_url() -> None:
+    """Unchanged existing behaviour, and an easy one to lose: `--token ""`
+    resolves to an empty string, which the server treats as "no token
+    configured". The printed URL carried no query string before this helper
+    existed, and must not start carrying `?token=` now."""
+    assert token_query_suffix(resolve_token("", None)) == ""

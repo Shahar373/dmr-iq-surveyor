@@ -324,3 +324,51 @@ def test_url_refuses_when_the_token_file_is_empty(tmp_path: Path) -> None:
     empty.chmod(0o600)
     result = _run(_config(tmp_path, FIELD_TOKEN_FILE=str(empty)), "url")
     assert result.returncode != 0
+
+
+# -- diagnosis must not leak the credential it reports on -----------------
+
+
+def test_status_never_prints_the_token_value(tmp_path: Path) -> None:
+    """`fieldctl status` is the command an operator runs and pastes into a
+    chat when something is wrong. It reports the token file's path and mode
+    and nothing else about it -- and it reaches the API through a curl config
+    file rather than an -H argument, so the value does not reach argv either."""
+    result = _run(_config(tmp_path), "status")
+    assert result.returncode == 0, result.stderr
+    assert TOKEN_VALUE not in result.stdout
+    assert TOKEN_VALUE not in result.stderr
+    assert "mode 600" in result.stdout
+
+
+def test_status_reports_the_address_it_would_bind(tmp_path: Path) -> None:
+    """Checked against the bound address, not loopback: binding one specific
+    address is the design, so a 127.0.0.1 probe would always say "not
+    listening" and always be wrong."""
+    result = _run(_config(tmp_path), "status")
+    assert "100.90.110.54:8765" in result.stdout
+
+
+def test_status_says_so_when_no_address_can_be_resolved(tmp_path: Path) -> None:
+    result = _run(_config(tmp_path, FIELD_TAILSCALE_IP=""), "status")
+    assert "UNRESOLVED" in result.stdout
+
+
+# -- rendering the unit ---------------------------------------------------
+
+
+def test_render_unit_leaves_no_placeholder_behind(tmp_path: Path) -> None:
+    result = _run(_config(tmp_path), "render-unit", "svcuser", "svcgroup",
+                  "/opt/dmr-field/app", "/usr/local/bin/fieldctl")
+    assert result.returncode == 0, result.stderr
+    assert not re.search(r"@[A-Z_]+@", result.stdout)
+    assert "User=svcuser" in result.stdout
+    assert "Group=svcgroup" in result.stdout
+    assert "WorkingDirectory=/opt/dmr-field/app" in result.stdout
+    assert "ExecStart=/usr/local/bin/fieldctl exec" in result.stdout
+
+
+def test_render_unit_requires_all_four_substitutions(tmp_path: Path) -> None:
+    result = _run(_config(tmp_path), "render-unit", "svcuser")
+    assert result.returncode != 0
+    assert "usage: fieldctl" in result.stderr

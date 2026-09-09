@@ -204,7 +204,10 @@ def token_query_suffix(resolved: ResolvedToken) -> str:
     whole purpose is to keep the secret out of this process's output, and the
     startup banner is captured by journald when the app runs as a service.
     """
-    if resolved.value is None or resolved.source == "file":
+    # `not resolved.value`, not `is None`: `--token ""` resolves to an empty
+    # string, which `_authorised` treats as "no token configured". It printed
+    # a bare URL before this helper existed and must keep doing so.
+    if not resolved.value or resolved.source == "file":
         return ""
     return f"?token={resolved.value}"
 
