@@ -62,6 +62,26 @@ class _Handler(BaseHTTPRequestHandler):
         if getattr(self.server, "verbose", False):  # type: ignore[attr-defined]
             super().log_message(format, *args)
 
+    def end_headers(self) -> None:
+        """Emit `Referrer-Policy: no-referrer` on every response.
+
+        The shared token arrives in the page's own URL (`?token=...`), because
+        static assets are served unauthenticated so that `app.js` can load and
+        read it out of `location.search`. That means the token sits in
+        `document.location` for the lifetime of the tab -- and by default a
+        browser puts the referring URL into the `Referer` header of every
+        request the page makes to another origin. The map tiles are exactly
+        such a request: with the shipped `--tile-url` the phone would send the
+        token to `tile.openstreetmap.org` on every tile.
+
+        Set here, in the one place every response path passes through --
+        `_send_json`, `_serve_static`, the SSE stream, the export download and
+        the base class's own `send_error` -- rather than at each call site,
+        because the one that gets forgotten is the one that leaks.
+        """
+        self.send_header("Referrer-Policy", "no-referrer")
+        super().end_headers()
+
     def _send_json(self, payload: Any, status: int = 200) -> None:
         if self._response_started:
             # Headers or body bytes are already on the wire (a static file, or
