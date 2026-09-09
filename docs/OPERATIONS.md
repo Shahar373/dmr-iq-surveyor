@@ -54,6 +54,11 @@ sudo VENV=/opt/dmr-field/venv bash /opt/dmr-field/app/scripts/pi_soapysdr_setup.
 /opt/dmr-field/venv/bin/python -c 'import SoapySDR; print("ok")'
 ```
 
+`VENV=` is what points the script at the deployment's virtualenv. Without it
+the script works on the checkout's own `.venv`, which is the right default for
+a batch-analysis install and the wrong one here — the service runs from
+`/opt/dmr-field/venv`, not from anything inside `/opt/dmr-field/app`.
+
 ### 3. Put your site profile somewhere outside the checkout
 
 The site profile records the antenna, receiver and fixed gain. It is
@@ -194,6 +199,13 @@ fix the cause, then `sudo systemctl reset-failed dmr-field.service` and start it
 rate is beyond what this storage sustains. Re-run `survey preflight` (step 4),
 then lower `FIELD_SAMPLE_RATE` or `FIELD_DURATION` in `/etc/dmr-field/field.env`
 and `fieldctl restart`. `fieldctl status` shows the values in effect.
+
+**The installer stopped partway.** Nothing is half-installed: it does every
+check before the first step that changes anything, and the token, the
+certificate and `field.env` are each created once and then left alone. Fix
+what it reported and run the same command again. If it stopped at the
+SoapySDR check, run step 2 — with `VENV=` naming the deployment virtualenv,
+not the checkout's — and then re-run the installer.
 
 **The app loads but every capture fails.** Almost always the virtualenv:
 `/opt/dmr-field/venv/bin/python -c 'import SoapySDR'`. If that fails, re-run
