@@ -114,7 +114,7 @@ at 1 Hz) that is never persisted to disk. There is no `live replay` command and 
 device-timestamped GPS trace, so a field anomaly (such as the repeating-bin symptom above) cannot
 currently be reproduced offline from what was recorded during the drive that exhibited it.
 
-## Field app: `/api/state` SDR-probe hang (fixed in this branch, not yet field-validated)
+## Field app: `/api/state` SDR-probe hang (fixed in this branch, field-validated 2026-09-09)
 
 A field attempt on commit `9e5dfbe` failed operationally: the app never left its `connecting…` /
 `disk…` placeholders. `GET /api/state` called `probe_soapysdr()` synchronously on the request
@@ -135,14 +135,20 @@ This branch (`stabilize/p25-geolocation-v0.10`, commits `b8133d4` through `3412f
 the SDR probe now runs out-of-process on its own bounded timeout (`capture/probe.py`), a cached
 single-flight monitor serves `/api/state` from memory (`web/devices.py`), a `Rescan SDR` control lets
 the operator recheck without restarting the server, and the frontend's own fetch has a hard timeout
-and shows every device state instead of hanging on the placeholder. **The fix is proven against a
-stub SDR in the automated test suite (`tests/test_web_device_state.py`,
-`tests/test_capture_probe_runner.py`, `tests/test_web_bootstrap.py`) and in local browser smoke
-tests, but it has not yet been field-validated on real hardware.** G4's status is
-**FAILED/PARTIAL on `9e5dfbe`; not yet rerun on the fix** -- a PASS requires an actual re-run of
-`docs/validation/pi-smoke-v0.10.md`'s full protocol on the Pi, on a commit at or after `3412f6e`.
+and shows every device state instead of hanging on the placeholder.
 
-Two limitations in the surrounding capture path are known and intentionally not addressed here:
+**G4 passed on 2026-09-09**, rerun on commit `f33f69b` staged on the Raspberry Pi 5 with the RSP1A
+attached. The bounded probe returned `available` in about 1.54 s; 50 consecutive `/api/state`
+requests all succeeded (min 0.023 s, avg 0.024 s, max 0.035 s) with the server's thread count
+unchanged at 8 before and after; a 30 s capture completed with `complete=True`, `timed_out=False`,
+`overflow_count=0` and all 23,040,000 frames written; and the operator confirmed by hand that
+unplugging the RSP1A showed "No SDR", that a capture attempted while it was unplugged was refused,
+and that replugging plus `Rescan SDR` returned the app to `available` without restarting the server.
+The earlier failure on `9e5dfbe` stands as recorded -- it is this issue's history, not its current
+state. Full evidence, including what the rerun did not cover and one duplicate request that was
+observed, is in `docs/validation/pi-smoke-v0.10.md`, "G4 rerun — PASS on `f33f69b` (2026-09-09)".
+
+Three limitations in the surrounding capture path are known and intentionally not addressed here:
 
 - **`SoapyIqDevice.open()` still has no timeout.** The fix bounds `enumerate()` (the probe), not
   `open()` (which happens later, once a capture actually starts). A thread-based timeout around it
@@ -154,6 +160,14 @@ Two limitations in the surrounding capture path are known and intentionally not 
   bounded join window for it to be reaped; if the kernel has it parked in D-state, that wait still
   elapses and `close()` then returns anyway rather than blocking the server further. This guarantees
   the server never hangs on such a child -- it does not guarantee the child itself is gone.
+- **`POST /api/capture` is not idempotent, and a duplicate submission was observed during the G4
+  rerun.** The operator pressed `Record` once, and a second `POST /api/capture` nevertheless reached
+  the server and was answered `409`. The recovery path then attached to the already-running job and
+  the recording completed normally, so the outcome the operator saw was correct -- but the request
+  really was duplicated, and nothing on either side deduplicates it. (A separate, earlier `409` in
+  the same session was the deliberate test of starting a capture with the SDR unplugged, and is the
+  expected refusal, not this.) Making capture submission idempotent -- a client-supplied request key,
+  or a server-side dedupe window -- is deliberately deferred and is not part of this branch.
 
 ## Documentation accuracy (fixed in this stabilization branch, listed for the PR record)
 

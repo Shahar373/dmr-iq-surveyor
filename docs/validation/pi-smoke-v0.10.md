@@ -1,15 +1,95 @@
 # Pi smoke test — v0.10.0 stabilization
 
-**Status: FAILED/PARTIAL on `9e5dfbe`; not yet rerun on the fix.** See "Field attempt" below for what
-was and was not actually exercised. This file's own checklist (§§0-9) is still a template only, empty
-because the attempt did not reach most of it; results are filled in, committed, and pushed as a
-separate, later step (gate G4b) once the smoke test in gate G4 is actually rerun on the Raspberry Pi
-against a commit at or after `3412f6e`. Every field below must be filled with a real, observed value
-or explicitly marked "not run" / "not applicable" -- never left as a plausible-looking placeholder.
+**Status: PASS on `f33f69b`, 2026-09-09.** The earlier attempt on `9e5dfbe` failed operationally and
+is kept below as history, not as the current state. What the passing rerun actually observed is
+recorded in "G4 rerun — PASS on `f33f69b` (2026-09-09)"; that section, not the §§0-9 checklist
+below, is this file's record of the run. The checklist itself remains the blank protocol template --
+its fields are "not transcribed", not "observed to be empty" -- and anything filled into it later
+must be a real, observed value or an explicit "not run" / "not applicable", never a
+plausible-looking placeholder.
 
 Do not use `--host 0.0.0.0` for this test. Bind explicitly to a Tailscale or hotspot address (see
 §0). See Plan v2, §§8-9, for the staging model this protocol assumes (detached-HEAD clone or
 worktree at a known commit; the Pi's existing checkout and `.venv` are never touched).
+
+## G4 rerun — PASS on `f33f69b` (2026-09-09)
+
+Run by the operator on the Pi staging checkout. Recorded here from the operator's report and the
+artifacts it names; this session had no access to the Pi and did not observe any of it directly.
+
+**Staging**
+
+- Commit under test: `f33f69b896936ba57013d7c29d7ba56586f5e2a2`; working tree clean.
+- Raspberry Pi 5, reported as not throttling.
+- SDRplay RSP1A, `Dev0`, serial `230405A498`.
+
+**Software checks**
+
+- Full `pytest` on the Pi: exit 0, with the one expected skip. No test count is recorded here: the
+  Pi's log was not available to the session that wrote this entry, and a count that cannot be read
+  off a log is not worth guessing.
+- `ruff`: exit 0.
+- Targeted tests plus the CI run on Python 3.11 and 3.13: green. CI for this exact commit is jobs
+  `pytest (3.11)` and `pytest (3.13)`, both `success` (Actions run 34201964056).
+
+**Bounded probe against real hardware**
+
+- `state=available`, resolved as `SDRplay Dev0 RSP1A 230405A498`.
+- Completed in about 1.54 s -- inside the 8 s probe timeout, and out-of-process, which is the whole
+  point of the fix.
+
+**`/api/state` under repeated load**
+
+- 50 of 50 requests succeeded.
+- Latency: min 0.023 s, avg 0.024 s, max 0.035 s.
+- Server thread count: 8 before, 8 after -- no per-request thread growth.
+- Device reported `available`; disk reported ready.
+
+**Operator-confirmed physical checks**
+
+- Unplugging the RSP1A showed "No SDR" in the app.
+- A capture attempted while it was unplugged was refused.
+- Replugging plus `Rescan SDR` returned the app to `available` **without restarting the server** --
+  the recovery the original failure made impossible.
+- Stop `g4_field_01` completed successfully.
+
+**Capture** (report:
+`/home/shahar/stage-data/runs/field/recordings/20260909_113637_g4_field_01_capture_report.json`)
+
+- `complete=True`, `timed_out=False`, `overflow_count=0`, `device_close_error=None`.
+- 23,040,000 of 23,040,000 frames; `actual_duration_seconds=30.0`, `elapsed_seconds=31.6627`.
+- 868.2 MHz, 768 kS/s, IFGR 25, LNA state 2, AGC off.
+- WAV size 92,160,252 bytes.
+
+**Database**
+
+- `PRAGMA integrity_check`: ok.
+- Main run: `status=ok`, `analyzed_seconds=6.0`.
+- Drive-view pass: `status=ok`, `analyzed_seconds=30.0`.
+
+**Shutdown**
+
+- No job left active; the server stopped and its port closed.
+
+### Observed during the rerun, and deliberately not fixed here
+
+`POST /api/capture` is not idempotent. The operator pressed `Record` once, and a second
+`POST /api/capture` still reached the server and was answered `409`. The recovery path then attached
+to the already-running job and the recording completed normally, so what the operator saw was
+correct -- but the duplicate request was real, and nothing on either side deduplicates it. A
+separate, earlier `409` in the same session was the deliberate test of starting a capture with the
+SDR unplugged; that one is the expected refusal and is not this problem. The idempotency fix (a
+client-supplied request key, or a server-side dedupe window) is deliberately deferred and is not
+part of this commit. This entry does not claim the session was free of errors or of duplicate
+requests.
+
+### Not covered by this record
+
+- §6 (drive mode) is not part of this rerun, which covered the stationary-stop path. The
+  `drive-view` result above is the `drive_view_for_stops` analysis pass over that stationary
+  capture, not a moving drive.
+- No GPS values are recorded here, by instruction.
+- The §§0-9 checklist below was not transcribed field by field (see the status note at the top).
 
 ## Field attempt — operational failure on commit `9e5dfbe`
 
@@ -28,11 +108,11 @@ it -- but it was not a total miss against the checklist below either:
 | §8 Hardware health | Metrics collected |
 | §9 Outcome | fail/partial (this attempt) |
 
-The fix described in this branch (`stabilize/p25-geolocation-v0.10`, commits `b8133d4` through
-`3412f6e`) has been exercised only against a stub SDR in the automated test suite and in local
-browser smoke tests (see `tests/test_web_device_state.py`, `tests/test_web_bootstrap.py`) --
-**it has not yet been field-validated on real hardware.** A PASS on this document requires an
-actual re-run of the full protocol below on the Pi, on a commit at or after `3412f6e`.
+At the time of this attempt the fix in this branch (`stabilize/p25-geolocation-v0.10`, commits
+`b8133d4` through `3412f6e`) had been exercised only against a stub SDR in the automated test suite
+and in local browser smoke tests (see `tests/test_web_device_state.py`,
+`tests/test_web_bootstrap.py`), and had not been field-validated on real hardware. It was
+field-validated afterwards, on `f33f69b` -- see "G4 rerun — PASS on `f33f69b` (2026-09-09)" above.
 
 - **Commit under test:** `9e5dfbeaf7f49fb35fff3b550a22658b667278fb` (dated 2026-09-06; the branch
   head at the time of the attempt, before any of the fix commits in this document existed).
