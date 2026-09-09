@@ -107,6 +107,12 @@ class SiteProfile:
     receiver: str | None = None
     gain_mode: str | None = None
     gain: float | None = None
+    # SDRplay LNA state (0..9-ish depending on model), the other half of a
+    # fixed manual gain -- IFGR alone does not reproduce a receiver setting,
+    # since the LNA stage sets the noise figure ahead of it. Optional and
+    # additive: a site profile written before this field existed parses to
+    # `None` here, exactly like an unset `gain`.
+    lna_state: int | None = None
     notes: str = ""
 
     def validate(self) -> None:
@@ -116,6 +122,8 @@ class SiteProfile:
             raise ProfileError("latitude must be in [-90, 90]")
         if self.longitude is not None and not -180.0 <= self.longitude <= 180.0:
             raise ProfileError("longitude must be in [-180, 180]")
+        if self.lna_state is not None and self.lna_state < 0:
+            raise ProfileError("lna_state must not be negative")
 
     @property
     def is_gain_comparable(self) -> bool:
@@ -202,6 +210,7 @@ def load_site_profile(path: str | Path) -> SiteProfile:
         receiver=(str(raw["receiver"]) if raw.get("receiver") is not None else None),
         gain_mode=(str(raw["gain_mode"]) if raw.get("gain_mode") is not None else None),
         gain=(float(raw["gain"]) if raw.get("gain") is not None else None),
+        lna_state=(int(raw["lna_state"]) if raw.get("lna_state") is not None else None),
         notes=str(raw.get("notes", "")),
     )
     profile.validate()

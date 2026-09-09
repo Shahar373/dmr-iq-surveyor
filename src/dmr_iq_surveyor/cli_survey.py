@@ -21,7 +21,12 @@ from dmr_iq_surveyor.capture.device import probe_soapysdr
 from dmr_iq_surveyor.capture.gps import resolve_gps
 from dmr_iq_surveyor.capture.preflight import run_preflight
 from dmr_iq_surveyor.reporting.export import export_survey
-from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_comparison, run_survey
+from dmr_iq_surveyor.survey.pipeline import (
+    DEFAULT_DATABASE_PATH,
+    DriveViewSettings,
+    run_comparison,
+    run_survey,
+)
 from dmr_iq_surveyor.survey.profiles import ProfileError, resolve_band_profile
 from dmr_iq_surveyor.survey.store import (
     connect_survey_database,
@@ -115,6 +120,18 @@ def survey_run(
         float | None,
         typer.Option("--longitude", help="Manual longitude for this run; takes precedence over --gps-url"),
     ] = None,
+    drive_view: Annotated[
+        bool,
+        typer.Option(
+            "--drive-view/--no-drive-view",
+            help=(
+                "Also read the recording the way a live drive bin hears it (24 spread "
+                "periodograms per 1 s window, FFT 16384) and store that as a second run "
+                "named <run_id>_drive_view, excluded from geolocation. Lets a stationary "
+                "stop be compared with drive bins on the same statistic"
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Discover RF observations in a wideband recording and store them."""
     if (latitude is None) != (longitude is None):
@@ -149,6 +166,7 @@ def survey_run(
             gps_source=gps["source"],
             gps_fetched_at_utc=gps["fetched_at_utc"],
             site_id_override=site_id,
+            drive_view=DriveViewSettings() if drive_view else None,
         )
     except (FileNotFoundError, OSError, ValueError, ProfileError, sqlite3.Error) as exc:
         console.print(f"[bold red]Survey run failed:[/bold red] {exc}")
@@ -167,6 +185,14 @@ def survey_run(
         f"{passband['usable_low_hz'] / 1e6:.6f}-{passband['usable_high_hz'] / 1e6:.6f} MHz "
         f"({result['coverage_status']})",
     )
+    view = result.get("drive_view")
+    if view:
+        table.add_row(
+            "Drive view",
+            f"{view['survey_run_id']}: {view['observation_count']} observation(s) over "
+            f"{view['windows']} window(s) of {view['frames_per_window']} frames "
+            "(excluded from geolocation)",
+        )
     table.add_row("Elapsed", f"{result['elapsed_seconds']:.3f} s")
     console.print(table)
     console.print(f"[green]Artifacts written to:[/green] {result['output_dir']}")

@@ -6,16 +6,23 @@ Read these files first:
 2. `src/dmr_iq_surveyor/iq/metadata.py`
 3. `tests/test_metadata.py`
 
-If a plan document exists under `docs/phase6-design.md` or `docs/phase6a-survey.md`, read it too —
-it is the authoritative design for the RF survey / P25 work in progress.
+If a plan document exists under `docs/phase6-design.md`, `docs/phase6a-survey.md` or
+`docs/phase7-geolocation-design.md`, read it too — those are the authoritative designs for the RF
+survey / P25 / geolocation work.
 
 ## Current state
 
 This is not a Milestone-1 prototype. The repository implements Phases 1–5.2 of an offline, passive,
 receive-only DMR survey pipeline (inspect → spectrum → detect → extract/decode → SQLite inventory →
-targeted capture), and Phase 6 (generic multi-protocol RF survey, starting with P25 in 866–870 MHz)
-is being added on top of it. Do not assume any part of the pipeline is unfinished or a stub — check
-the actual code and tests before describing what exists.
+targeted capture), Phase 6A (generic multi-protocol RF survey), live SoapySDR capture (`capture/`),
+and Phase 7 (multi-session P25 site geolocation plus a served field app: `reference/`, `geo/`,
+`web/`). Do not assume any part of the pipeline is unfinished or a stub — check the actual code and
+tests before describing what exists.
+
+What is genuinely *not* implemented is protocol decoding for P25 (Phase 6B). Site attribution is
+therefore by frequency alone (`inferred_unique`), and a frequency shared by two sites is excluded
+(`ambiguous_reuse`) rather than guessed. Do not describe a geolocation result as confirming which
+site was heard.
 
 `cli.py`, `cli_v2.py`, `cli_v3.py`, `cli_v4.py` are not competing versions. Each imports the previous
 module's `app` and adds commands for one phase; the console entry point pulls in the whole chain
@@ -38,9 +45,11 @@ these files without a specific reason tied to a phase's plan.
   bypass, or decryption. Encrypted traffic may be identified as encrypted; it is never decrypted.
 - **No premature ML.** Classification is rule/evidence-based and must be explainable. Don't add a
   learned classifier for protocol identification.
-- **No premature realtime/UI work.** Build the offline analysis pipeline first (file in, artifacts +
-  database out). Live SDR acquisition and any dashboard/UI are later, separate milestones — do not
-  start on them opportunistically while working on an earlier phase.
+- **Offline analysis is still the spine.** Every stage must work file-in, artifacts-and-database-out.
+  Live acquisition (`capture/`) and the field app (`web/`) were each explicitly authorized and are
+  built strictly as thin compositions over that spine — `web/service.py` calls `run_capture`,
+  `run_survey` and `geo.pipeline` unchanged. Do not reimplement pipeline logic inside them, and do
+  not start new realtime or UI surfaces opportunistically while working on an earlier phase.
 
 ## Memory and performance constraints
 
@@ -72,5 +81,8 @@ these files without a specific reason tied to a phase's plan.
   not part of the repository; it will not exist in a fresh clone or CI).
 - Do not infer DMR or P25 from bandwidth/spectral shape alone.
 - Do not implement UI ahead of the milestone that calls for it.
+- Do not present a geolocation posterior mode as a transmitter coordinate, or drop a site/measurement
+  that cannot be used — record the reason (`ambiguous_reuse`, `not_covered`, `frequency_unknown`,
+  `insufficient_evidence`, `unbounded_region`, `weak_geometry`) instead.
 - Do not load the full wideband recording into RAM.
 - Do not overwrite source recordings.

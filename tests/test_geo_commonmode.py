@@ -1,0 +1,493 @@
+"""Per-stop common-mode offsets, and the two-pass solve that uses them."""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import pytest
+from fixtures.geo_scenario import Transmitter, fast_solve_settings, seed_run
+
+from dmr_iq_surveyor.geo.commonmode import (
+    STATUS_ESTIMATED,
+    STATUS_INCONSISTENT,
+    STATUS_NOT_ESTIMABLE,
+    STATUS_WITHIN_NOISE,
+    CommonModeSettings,
+    estimate_offsets,
+    residuals_by_run,
+    summarise,
+)
+from dmr_iq_surveyor.geo.model import haversine_m
+from dmr_iq_surveyor.geo.pipeline import (
+    import_reference_sites,
+    materialise_measurements,
+    solve_all_sites,
+)
+from dmr_iq_surveyor.geo.store import connect_geo_database
+
+# Six sites spread across the area, so most stops hear several of them -- which
+# is the condition under which a shared offset is identifiable at all.
+TRANSMITTERS = [
+    Transmitter(866_712_500.0, 32.050, 34.800, reference_level_db=30.0, path_loss_exponent=3.2),
+    Transmitter(866_925_000.0, 32.090, 34.850, reference_level_db=30.0, path_loss_exponent=3.2),
+    Transmitter(867_025_000.0, 32.020, 34.760, reference_level_db=30.0, path_loss_exponent=3.2),
+    Transmitter(867_762_500.0, 32.075, 34.780, reference_level_db=30.0, path_loss_exponent=3.2),
+    Transmitter(868_050_000.0, 32.035, 34.845, reference_level_db=30.0, path_loss_exponent=3.2),
+    Transmitter(868_425_000.0, 32.060, 34.815, reference_level_db=30.0, path_loss_exponent=3.2),
+]
+
+STOPS = [
+    (32.045, 34.795), (32.062, 34.812), (32.038, 34.828), (32.072, 34.788),
+    (32.028, 34.772), (32.085, 34.838), (32.015, 34.808), (32.098, 34.802),
+    (32.052, 34.752), (32.048, 34.870),
+]
+
+
+def _csv() -> str:
+    header = "wacn_hex,system_id_hex,rfss,site,observation_status,primary_cc_mhz,nac_hex,notes\n"
+    rows = "".join(
+        f"BEE00,37D,1,{20 + index},DIRECT,{tx.frequency_hz / 1e6:.6f},37B,\n"
+        for index, tx in enumerate(TRANSMITTERS)
+    )
+    return header + rows
+
+
+def _campaign(tmp_path: Path, *, offset_run: str | None = None, offset_db: float = 0.0) -> Path:
+    database = tmp_path / "db.sqlite3"
+    connect_geo_database(database).close()
+    csv_path = tmp_path / "sites.csv"
+    csv_path.write_text(_csv(), encoding="utf-8")
+    import_reference_sites(csv_path, database_path=database, snapshot_id="cm")
+
+    connection = connect_geo_database(database)
+    for index, (latitude, longitude) in enumerate(STOPS):
+        seed_run(
+            connection,
+            run_id=f"stop_{index:02d}",
+            latitude=latitude,
+            longitude=longitude,
+            transmitters=TRANSMITTERS,
+            site_id=f"stop_{index:02d}",
+            capture_start_utc=f"2026-08-01T{7 + index:02d}:00:00+00:00",
+        )
+    if offset_run is not None:
+        # Every site at this one stop shifts together: an antenna knocked out
+        # of position, or local interference raising the noise floor.
+        connection.execute(
+            "UPDATE rf_observations SET snr_db = snr_db + ? WHERE survey_run_id = ?",
+            (offset_db, offset_run),
+        )
+        connection.commit()
+    connection.close()
+    materialise_measurements(database_path=database)
+    return database
+
+
+# ------------------------------------------------------------------ estimator
+
+
+def test_a_shared_offset_is_found_and_a_lone_site_is_not_guessed_at() -> None:
+    offsets = estimate_offsets(
+        {
+            "stop_0": [0.3, -0.5, 0.8, 0.1],
+            "stop_1": [-0.2, 0.4, -0.6, 0.2],
+            "stop_2": [0.1, 0.0, -0.3, 0.5],
+            "stop_bad": [-7.1, -6.8, -7.4, -6.9],
+            "stop_thin": [1.2],
+        }
+    )
+    assert offsets["stop_bad"].status == STATUS_ESTIMATED
+    assert offsets["stop_bad"].offset_db == pytest.approx(-7.0, abs=0.3)
+    assert offsets["stop_bad"].scatter_db < 0.5
+    assert offsets["stop_bad"].applied is True
+    assert offsets["stop_0"].status == STATUS_WITHIN_NOISE
+    assert offsets["stop_0"].offset_db == 0.0
+
+    thin = offsets["stop_thin"]
+    assert thin.status == STATUS_NOT_ESTIMABLE
+    assert thin.applied is False
+    assert "told apart from one site" in thin.reason
+    assert summarise(offsets)["applied"] == 1
+
+
+def test_offsets_are_centred_so_only_differences_between_stops_count() -> None:
+    """Adding a constant to every stop and to every reference level is an
+    identical fit, so an absolute offset is not identifiable."""
+    shifted = estimate_offsets(
+        {f"stop_{i}": [12.0, 12.2, 11.8, 12.1] for i in range(4)}
+    )
+    assert all(offset.offset_db == 0.0 for offset in shifted.values())
+    assert all(offset.status == STATUS_WITHIN_NOISE for offset in shifted.values())
+
+
+def test_the_median_ignores_one_badly_fitting_site() -> None:
+    offsets = estimate_offsets(
+        {
+            "stop_a": [-5.0, -5.2, -4.8, 22.0],
+            "stop_b": [0.1, -0.1, 0.2, 0.0],
+            "stop_c": [0.0, 0.1, -0.2, 0.1],
+        }
+    )
+    assert offsets["stop_a"].offset_db == pytest.approx(-5.0, abs=0.5)
+
+
+def test_a_large_but_inconsistent_shift_is_refused(tmp_path: Path) -> None:
+    """"Common" is the whole claim, so it is tested rather than assumed.
+
+    A big median residual whose sites disagree wildly is model misfit at one
+    stop; correcting it would bend real geometry to suit a fitting error.
+    """
+    offsets = estimate_offsets(
+        {
+            # A large median shift that the sites plainly do not share.
+            "stop_scattered": [-14.0, -12.0, -1.0, 0.0],
+            "stop_a": [0.1, -0.1, 0.2, 0.0],
+            "stop_b": [0.0, 0.1, -0.2, 0.1],
+            "stop_c": [0.1, 0.0, 0.1, -0.1],
+        }
+    )
+    scattered = offsets["stop_scattered"]
+    assert scattered.status == STATUS_INCONSISTENT
+    assert scattered.applied is False
+    assert scattered.offset_db == 0.0
+    assert "not a shift they share" in scattered.reason
+
+
+def test_a_disabled_estimator_reports_but_does_not_apply() -> None:
+    offsets = estimate_offsets(
+        {"stop_bad": [-7.0] * 4, "stop_a": [0.0] * 4, "stop_b": [0.1] * 4},
+        CommonModeSettings(enabled=False),
+    )
+    assert offsets["stop_bad"].status == STATUS_ESTIMATED
+    assert offsets["stop_bad"].applied is False
+
+
+def test_residuals_are_collected_only_from_detections_of_solved_sites() -> None:
+    solutions = [
+        {
+            "status": "ok",
+            "residuals": [
+                {"survey_run_id": "a", "detected": True, "residual_db": 1.0},
+                {"survey_run_id": "a", "detected": False, "exceedance_db": 0.0},
+                {"survey_run_id": "b", "detected": True, "residual_db": -2.0},
+            ],
+        },
+        {"status": "insufficient_evidence", "residuals": []},
+    ]
+    assert residuals_by_run(solutions) == {"a": [1.0], "b": [-2.0]}
+
+
+# ------------------------------------------------------------- two-pass solve
+
+
+def test_a_stop_knocked_off_the_campaign_is_corrected(tmp_path: Path) -> None:
+    database = _campaign(tmp_path, offset_run="stop_04", offset_db=-8.0)
+    report = solve_all_sites(database_path=database, settings=fast_solve_settings())
+    common = report["common_mode"]
+
+    assert common["applied"] >= 1, f"the 8 dB stop should have been caught: {common}"
+    corrected = common["offsets"]["stop_04"]
+    assert corrected["applied"] is True
+    # The magnitude is a LOWER bound: the first fitting pass already absorbed
+    # part of the shift into each site's reference level and position, so what
+    # is left in the residuals understates it. Sign and identification are what
+    # matter; a second correction pass would recover more at twice the cost.
+    assert -9.0 < corrected["offset_db"] < -3.0
+    assert corrected["site_count"] >= 3
+    assert "predicted level" in corrected["reason"]
+
+    solved = [row for row in report["solutions"] if row["status"] == "ok"]
+    assert solved, "the campaign should still solve"
+    assert any(
+        any("common-mode" in warning for warning in row.get("warnings", [])) for row in solved
+    ), "a corrected solution must say so"
+
+
+def test_a_consistent_campaign_is_left_alone(tmp_path: Path) -> None:
+    database = _campaign(tmp_path)
+    report = solve_all_sites(database_path=database, settings=fast_solve_settings())
+    assert report["common_mode"]["applied"] == 0
+    assert report["common_mode"]["largest_offset_db"] < 2.0
+    assert not any(
+        "common-mode" in warning
+        for row in report["solutions"]
+        for warning in row.get("warnings", [])
+    )
+
+
+def test_correcting_a_bad_stop_improves_the_estimates(tmp_path: Path) -> None:
+    """The point of the correction, measured rather than asserted."""
+    truth = {
+        f"BEE00:37D:1:{20 + index}": (tx.latitude, tx.longitude)
+        for index, tx in enumerate(TRANSMITTERS)
+    }
+
+    def median_error(database: Path, *, common_mode: CommonModeSettings) -> float:
+        report = solve_all_sites(
+            database_path=database,
+            settings=fast_solve_settings(),
+            common_mode=common_mode,
+        )
+        errors = [
+            haversine_m(row["mode_latitude"], row["mode_longitude"], *truth[row["site_key"]])
+            for row in report["solutions"]
+            if row["status"] == "ok" and row.get("mode_latitude") is not None
+        ]
+        assert errors, "the campaign must solve at least one site"
+        return float(sorted(errors)[len(errors) // 2])
+
+    database = _campaign(tmp_path, offset_run="stop_04", offset_db=-9.0)
+    uncorrected = median_error(database, common_mode=CommonModeSettings(enabled=False))
+    corrected = median_error(database, common_mode=CommonModeSettings(enabled=True))
+    assert corrected <= uncorrected + 1.0, (
+        f"correcting an 9 dB stop should not make things worse: "
+        f"{uncorrected:.0f} m -> {corrected:.0f} m"
+    )
+
+
+def test_the_plan_ranks_places_whose_outcome_is_least_predictable(tmp_path: Path) -> None:
+    database = _campaign(tmp_path)
+    report = solve_all_sites(database_path=database, settings=fast_solve_settings())
+    plan = report["plan"]
+
+    assert plan["status"] == "ok"
+    assert plan["top_stops"], "a solved campaign should have somewhere worth going"
+    assert all(0.0 <= stop["value"] <= 1.0 for stop in plan["top_stops"])
+    assert plan["top_stops"] == sorted(
+        plan["top_stops"], key=lambda stop: stop["value"], reverse=True
+    )
+
+    # Suggestions are spread, not three cells of one hot spot.
+    for first in range(len(plan["top_stops"])):
+        for second in range(first + 1, len(plan["top_stops"])):
+            a, b = plan["top_stops"][first], plan["top_stops"][second]
+            assert haversine_m(a["latitude"], a["longitude"], b["latitude"], b["longitude"]) > 1000.0
+
+    # A suggestion beside a stop already made would repeat a measurement.
+    for stop in plan["top_stops"]:
+        nearest = min(
+            haversine_m(stop["latitude"], stop["longitude"], latitude, longitude)
+            for latitude, longitude in STOPS
+        )
+        assert nearest > 200.0
+
+    for stop in plan["top_stops"]:
+        assert stop["helps_most"], "a suggestion must say which sites it helps"
+
+
+def test_the_plan_sends_the_operator_to_a_bearing_it_has_not_seen() -> None:
+    """Entropy alone cannot tell an opening bearing from a repeated one.
+
+    A ring at the edge of a site's audible range is uncertain the whole way
+    round, including the arc already driven. Azimuth span is what decides
+    whether a region closes, so the plan has to prefer the part of that ring
+    nobody has stood in yet.
+
+    Built on deliberately clustered stops, which is the case where the two
+    rankings can differ at all: with stops already spread around a site,
+    every bearing is covered and there is nothing left for the term to find.
+    """
+    import numpy as np
+
+    from dmr_iq_surveyor.geo.model import (
+        GeoMeasurement,
+        LocalProjection,
+        bearing_deg,
+    )
+    from dmr_iq_surveyor.geo.model import (
+        haversine_m as distance_m,
+    )
+    from dmr_iq_surveyor.geo.planning import PlanSettings, build_target, plan_next_stops
+    from dmr_iq_surveyor.geo.solver import solve_site
+
+    transmitter = (32.100, 34.850)
+    clustered = [(32.070, 34.800), (32.080, 34.815), (32.075, 34.830)]
+    measurements = []
+    for index, (latitude, longitude) in enumerate(clustered):
+        distance = max(distance_m(latitude, longitude, *transmitter), 50.0)
+        level = 34.0 - 10.0 * 3.0 * math.log10(distance / 1000.0)
+        measurements.append(
+            GeoMeasurement(
+                label=f"stop{index}",
+                latitude=latitude,
+                longitude=longitude,
+                detected=level >= 4.0,
+                level_db=level if level >= 4.0 else None,
+                censor_level_db=4.0,
+            )
+        )
+
+    solve = fast_solve_settings()
+    result = solve_site(measurements, solve)
+    assert result.surface is not None
+    assert result.azimuth_span_deg < 45.0, "the fixture must actually be one-sided"
+
+    projection = LocalProjection(
+        float(np.mean([s[0] for s in clustered])), float(np.mean([s[1] for s in clustered]))
+    )
+    observed = [
+        bearing_deg(result.mode_latitude, result.mode_longitude, latitude, longitude)
+        for latitude, longitude in clustered
+    ]
+
+    def gap_to_nearest_observed_bearing(azimuth_weight: float) -> float:
+        target = build_target(
+            site_key="site",
+            surface=result.surface,
+            projection=projection,
+            reference_level_db=result.reference_level_db,
+            path_loss_exponent=result.path_loss_exponent,
+            threshold_db=4.0,
+            area_km2=500.0,
+            settings=PlanSettings(),
+        )
+        plan = plan_next_stops(
+            targets=[target],
+            projection=projection,
+            visited=list(clustered),
+            solve=solve,
+            settings=PlanSettings(azimuth_weight=azimuth_weight),
+        )
+        best = plan["top_stops"][0]
+        proposed = bearing_deg(
+            result.mode_latitude, result.mode_longitude, best["latitude"], best["longitude"]
+        )
+        return min(abs((proposed - seen + 180.0) % 360.0 - 180.0) for seen in observed)
+
+    entropy_only = gap_to_nearest_observed_bearing(0.0)
+    with_azimuth = gap_to_nearest_observed_bearing(0.6)
+    assert with_azimuth > entropy_only, (
+        f"the angular term should open the geometry further than entropy alone "
+        f"({with_azimuth:.0f} deg vs {entropy_only:.0f} deg off the nearest measured bearing)"
+    )
+    assert with_azimuth > 90.0, (
+        f"with every stop on one side, the next one belongs well away from that arc; "
+        f"got {with_azimuth:.0f} deg"
+    )
+
+
+def test_planning_refuses_before_there_is_anything_to_plan_against(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    connect_geo_database(database).close()
+    csv_path = tmp_path / "sites.csv"
+    csv_path.write_text(_csv(), encoding="utf-8")
+    import_reference_sites(csv_path, database_path=database, snapshot_id="cm")
+    report = solve_all_sites(database_path=database, settings=fast_solve_settings())
+    assert report["plan"]["status"] == "no_targets"
+    assert "spread around the area" in report["plan"]["reason"]
+
+
+def test_the_report_explains_the_correction_and_the_plan(tmp_path: Path) -> None:
+    database = _campaign(tmp_path, offset_run="stop_04", offset_db=-8.0)
+    output = tmp_path / "out"
+    report = solve_all_sites(
+        database_path=database,
+        output_root=output,
+        solve_batch_id="b1",
+        settings=fast_solve_settings(),
+    )
+    markdown = (output / "reports" / "geolocation_b1.md").read_text(encoding="utf-8")
+    assert "common-mode" in markdown.lower()
+    assert "Where to go next" in markdown
+    assert "least predictable" in markdown
+    assert math.isfinite(report["common_mode"]["largest_offset_db"])
+
+
+def _campaign_with_a_barely_heard_site(tmp_path: Path) -> tuple[Path, str]:
+    """A campaign where one site is heard from only two stops.
+
+    Built by making that site far weaker than the rest, so it clears the
+    detection threshold at the two nearest stops and nowhere else -- which
+    is exactly how a distant or obstructed site presents in real data.
+    """
+    # 14 dB puts it over the detection threshold at exactly the two nearest
+    # stops and nowhere else: enough to solve (min_detections is 2) and not
+    # enough for the fit to mean anything (min_detections_for_fit is 3),
+    # which is the narrow band this test is about.
+    faint = Transmitter(
+        868_800_000.0, 32.050, 34.800, reference_level_db=14.0, path_loss_exponent=3.2
+    )
+    transmitters = [*TRANSMITTERS, faint]
+    database = tmp_path / "db.sqlite3"
+    connect_geo_database(database).close()
+    csv_path = tmp_path / "sites.csv"
+    header = "wacn_hex,system_id_hex,rfss,site,observation_status,primary_cc_mhz,nac_hex,notes\n"
+    csv_path.write_text(
+        header
+        + "".join(
+            f"BEE00,37D,1,{20 + index},DIRECT,{tx.frequency_hz / 1e6:.6f},37B,\n"
+            for index, tx in enumerate(transmitters)
+        ),
+        encoding="utf-8",
+    )
+    import_reference_sites(csv_path, database_path=database, snapshot_id="faint")
+
+    connection = connect_geo_database(database)
+    for index, (latitude, longitude) in enumerate(STOPS):
+        seed_run(
+            connection,
+            run_id=f"stop_{index:02d}",
+            latitude=latitude,
+            longitude=longitude,
+            transmitters=transmitters,
+            site_id=f"stop_{index:02d}",
+            capture_start_utc=f"2026-08-01T{7 + index:02d}:00:00+00:00",
+        )
+    connection.close()
+    materialise_measurements(database_path=database)
+    return database, f"BEE00:37D:1:{20 + len(TRANSMITTERS)}"
+
+
+def test_a_site_whose_fit_is_unidentifiable_does_not_steer_the_plan(tmp_path: Path) -> None:
+    """The planner's value for a site is the entropy of the detection
+    probability it predicts at a candidate, and it computes that prediction
+    from the site's reference level and exponent. When those were never
+    identified -- two detections reproduced exactly by many different pairs --
+    the prediction is arithmetic, and steering a drive by it sends the
+    operator somewhere for a reason that does not exist. Such a site is still
+    solved and still reported; it just gets no vote on where to go, and the
+    plan says so rather than leaving the operator to wonder."""
+    database, faint_key = _campaign_with_a_barely_heard_site(tmp_path)
+    report = solve_all_sites(database_path=database, settings=fast_solve_settings())
+
+    by_key = {row["site_key"]: row for row in report["solutions"]}
+    faint = by_key[faint_key]
+    assert faint["detection_count"] == 2, "the fixture must starve this site to exactly two"
+    assert faint["fit_status"] == "underdetermined"
+
+    underdetermined = {
+        key for key, row in by_key.items() if row.get("fit_status") == "underdetermined"
+    }
+    assert faint_key in underdetermined
+
+    plan = report["plan"]
+    voted = {
+        helped["site_key"] for stop in plan["top_stops"] for helped in stop.get("helps_most", [])
+    }
+    assert not (underdetermined & voted), (
+        f"{sorted(underdetermined & voted)} steered the plan on a fit that was never identified"
+    )
+    assert set(plan.get("excluded_from_plan", [])) == underdetermined
+    assert "not identifiable" in plan["reason"]
+    # The well-determined sites still plan, so this removes a bad vote rather
+    # than the whole election.
+    assert voted, "sites with an identified fit must still steer the plan"
+
+    # And the starved site is still solved and still reported -- left out of
+    # the plan, not dropped from the campaign.
+    assert faint["status"], "it still carries a status of its own"
+
+
+def test_an_unidentified_fit_may_be_let_back_into_the_plan(tmp_path: Path) -> None:
+    """The exclusion is a default, not a law: an operator who wants every
+    site voting can say so, and then nothing is held back."""
+    from dmr_iq_surveyor.geo.planning import PlanSettings
+
+    database, faint_key = _campaign_with_a_barely_heard_site(tmp_path)
+    report = solve_all_sites(
+        database_path=database,
+        settings=fast_solve_settings(),
+        plan_settings=PlanSettings(plan_from_underdetermined_fits=True),
+    )
+    assert report["plan"].get("excluded_from_plan") == []

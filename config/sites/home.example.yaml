@@ -13,7 +13,12 @@ receiver: "SDRplay RSP1B"
 # manual gain is required for cross-run SNR comparisons to be meaningful.
 # Leave gain null until you have picked and recorded a fixed baseline value;
 # runs without a recorded gain are flagged in reports as not gain-comparable.
+#
+# `dmr-surveyor web serve` reads gain and lna_state from HERE as the field
+# app's default capture settings -- this is the one file to edit, not a
+# `web serve` command-line flag, which only exists as an override.
 gain_mode: manual
 gain: null
+lna_state: null
 
 notes: ""
