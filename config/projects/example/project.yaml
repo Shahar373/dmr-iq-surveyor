@@ -1,0 +1,32 @@
+# Example project manifest. Copy the directory, rename it, and edit.
+#
+# A project is one subject studied with one analyzer, held in one SQLite
+# database. `project_id` is what that database is claimed to; once claimed it
+# must not change, because the claim in the database is compared against it on
+# every open.
+#
+# Every key here is validated on load. An unknown one is an error rather than
+# a silent no-op, so a misspelled default fails instead of quietly not applying.
+schema_version: 1
+
+# ^[a-z0-9][a-z0-9._-]{0,63}$ -- the same rule as a campaign id.
+project_id: example_p25
+
+label: "Example P25 project"
+
+# The only analyzer that exists. VOR, ATIS and DMR are named in the roadmap
+# and are not written; a manifest asking for one is refused rather than
+# silently read as P25.
+analyzer: p25_site_geolocation
+
+# Absolute, or relative to this file. It must already exist and already carry
+# this project's claim: nothing that serves a project will create it.
+# `dmr-surveyor project init --create` is the one command that may.
+database: ../../../runs/inventory/dmr_inventory.sqlite3
+
+# Inherited by every campaign that does not override them, and by every
+# command run with --project that was not given the flag explicitly.
+defaults:
+  band: central_800_narrow
+  site: home
+  output: runs/field

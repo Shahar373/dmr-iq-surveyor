@@ -301,3 +301,43 @@ def test_an_explicit_output_overrides_the_manifest_silently() -> None:
     resolved = resolve_setting("output", flag="/tmp/x", flag_explicit=True, project="/var/lib/y")
     assert resolved.value == "/tmp/x"
     assert resolved.origin == ORIGIN_FLAG
+
+
+# -- the example that ships with the repository ------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE = REPO_ROOT / "config" / "projects" / "example"
+
+
+def test_the_shipped_example_manifests_are_valid() -> None:
+    """It is documentation an operator is told to copy. A stale example is a
+    worse starting point than none, and only loading it can say."""
+    project = load_project_manifest(EXAMPLE / "project.yaml")
+    assert project.project_id == "example_p25"
+    assert project.analyzer == "p25_site_geolocation"
+    # Relative in the file, resolved against the manifest, so copying the
+    # directory somewhere else moves the database path with it.
+    assert project.database.is_absolute()
+
+    campaign = resolve_campaign(project, "2026-09_day1")
+    assert campaign.project_id == project.project_id
+    assert campaign.defaults.capture["sample_rate_hz"] == 5_000_000.0
+
+
+def test_a_project_resolves_by_name_under_config_projects(tmp_path: Path) -> None:
+    """`config/projects/<name>/` alongside `config/bands` and `config/sites`,
+    so an operator who knows how a band profile resolves knows this too."""
+    _project(tmp_path / "config" / "projects" / "p25")
+
+    resolved = resolve_project("p25", base_dir=tmp_path)
+
+    assert resolved.project_id == "p25_central_il"
+
+
+def test_config_projects_is_searched_before_a_bare_projects_directory(
+    tmp_path: Path,
+) -> None:
+    _project(tmp_path / "config" / "projects" / "p25")
+    _project(tmp_path / "projects" / "p25", body=PROJECT_YAML.replace("p25_central_il", "other_id"))
+
+    assert resolve_project("p25", base_dir=tmp_path).project_id == "p25_central_il"

@@ -36,7 +36,11 @@ SUPPORTED_ANALYZERS = (ANALYZER_P25_SITE_GEOLOCATION,)
 
 PROJECT_MANIFEST_NAME = "project.yaml"
 CAMPAIGN_DIR_NAME = "campaigns"
-_DEFAULT_PROJECT_DIRS = ("projects",)
+# Searched in order when a project is named rather than pathed. `config/`
+# first, because that is where `config/bands` and `config/sites` already
+# live and an operator who knows one knows the other; a bare `projects/`
+# alongside `runs/` works too, for a project kept beside its own output.
+_DEFAULT_PROJECT_DIRS = ("config/projects", "projects")
 
 # Settings where an explicit flag contradicting the manifest is refused rather
 # than obeyed. A campaign compares levels between places, so a band silently

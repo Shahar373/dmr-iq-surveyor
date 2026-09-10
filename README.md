@@ -29,6 +29,7 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - [`docs/phase6-design.md`](docs/phase6-design.md)
 - [`docs/phase6a-survey.md`](docs/phase6a-survey.md)
 - [`docs/phase7-geolocation-design.md`](docs/phase7-geolocation-design.md)
+- [`docs/projects-and-campaigns.md`](docs/projects-and-campaigns.md)
 - [`docs/PHASE7-FIELD-GEOLOCATION.md`](docs/PHASE7-FIELD-GEOLOCATION.md)
 - [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md)
 - [`docs/FIELD-RECORDING-GUIDE.md`](docs/FIELD-RECORDING-GUIDE.md)
@@ -699,6 +700,40 @@ See [`docs/phase7-geolocation-design.md`](docs/phase7-geolocation-design.md) for
 schema, [`docs/PHASE7-FIELD-GEOLOCATION.md`](docs/PHASE7-FIELD-GEOLOCATION.md) for the campaign
 procedure, and [`config/p25_sites.example.md`](config/p25_sites.example.md) for the snapshot format.
 
+
+## Projects and campaigns
+
+A **project** is one subject studied with one analyzer, held in one SQLite database — "P25 sites in central Israel". A **campaign** is one collection round inside it — "day 1, coastal road". Two manifests declare them, and the project's database carries a claim saying which project it belongs to.
+
+```
+config/projects/<name>/project.yaml        # id, analyzer, database, defaults
+config/projects/<name>/campaigns/<id>.yaml # one collection round
+```
+
+`config/projects/example/` is a worked example; copy the directory and edit it.
+
+```bash
+# Take on the existing, already-validated database. Reports and stops.
+dmr-surveyor project init --adopt \
+  --project-id p25_central_il --label "P25 central Israel" \
+  --database runs/inventory/dmr_inventory.sqlite3 \
+  --manifest config/projects/p25/project.yaml
+# ... then, once the report reads right:
+dmr-surveyor project init --adopt ... --write
+
+dmr-surveyor project show --project p25
+dmr-surveyor web serve --project p25 --campaign 2026-09_day1 --host 0.0.0.0
+```
+
+Adoption never moves or rewrites a row: it assigns the whole database, every historical run included, to the project. It assigns no run to a campaign — `campaign_id` stays `NULL` on existing rows, and there is no backfill.
+
+Why this exists: opening a path in this codebase does not read a database, it **makes** one. A mistyped `--database` returns a fresh, fully schema'd, empty database rather than an error, and an existing empty file is silently schema'd the same way. Once a database is claimed, a command run with `--project` must open that path, it must already exist, and it must already carry that project's claim for that project's analyzer — checked by reading the file's first sixteen bytes rather than by connecting, so a wrong path creates no file and no directory. `web serve --project` therefore fails at startup, with a message, instead of on the first page load after somebody has driven somewhere.
+
+Precedence is explicit flag, then campaign manifest, then project manifest, then the CLI's own default. A contradicting explicit `--band` is refused naming both origins, because levels recorded under different bands are not comparable; `--output` and the rest simply win.
+
+Without `--project` nothing binds, nothing is opened at startup, and every existing invocation behaves exactly as it did — including today's create-on-open behaviour, which is left alone rather than changed underneath commands that depend on it.
+
+See [`docs/projects-and-campaigns.md`](docs/projects-and-campaigns.md) for the manifest reference, the adoption order of operations and the full precedence table.
 
 ## Result packaging
 
