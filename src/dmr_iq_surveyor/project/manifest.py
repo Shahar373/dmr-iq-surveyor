@@ -131,9 +131,15 @@ class ProjectDefaults:
     band: str | None = None
     site: str | None = None
     output: str | None = None
+    hardware: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"band": self.band, "site": self.site, "output": self.output}
+        return {
+            "band": self.band,
+            "site": self.site,
+            "output": self.output,
+            "hardware": self.hardware,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,10 +148,21 @@ class CampaignDefaults:
 
     band: str | None = None
     site: str | None = None
+    # The receiver this round is run with, by name under config/hardware/ or
+    # by path. Gain lives here rather than in `capture` because it is not a
+    # capture setting an operator picks per stop -- it is what the radio is,
+    # and it has to be identical across a round for its levels to mean
+    # anything together.
+    hardware: str | None = None
     capture: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"band": self.band, "site": self.site, "capture": dict(self.capture)}
+        return {
+            "band": self.band,
+            "site": self.site,
+            "hardware": self.hardware,
+            "capture": dict(self.capture),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,9 +199,9 @@ class CampaignManifest:
 
 
 _PROJECT_KEYS = {"schema_version", "project_id", "label", "analyzer", "database", "defaults"}
-_PROJECT_DEFAULT_KEYS = {"band", "site", "output"}
+_PROJECT_DEFAULT_KEYS = {"band", "site", "output", "hardware"}
 _CAMPAIGN_KEYS = {"schema_version", "campaign_id", "project_id", "label", "defaults"}
-_CAMPAIGN_DEFAULT_KEYS = {"band", "site", "capture"}
+_CAMPAIGN_DEFAULT_KEYS = {"band", "site", "capture", "hardware"}
 # The three capture settings a collection round may pin. Restricted on
 # purpose: a campaign fixes what has to stay identical across stops for
 # their levels to be comparable, and a key nothing reads would be a
@@ -243,6 +260,7 @@ def project_from_mapping(raw: dict[str, Any], resolved: Path) -> ProjectManifest
             band=_optional_str(defaults_raw.get("band")),
             site=_optional_str(defaults_raw.get("site")),
             output=_optional_str(defaults_raw.get("output")),
+            hardware=_optional_str(defaults_raw.get("hardware")),
         ),
         path=resolved,
     )
@@ -413,6 +431,7 @@ def load_campaign_manifest(
         defaults=CampaignDefaults(
             band=_optional_str(defaults_raw.get("band")),
             site=_optional_str(defaults_raw.get("site")),
+            hardware=_optional_str(defaults_raw.get("hardware")),
             capture=dict(capture),
         ),
         path=resolved,

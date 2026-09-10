@@ -95,6 +95,8 @@ def seed_run(
     gain: float | None = 40.0,
     threshold_db: float = DETECTION_THRESHOLD_DB,
     coverage_status: str = "complete",
+    campaign_id: str | None = None,
+    hardware: dict[str, Any] | None = None,
 ) -> list[float]:
     """Store one survey run whose observations follow the given transmitters.
 
@@ -143,6 +145,8 @@ def seed_run(
         gps_latitude=latitude,
         gps_longitude=longitude,
         gps_source="user" if latitude is not None else "not_configured",
+        campaign_id=campaign_id,
+        hardware=hardware,
     )
     import_survey_run(
         connection, run=record, observations=observations, raster_tolerance_hz=6250.0

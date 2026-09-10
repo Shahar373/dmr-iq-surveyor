@@ -267,3 +267,64 @@ def test_the_embedded_program_refuses_to_guess_when_given_no_directory(
     )
     assert result.returncode != 0
     assert "TLS directory was not passed" in (result.stdout + result.stderr)
+
+
+# -- project and collection round -----------------------------------------
+
+
+def test_an_existing_environment_file_is_kept_rather_than_re_rendered(
+    tmp_path: Path,
+) -> None:
+    """The promise an update makes to a Pi already in the field. Re-rendering
+    would discard whatever the operator edited by hand -- and after this
+    change that includes FIELD_PROJECT and FIELD_CAMPAIGN, which the
+    installer has no way to guess."""
+    conf = tmp_path / "etc"
+    conf.mkdir()
+    existing = conf / "field.env"
+    existing.write_text(
+        "FIELD_BAND=hand_edited\nFIELD_PROJECT=/etc/dmr-field/projects/p25/project.yaml\n",
+        encoding="utf-8",
+    )
+
+    result = _run(tmp_path, "--dry-run", *_sandbox(tmp_path))
+
+    assert "keeping the existing" in result.stdout
+    assert existing.read_text(encoding="utf-8").startswith("FIELD_BAND=hand_edited")
+
+
+def test_the_example_ships_both_variables_empty(tmp_path: Path) -> None:
+    """Empty and uncommented, not commented out: the installer's own `sed`
+    anchors on `^FIELD_X=`, so a commented key could never be substituted."""
+    result = _run(tmp_path, "--dry-run", *_sandbox(tmp_path))
+
+    assert "FIELD_PROJECT=" in result.stdout
+    assert "FIELD_CAMPAIGN=" in result.stdout
+    assert "#FIELD_PROJECT" not in result.stdout
+
+
+def test_a_project_and_campaign_given_to_the_installer_are_written(
+    tmp_path: Path,
+) -> None:
+    result = _run(
+        tmp_path,
+        "--dry-run",
+        *_sandbox(tmp_path),
+        "--project", "/etc/dmr-field/projects/p25/project.yaml",
+        "--campaign", "2026-09_day1",
+    )
+
+    assert "FIELD_PROJECT=/etc/dmr-field/projects/p25/project.yaml" in result.stdout
+    assert "FIELD_CAMPAIGN=2026-09_day1" in result.stdout
+
+
+def test_omitting_them_leaves_the_example_empty_rather_than_guessing(
+    tmp_path: Path,
+) -> None:
+    """A project deployment is opt-in. An installer that invented one would
+    bind the service to a database that may not exist."""
+    result = _run(tmp_path, "--dry-run", *_sandbox(tmp_path))
+
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    assert "FIELD_PROJECT=" in lines
+    assert "FIELD_CAMPAIGN=" in lines

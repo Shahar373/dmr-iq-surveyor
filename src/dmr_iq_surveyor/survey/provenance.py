@@ -248,24 +248,57 @@ def requested_bucket(
     )
 
 
-def declared_bucket(site: SiteProfile | None) -> dict[str, Any]:
-    """The `declared` bucket: the site profile as it stood for this run.
+def declared_bucket(site: SiteProfile | None, hardware: Any = None) -> dict[str, Any]:
+    """The `declared` bucket: what the operator said, as it stood for this run.
 
     Snapshotted per run on purpose. `sites` holds one mutable row that
     `upsert_site` rewrites, so without this a profile edited next month would
     retroactively change the receiver, antenna and gain every earlier run
     appears to have been taken with.
+
+    A hardware profile, when the campaign names one, is the more specific
+    declaration and supplies the receiver half field by field: it exists
+    precisely to say what the radio is and what it should be set to, across
+    every site a campaign visits. The site profile still supplies whatever
+    the hardware profile leaves unset, so adding one to a campaign never
+    takes information away from a run.
+
+    Still `declared`, never `applied`, however precise the file is. A
+    declaration is what somebody intended; only the radio's own read-back
+    may claim to be what the receiver was actually set to.
     """
-    if site is None:
+    if site is None and hardware is None:
         return {}
+    receiver = getattr(hardware, "receiver", None)
+    antenna = getattr(hardware, "antenna", None)
+    gain_mode = getattr(hardware, "gain_mode", None)
+    gain = getattr(hardware, "if_gain_reduction_db", None)
+    lna_state = getattr(hardware, "lna_state", None)
     return _known(
         {
-            "site_id": site.site_id,
-            "receiver": site.receiver,
-            "antenna": site.antenna,
-            "gain_mode": site.gain_mode,
-            "gain": site.gain,
-            "lna_state": site.lna_state,
+            "site_id": getattr(site, "site_id", None),
+            # Which file the receiver half came from, so a reader can tell a
+            # campaign-wide declaration from a per-site one. Recorded only
+            # when that file actually contributed a value: an id alone would
+            # make a bucket non-empty, and `_derive_source` would then report
+            # the run as "declared" while nothing about the receiver is.
+            "hardware_id": (
+                getattr(hardware, "hardware_id", None)
+                if any(
+                    value is not None
+                    for value in (receiver, antenna, gain_mode, gain, lna_state)
+                )
+                else None
+            ),
+            "receiver": receiver if receiver is not None else getattr(site, "receiver", None),
+            "antenna": antenna if antenna is not None else getattr(site, "antenna", None),
+            "gain_mode": (
+                gain_mode if gain_mode is not None else getattr(site, "gain_mode", None)
+            ),
+            "gain": gain if gain is not None else getattr(site, "gain", None),
+            "lna_state": (
+                lna_state if lna_state is not None else getattr(site, "lna_state", None)
+            ),
         }
     )
 
@@ -553,6 +586,70 @@ def lna_state_reading(hardware: Any, site_row: Any | None = None) -> Reading:
     return Reading(_as_lna_index(reading.value), reading.source)
 
 
+@dataclass(frozen=True, slots=True)
+class ReceiverSettings:
+    """What one run's receiver was set to, each half with its own evidence."""
+
+    survey_run_id: str
+    if_gain_reduction: Reading
+    lna_state: Reading
+
+    @property
+    def sources(self) -> tuple[str, str]:
+        return self.if_gain_reduction.source, self.lna_state.source
+
+    @property
+    def from_legacy_site_row(self) -> bool:
+        """True when a value could only be had from the mutable `sites` row."""
+        return SOURCE_DECLARED_SITE_ROW in self.sources
+
+
+def receiver_settings(row: Any) -> ReceiverSettings:
+    """Resolve one run's receiver settings from the row that holds them.
+
+    THE resolver. Every reader of a run's gain goes through here, so there is
+    one precedence and one set of labels rather than a ladder per caller:
+
+        applied -> requested -> declared -> the legacy `sites` row
+
+    `applied` means the radio reported the value back; nothing else may ever
+    be labelled that way. `declared` is the operator's own claim, snapshotted
+    into the run when it was recorded, so editing a profile afterwards cannot
+    rewrite what a run appears to have been taken with.
+
+    The `sites` row is last and labelled apart because it is *current state*:
+    `upsert_site` rewrites it on every run, so it describes the profile as it
+    stands now, not as it stood for the run being read. It is offered only
+    when the run's own blob says nothing at all -- which is exactly the case
+    of a row written before runs carried their own declaration. A run WITH
+    provenance never falls through to it.
+
+    `row` needs `survey_run_id` and `hardware_json`; `gain` and `lna_state`
+    are consulted only if the caller joined them in, and their absence simply
+    removes the legacy tier.
+    """
+    hardware = load_hardware(_column(row, "hardware_json"))
+    return ReceiverSettings(
+        survey_run_id=str(_column(row, "survey_run_id")),
+        if_gain_reduction=if_gain_reading(hardware, site_row=_column(row, "gain")),
+        lna_state=lna_state_reading(hardware, site_row=_column(row, "lna_state")),
+    )
+
+
+def _column(row: Any, name: str) -> Any:
+    """One column, or `None` when the caller did not select it.
+
+    `sqlite3.Row` raises `IndexError` for a column that is not in the query
+    rather than returning `None`, and a mapping raises `KeyError`; both mean
+    the same thing here -- the caller did not ask for it, so that tier of
+    evidence is simply not available.
+    """
+    try:
+        return row[name]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
 def identity_value(hardware: Any, key: str) -> Any | None:
     """A value from the `identity` bucket, or `None`.
 
@@ -581,6 +678,7 @@ __all__ = [
     "GAIN_ELEMENT_RF",
     "HARDWARE_SCHEMA_VERSION",
     "NOT_RECORDED",
+    "ReceiverSettings",
     "SOURCE_APPLIED",
     "SOURCE_DECLARED",
     "SOURCE_DECLARED_SITE_ROW",
@@ -604,6 +702,7 @@ __all__ = [
     "load_hardware",
     "normalise_campaign_id",
     "normalise_hardware",
+    "receiver_settings",
     "requested_bucket",
     "with_declared",
 ]

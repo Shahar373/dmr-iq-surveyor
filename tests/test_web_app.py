@@ -15,6 +15,7 @@ import pytest
 from fixtures.device_probe import StubProbeRunner
 from fixtures.geo_scenario import Transmitter, build_database, seed_run
 
+from dmr_iq_surveyor.survey.provenance import ProvenanceError
 from dmr_iq_surveyor.web.jobs import JobRegistry
 from dmr_iq_surveyor.web.server import create_server
 from dmr_iq_surveyor.web.service import (
@@ -605,3 +606,26 @@ def test_throttle_capture_progress_matches_a_real_capture_loops_call_pattern(
         f"milliseconds of wall-clock time, so almost all {len(raw_calls)} raw calls "
         f"should collapse to the first and the final one; got {len(forwarded_calls)}"
     )
+
+
+def test_an_invalid_campaign_refuses_to_start_without_creating_directories(
+    tmp_path: Path,
+) -> None:
+    """`FieldService.__init__` is what validates `campaign_id`, and it must
+    run before either directory is made -- a startup refusal must not leave
+    an empty `output_root`/`recordings_dir` behind for the next attempt to
+    silently treat as "already set up"."""
+    output_root = tmp_path / "out"
+    recordings_dir = tmp_path / "rec"
+    settings = FieldSettings(
+        database_path=tmp_path / "db.sqlite3",
+        output_root=output_root,
+        recordings_dir=recordings_dir,
+        campaign_id="not a valid campaign id!!",
+    )
+
+    with pytest.raises(ProvenanceError):
+        create_server(settings, host="127.0.0.1", port=0)
+
+    assert not output_root.exists()
+    assert not recordings_dir.exists()

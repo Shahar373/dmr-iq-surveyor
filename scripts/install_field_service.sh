@@ -16,7 +16,13 @@
 # that cannot keep up drops samples instead of refusing.
 #
 # IF gain reduction and LNA state are not settable here: they come from the
-# site profile given by --site.
+# site profile given by --site, or from the hardware profile a campaign names.
+#
+# --project and --campaign are optional and off by default. --project takes a
+# project manifest (path, or a name under config/projects/); it binds the
+# service to that project's database, which must already exist and already
+# carry its claim. --campaign is the collection round every stop is recorded
+# under, and is only read alongside --project.
 #
 # Run it from the deployment checkout, not from a development machine. It is
 # safe to re-run: the token and the TLS pair are created once and then left
@@ -41,6 +47,11 @@ SITE_PROFILE=""
 # invent capture settings: the values that belong here come from
 # `dmr-surveyor survey preflight` against the storage this Pi actually has.
 BAND_PROFILE=""
+# Both optional, both "leave the example's empty value alone" when omitted.
+# A project deployment is opt-in: an install that does not name one keeps
+# behaving exactly as every install before projects existed.
+PROJECT_MANIFEST=""
+CAMPAIGN_ID=""
 CENTER_FREQUENCY=""
 SAMPLE_RATE=""
 DURATION=""
@@ -73,7 +84,7 @@ run() {
 }
 
 usage() {
-    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 2
 }
 
@@ -82,6 +93,8 @@ while [[ $# -gt 0 ]]; do
         --site)      SITE_PROFILE="${2:?--site needs a path}"; shift 2 ;;
         --prefix)    PREFIX="${2:?--prefix needs a path}"; shift 2 ;;
         --band)              BAND_PROFILE="${2:?--band needs a name or path}"; shift 2 ;;
+        --project)   PROJECT_MANIFEST="${2:?--project needs a manifest path or name}"; shift 2 ;;
+        --campaign)  CAMPAIGN_ID="${2:?--campaign needs a collection round id}"; shift 2 ;;
         --center-frequency)  CENTER_FREQUENCY="${2:?--center-frequency needs a value in Hz}"; shift 2 ;;
         --sample-rate)       SAMPLE_RATE="${2:?--sample-rate needs a value in samples/s}"; shift 2 ;;
         --duration)          DURATION="${2:?--duration needs a value in seconds}"; shift 2 ;;
@@ -228,6 +241,12 @@ else
         )
         if [[ -n "$BAND_PROFILE" ]]; then
             edits+=( -e "s|^FIELD_BAND=.*|FIELD_BAND=${BAND_PROFILE}|" )
+        fi
+        if [[ -n "$PROJECT_MANIFEST" ]]; then
+            edits+=( -e "s|^FIELD_PROJECT=.*|FIELD_PROJECT=${PROJECT_MANIFEST}|" )
+        fi
+        if [[ -n "$CAMPAIGN_ID" ]]; then
+            edits+=( -e "s|^FIELD_CAMPAIGN=.*|FIELD_CAMPAIGN=${CAMPAIGN_ID}|" )
         fi
         if [[ -n "$CENTER_FREQUENCY" ]]; then
             edits+=( -e "s|^FIELD_CENTER_FREQUENCY=.*|FIELD_CENTER_FREQUENCY=${CENTER_FREQUENCY}|" )

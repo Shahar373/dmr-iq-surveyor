@@ -17,6 +17,13 @@ project_id: example_p25
 label: "Day 1, coastal road"
 
 defaults:
+  # The receiver this round is run with, by name under config/hardware/ or by
+  # path. It declares the gain every stop of this round is taken at, and
+  # outranks the site profile for the receiver half -- gain belongs to the
+  # radio, not to the place. Still a DECLARATION: only the radio's own
+  # read-back is ever recorded as `applied`.
+  hardware: example
+
   # A band that disagrees with the project's is fine -- a campaign may narrow
   # it. What is refused is an explicit --band on the command line that
   # disagrees with whichever of the two applies: levels recorded under
@@ -25,8 +32,8 @@ defaults:
   site: home
   # Only these three keys, all positive numbers. They are the capture settings
   # that must not drift between stops for their levels to mean anything
-  # together. Gain is deliberately absent: it belongs to the hardware profile,
-  # which is not written yet, so the site profile remains its only source.
+  # together. Gain is deliberately absent: it belongs to the hardware profile
+  # named by `hardware:` above.
   capture:
     center_frequency_hz: 867406250
     sample_rate_hz: 5000000

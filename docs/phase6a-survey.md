@@ -161,10 +161,11 @@ the SDR is opened for a drive, and at startup for the served app rather than at 
 first stop. The store validates again on the way in, and does so *before* it deletes the run it
 is replacing, so a rejected re-import cannot cost the run that was already there.
 
-`scripts/campaign_digest.py --campaign <id>` narrows the collection section. It is the only
-section that can be narrowed today, so the digest skips the measurement, solution and planning
-sections in that mode and says it is doing so, rather than printing whole-database numbers
-under a heading that names one campaign.
+`scripts/campaign_digest.py --campaign <id>` narrows **every** section. Measurements and
+exclusions reach the campaign by joining `survey_runs`; solutions and plans carry the campaign
+their solve was scoped to. A batch solved without `--campaign` is not shown under a campaign
+heading -- it read every run in the file, so presenting its numbers as one round's would be
+exactly the mislabelling that used to make these sections unshowable.
 
 ## Output layout
 

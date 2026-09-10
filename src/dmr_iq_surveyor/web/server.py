@@ -450,11 +450,15 @@ def create_server(
     certificate: Certificate | None = None,
     probe_runner: ProbeRunner | None = None,
 ) -> FieldServer:
+    # Built before either directory is created: FieldService.__init__
+    # validates campaign_id and raises on a bad one, and a validation
+    # failure must not leave an empty output/recordings directory behind.
+    service = FieldService(settings, probe_runner=probe_runner)
     Path(settings.output_root).expanduser().resolve().mkdir(parents=True, exist_ok=True)
     Path(settings.recordings_dir).expanduser().resolve().mkdir(parents=True, exist_ok=True)
     return FieldServer(
         (host, port),
-        FieldService(settings, probe_runner=probe_runner),
+        service,
         verbose=verbose,
         certificate=certificate,
     )

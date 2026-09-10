@@ -50,15 +50,18 @@ from dmr_iq_surveyor.live.session import LiveSession, LiveSettings, Position
 from dmr_iq_surveyor.reference.store import list_sites
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, DriveViewSettings, run_survey
 from dmr_iq_surveyor.survey.profiles import (
+    HardwareProfile,
     ProfileError,
     SiteProfile,
     resolve_band_profile,
+    resolve_hardware_profile,
     resolve_site_profile,
 )
 from dmr_iq_surveyor.survey.provenance import (
     hardware_from_capture_manifest,
     normalise_campaign_id,
 )
+from dmr_iq_surveyor.survey.scope import CampaignScope
 from dmr_iq_surveyor.survey.store import delete_survey_run
 from dmr_iq_surveyor.web.devices import STATE_CHECKING as DEVICE_STATE_CHECKING
 from dmr_iq_surveyor.web.devices import DeviceMonitor
@@ -147,6 +150,10 @@ class FieldSettings:
     # is what actually enforces which database this process may open.
     project_id: str | None = None
     project_root: Path | None = None
+    # The receiver this round is run with, by name under config/hardware/ or
+    # by path. `None` is every deployment before hardware profiles existed:
+    # the site profile stays the only declaration source, exactly as before.
+    hardware_profile: str | None = None
     center_frequency_hz: float = 867_406_250.0
     sample_rate_hz: float = 5_000_000.0
     # 90 s at 5 MS/s is 1.68 GiB. With one recording kept that peaks at
@@ -507,10 +514,50 @@ class FieldService:
         finally:
             self._device_transition_lock.release()
 
+    def _scope(self) -> CampaignScope:
+        """The campaign this app is serving, as an analysis boundary.
+
+        The field app records every stop under one campaign and then solves
+        after each one, so its reads and its solves have to agree about which
+        runs exist. Without this the app would solve across every round in
+        the file and stamp the result with no campaign at all -- and the
+        scoped readers, which refuse an unstamped solve precisely because it
+        was computed from everything, would then report the Pi as having
+        solved nothing.
+
+        Unset -- the deployment that names no campaign -- is
+        `WHOLE_DATABASE`, which is exactly what the app did before.
+        """
+        return CampaignScope(self.settings.campaign_id)
+
+    def _hardware_profile(self) -> HardwareProfile | None:
+        """The campaign's hardware profile, or `None` when none is named.
+
+        Resolved per use rather than cached: it is read once per stop, and an
+        operator who corrects the file mid-round should not have to restart
+        the service for the next stop to record the corrected declaration.
+
+        A profile that cannot be resolved is not fatal here -- startup
+        already refused an unresolvable one, so reaching this is a file that
+        moved while the app was running, and losing the receiver half of a
+        declaration is better than losing the stop.
+        """
+        name = self.settings.hardware_profile
+        if not name:
+            return None
+        try:
+            return resolve_hardware_profile(
+                name, base_dir=self.settings.profile_base_dir
+            )
+        except (ProfileError, FileNotFoundError, OSError):
+            return None
+
     def sites_overview(self) -> list[dict[str, Any]]:
         """Just the sites. `/api/sites` used to build the whole state
         payload -- SDR probe included -- and throw all but this away."""
-        return site_overview(database_path=self.settings.database_path)
+        return site_overview(
+            database_path=self.settings.database_path, scope=self._scope()
+        )
 
     def require_device_ready(self) -> None:
         """A fresh, time-bounded readiness check, or a clear refusal.
@@ -547,6 +594,7 @@ class FieldService:
         self.devices.close()
 
     def survey_runs(self, limit: int = 25) -> list[dict[str, Any]]:
+        predicate, parameters = self._scope().where("r")
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
             rows = connection.execute(
@@ -556,10 +604,13 @@ class FieldService:
                        (SELECT COUNT(*) FROM rf_observations o
                         WHERE o.survey_run_id = r.survey_run_id) AS observation_count
                 FROM survey_runs r
+                """
+                + (f"WHERE {predicate} " if predicate else "")
+                + """
                 ORDER BY COALESCE(capture_start_utc, imported_at) DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (*parameters, limit),
             ).fetchall()
         finally:
             connection.close()
@@ -607,7 +658,9 @@ class FieldService:
         }
 
     def geojson(self) -> dict[str, Any]:
-        collection = build_map_geojson(database_path=self.settings.database_path)
+        collection = build_map_geojson(
+            database_path=self.settings.database_path, scope=self._scope()
+        )
         plan = self.plan()
         collection["features"].extend(plan.get("geojson", {}).get("features", []))
         return collection
@@ -616,7 +669,7 @@ class FieldService:
         """The latest next-stop plan, or an explicit note that there is none."""
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
-            stored = latest_plan(connection)
+            stored = latest_plan(connection, scope=self._scope())
         finally:
             connection.close()
         if stored is None:
@@ -643,13 +696,22 @@ class FieldService:
             ).fetchone()
             if row is None:
                 raise ValueError(f"unknown site key: {site_key}")
-            history = solution_history(connection, int(row["p25_site_id"]))
+            history = solution_history(
+                connection, int(row["p25_site_id"]), scope=self._scope()
+            )
         finally:
             connection.close()
         return {"site_key": site_key, "history": history}
 
     def stops(self) -> list[dict[str, Any]]:
-        """Every stop, with whether it is contributing and why not."""
+        """Every stop in this app's campaign, with whether it is contributing
+        and why not.
+
+        Scoped like every other read here: a session serving one campaign
+        must not list -- and, through `set_stop_excluded`/`delete_stop`,
+        must not be able to touch -- another campaign's stops.
+        """
+        predicate, parameters = self._scope().where("r")
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
             rows = connection.execute(
@@ -667,8 +729,12 @@ class FieldService:
                        (SELECT reason FROM geo_run_exclusions e
                         WHERE e.survey_run_id = r.survey_run_id) AS exclusion_reason
                 FROM survey_runs r LEFT JOIN sites s ON s.site_id = r.site_id
-                ORDER BY COALESCE(r.capture_start_utc, r.imported_at) DESC
                 """
+                + (f"WHERE {predicate} " if predicate else "")
+                + """
+                ORDER BY COALESCE(r.capture_start_utc, r.imported_at) DESC
+                """,
+                parameters,
             ).fetchall()
         finally:
             connection.close()
@@ -689,6 +755,10 @@ class FieldService:
                 "SELECT COUNT(*) AS n FROM survey_runs WHERE survey_run_id = ?", (run_id,)
             ).fetchone()["n"] == 0:
                 raise ValueError(f"unknown stop: {run_id}")
+            # Checked before either write below: a stop outside this app's
+            # campaign is refused, not silently excluded/included then
+            # reported as a failure after the exclusion already landed.
+            self._scope().narrow(connection, [run_id])
             if excluded:
                 exclude_run(
                     connection, run_id, reason or "excluded by the operator in the field"
@@ -698,13 +768,27 @@ class FieldService:
             current = run_exclusion(connection, run_id)
         finally:
             connection.close()
-        materialise_measurements(database_path=self.settings.database_path, run_ids=[run_id])
+        materialise_measurements(
+            database_path=self.settings.database_path,
+            run_ids=[run_id],
+            scope=self._scope(),
+        )
         return {"survey_run_id": run_id, "excluded": current is not None, "reason": current or ""}
 
     def delete_stop(self, run_id: str) -> dict[str, Any]:
-        """Remove a stop entirely, including its observations."""
+        """Remove a stop entirely, including its observations.
+
+        `delete_survey_run` itself has no notion of a campaign, so the check
+        has to happen here: a session serving one campaign must not be able
+        to delete another campaign's evidence through this endpoint.
+        """
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
+            if connection.execute(
+                "SELECT COUNT(*) AS n FROM survey_runs WHERE survey_run_id = ?", (run_id,)
+            ).fetchone()["n"] == 0:
+                raise ValueError(f"unknown stop: {run_id}")
+            self._scope().narrow(connection, [run_id])
             result = delete_survey_run(connection, run_id)
         finally:
             connection.close()
@@ -969,6 +1053,7 @@ class FieldService:
             # carries the radio's read-back rather than the request.
             hardware=hardware_from_capture_manifest(manifest),
             declared_site=declared_profile,
+            declared_hardware=self._hardware_profile(),
             drive_view=(
                 DriveViewSettings(
                     fft_size=self.settings.live_fft_size,
@@ -1048,6 +1133,7 @@ class FieldService:
             database_path=self.settings.database_path,
             run_ids=[run_id],
             settings=MeasurementSettings(),
+            scope=self._scope(),
         )
         summary = measurements["summary"]
         job.emit(
@@ -1150,7 +1236,9 @@ class FieldService:
             job.check_cancelled()
             job.emit("measurements", "matching against the site registry", progress=0.7)
             measurements = materialise_measurements(
-                database_path=self.settings.database_path, run_ids=[run_id]
+                database_path=self.settings.database_path,
+                run_ids=[run_id],
+                scope=self._scope(),
             )
             solve_report = None
             if solve:
@@ -1562,7 +1650,9 @@ class FieldService:
         pending = self._take_pending_runs()
         if pending:
             materialise_measurements(
-                database_path=self.settings.database_path, run_ids=pending
+                database_path=self.settings.database_path,
+                run_ids=pending,
+                scope=self._scope(),
             )
         report = self._solve(
             job, progress_from=0.96, progress_to=0.99,
@@ -1623,12 +1713,15 @@ class FieldService:
             try:
                 if pending:
                     materialise_measurements(
-                        database_path=self.settings.database_path, run_ids=pending
+                        database_path=self.settings.database_path,
+                        run_ids=pending,
+                        scope=self._scope(),
                     )
                 report = solve_all_sites(
                     database_path=self.settings.database_path,
                     output_root=self.settings.output_root,
                     settings=self.field_solve_settings(),
+                    scope=self._scope(),
                 )
                 solved = sum(1 for row in report["solutions"] if row["status"] == "ok")
                 with self._live_lock:
@@ -1688,7 +1781,9 @@ class FieldService:
         def work(job: Job) -> dict[str, Any]:
             if rebuild:
                 job.emit("measurements", "rebuilding every run's measurements", progress=0.05)
-                materialise_measurements(database_path=self.settings.database_path)
+                materialise_measurements(
+                    database_path=self.settings.database_path, scope=self._scope()
+                )
             return self._solve(job, progress_from=0.1, progress_to=0.99, settings=settings)
 
         return self.jobs.submit(kind="solve", label="re-solve all sites", work=work)
@@ -1716,6 +1811,7 @@ class FieldService:
             output_root=self.settings.output_root,
             settings=settings,
             on_progress=on_progress,
+            scope=self._scope(),
         )
         solved = sum(1 for row in report["solutions"] if row["status"] == "ok")
         job.emit(

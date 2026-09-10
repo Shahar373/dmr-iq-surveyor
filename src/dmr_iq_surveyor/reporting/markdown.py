@@ -99,21 +99,42 @@ def render_comparison_markdown(
     baseline_run_id: str,
     target_run_id: str,
     rows: list[dict[str, Any]],
+    baseline_campaign_id: str | None = None,
+    target_campaign_id: str | None = None,
 ) -> str:
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
     summary = ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
+    baseline_campaign = baseline_campaign_id or "unassigned"
+    target_campaign = target_campaign_id or "unassigned"
     lines = [
         "# Survey run comparison",
         "",
-        f"- Baseline run: **{baseline_run_id}**",
-        f"- Target run: **{target_run_id}**",
+        f"- Baseline run: **{baseline_run_id}** (campaign {baseline_campaign})",
+        f"- Target run: **{target_run_id}** (campaign {target_campaign})",
         f"- Status counts: {summary or 'none'}",
+    ]
+    if baseline_campaign_id != target_campaign_id:
+        # Stated, not enforced. Comparing two rounds is the point of running
+        # a second one; what the reader needs is to know which differences
+        # might be the rounds rather than the RF.
+        lines.extend(
+            [
+                "",
+                (
+                    f"> **campaign_differs** -- baseline is {baseline_campaign} and "
+                    f"target is {target_campaign}. Each round establishes its own "
+                    "reference gain and noise floor, so a level difference here can be "
+                    "the campaigns rather than the RF."
+                ),
+            ]
+        )
+    lines.extend([
         "",
         "| Frequency MHz | Status | Reason | SNR delta dB | Occupancy delta pts | Persistence delta |",
         "|---:|---|---|---:|---:|---:|",
-    ]
+    ])
     for row in rows:
         delta = row.get("delta") or {}
         frequency = row["nominal_frequency_hz"]

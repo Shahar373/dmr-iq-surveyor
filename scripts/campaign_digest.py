@@ -197,16 +197,29 @@ def stops(connection: sqlite3.Connection, campaign: str | None = None) -> None:
         print(f"  windows measured     {windows} (~{windows / 60:.0f} minutes of listening)")
 
 
-def measurements(connection: sqlite3.Connection) -> None:
+def measurements(connection: sqlite3.Connection, campaign: str | None = None) -> None:
+    # A measurement carries no campaign of its own; the run that produced it
+    # does. Joining through `survey_runs` is what makes the collection
+    # section and this one describe the same set of stops.
+    clause = " WHERE r.campaign_id = ?" if campaign else ""
+    arguments = (campaign,) if campaign else ()
     rows = _rows(
         connection,
-        "SELECT usability, attribution, detected, COUNT(*) AS n FROM geo_measurements "
-        "GROUP BY usability, attribution, detected",
+        "SELECT m.usability, m.attribution, m.detected, COUNT(*) AS n "
+        "FROM geo_measurements m "
+        "JOIN survey_runs r ON r.survey_run_id = m.survey_run_id"
+        + clause
+        + " GROUP BY m.usability, m.attribution, m.detected",
+        *arguments,
     )
     print()
     print("== WHAT COUNTED AS EVIDENCE " + "=" * 41)
     if not rows:
-        print("  none -- run `dmr-surveyor geo measurements` first")
+        if campaign:
+            print(f"  none for campaign {campaign} -- run `dmr-surveyor geo measurements "
+                  f"--campaign {campaign}` first")
+        else:
+            print("  none -- run `dmr-surveyor geo measurements` first")
         return
     usable_det = sum(r["n"] for r in rows if r["usability"] == "usable" and r["detected"])
     usable_non = sum(r["n"] for r in rows if r["usability"] == "usable" and not r["detected"])
@@ -218,7 +231,12 @@ def measurements(connection: sqlite3.Connection) -> None:
     for reason, count in dropped.most_common():
         print(f"  {reason:20s} {count} measurement(s) set aside")
 
-    excluded = _rows(connection, "SELECT survey_run_id, reason, scope FROM geo_run_exclusions")
+    excluded = _rows(
+        connection,
+        "SELECT e.survey_run_id, e.reason, e.scope FROM geo_run_exclusions e "
+        "JOIN survey_runs r ON r.survey_run_id = e.survey_run_id" + clause,
+        *arguments,
+    )
     superseded = [row for row in excluded if row["reason"].startswith(SUPERSEDED_REASON_PREFIX)]
     views = [row for row in excluded if row["reason"].startswith(DRIVE_VIEW_REASON_PREFIX)]
     for row in excluded:
@@ -325,14 +343,38 @@ def _redriven_agreement(connection: sqlite3.Connection, superseded: list[sqlite3
           f"median shift {median:+.1f} dB, median |difference| {spread:.1f} dB -> {verdict}")
 
 
-def solutions(connection: sqlite3.Connection) -> None:
-    latest = connection.execute(
-        "SELECT solve_batch_id FROM geo_solutions ORDER BY solved_at DESC LIMIT 1"
-    ).fetchone()
+def solutions(connection: sqlite3.Connection, campaign: str | None = None) -> None:
+    # Scoped, "the latest solve" means the latest solve OF THIS CAMPAIGN. A
+    # batch from an unscoped solve carries no campaign and is not shown here:
+    # it was computed from every run in the file, so presenting its numbers
+    # under a heading naming one round would be the mislabelling this whole
+    # section used to be skipped to avoid.
+    # By insertion order, never by `solved_at`: a Raspberry Pi has no
+    # real-time clock, so it boots with a stale time and jumps when NTP
+    # arrives over the phone hotspot, and a solve run later in the day can
+    # carry an earlier timestamp than one run before it. `geo/store.py`
+    # settled this for `latest_solutions`; the digest was still ranking on
+    # the string.
+    if campaign:
+        latest = connection.execute(
+            "SELECT solve_batch_id FROM geo_solutions WHERE campaign_id = ? "
+            "ORDER BY geo_solution_id DESC LIMIT 1",
+            (campaign,),
+        ).fetchone()
+    else:
+        latest = connection.execute(
+            "SELECT solve_batch_id FROM geo_solutions ORDER BY geo_solution_id DESC LIMIT 1"
+        ).fetchone()
     print()
     print("== WHAT THE SOLVER CONCLUDED " + "=" * 40)
     if latest is None:
-        print("  nothing solved yet -- run `dmr-surveyor geo solve`")
+        if campaign:
+            print(f"  nothing solved for campaign {campaign} -- run "
+                  f"`dmr-surveyor geo solve --campaign {campaign}`.")
+            print("  A solve run without --campaign is not shown here: it read every run "
+                  "in the file.")
+        else:
+            print("  nothing solved yet -- run `dmr-surveyor geo solve`")
         return
     rows = _rows(
         connection,
@@ -401,14 +443,27 @@ def solutions(connection: sqlite3.Connection) -> None:
             print(f"      ! {warning}")
 
 
-def plan(connection: sqlite3.Connection) -> None:
-    row = connection.execute(
-        "SELECT status, reason, plan_json FROM geo_plans ORDER BY rowid DESC LIMIT 1"
-    ).fetchone()
+def plan(connection: sqlite3.Connection, campaign: str | None = None) -> None:
+    if campaign:
+        row = connection.execute(
+            "SELECT status, reason, plan_json FROM geo_plans WHERE campaign_id = ? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (campaign,),
+        ).fetchone()
+    else:
+        row = connection.execute(
+            "SELECT status, reason, plan_json FROM geo_plans ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
     print()
     print("== WHERE TO GO NEXT " + "=" * 49)
     if row is None:
-        print("  no plan yet -- it is written by `geo solve`")
+        if campaign:
+            print(f"  no plan for campaign {campaign} -- it is written by "
+                  f"`geo solve --campaign {campaign}`.")
+            print("  A plan from an unscoped solve is not shown here: it was computed "
+                  "from every run in the file.")
+        else:
+            print("  no plan yet -- it is written by `geo solve`")
         return
     print(f"  {row['status']}: {row['reason']}")
     # Rank is the position in the list, which is how the map numbers them --
@@ -438,23 +493,15 @@ def main() -> None:
               + (f", campaign {campaign}" if campaign else ""))
         print()
         stops(connection, campaign)
-        if campaign:
-            # Only the collection section can be narrowed today. Printing
-            # whole-database evidence, solutions and a plan under a heading
-            # that names one campaign would invite every number below to be
-            # read as that campaign's, which none of them is. They are
-            # skipped and said to be skipped, rather than shown mislabelled.
-            print()
-            print("== NOT SHOWN FOR A SINGLE CAMPAIGN " + "=" * 34)
-            print("  Measurements, solutions and the next-stop plan are not "
-                  "campaign-scoped yet.")
-            print("  They would cover every run in the database, not just "
-                  f"campaign {campaign}.")
-            print("  Run without --campaign to see them across the whole file.")
-        else:
-            measurements(connection)
-            solutions(connection)
-            plan(connection)
+        # Every section below is narrowed by the same campaign as the one
+        # above, so the whole digest describes one set of stops. Measurements
+        # reach it by joining `survey_runs`; solutions and plans carry the
+        # campaign their solve was scoped to, and a batch solved without one
+        # is not shown under a campaign heading, because it read every run in
+        # the file rather than this round's.
+        measurements(connection, campaign)
+        solutions(connection, campaign)
+        plan(connection, campaign)
     finally:
         connection.close()
 

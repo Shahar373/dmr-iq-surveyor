@@ -31,6 +31,7 @@ from dmr_iq_surveyor.survey.discovery import (
 from dmr_iq_surveyor.survey.profiles import (
     BandProfile,
     ComparisonTolerances,
+    HardwareProfile,
     SiteProfile,
     resolve_band_profile,
     resolve_site_profile,
@@ -148,6 +149,7 @@ def run_survey(
     campaign_id: str | None = None,
     hardware: dict[str, Any] | None = None,
     declared_site: SiteProfile | None = None,
+    declared_hardware: HardwareProfile | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     log = SurveyLog()
@@ -200,12 +202,21 @@ def run_survey(
     # measured, so editing that profile later cannot rewrite what this run
     # appears to have been taken with.
     measured = hardware if hardware is not None else hardware_from_recording(source)
-    resolved_hardware = with_declared(measured, declared_bucket(declaration))
+    resolved_hardware = with_declared(
+        measured, declared_bucket(declaration, declared_hardware)
+    )
     log.info(
         f"campaign {resolved_campaign_id!r}; receiver state "
         f"{hardware_source_label(resolved_hardware)}"
     )
-    if not site_profile.is_gain_comparable:
+    # A hardware profile declares the gain for the whole round, so a run that
+    # names one IS gain-comparable even when its site profile records
+    # nothing. Warning anyway would train an operator to ignore the one
+    # message that says levels cannot be trusted.
+    declares_gain = site_profile.is_gain_comparable or (
+        declared_hardware is not None and declared_hardware.declares_gain
+    )
+    if not declares_gain:
         log.warning(
             f"site {site_profile.site_id!r} has no recorded gain; "
             "cross-run SNR comparisons involving this run are not gain-comparable"
@@ -498,6 +509,11 @@ def run_comparison(
         baseline_row = get_run(connection, baseline_run_id)
         if baseline_row is None:
             raise ValueError(f"Unknown survey run: {baseline_run_id}")
+        target_row = get_run(connection, target_run_id)
+        if target_row is None:
+            raise ValueError(f"Unknown survey run: {target_run_id}")
+        baseline_campaign = baseline_row["campaign_id"]
+        target_campaign = target_row["campaign_id"]
         tolerances = tolerances_from.comparison if tolerances_from is not None else ComparisonTolerances()
         rows = compare_runs(
             connection,
@@ -511,7 +527,11 @@ def run_comparison(
 
     row_dicts = [row.to_dict() for row in rows]
     report = build_comparison_report(
-        baseline_run_id=baseline_run_id, target_run_id=target_run_id, rows=row_dicts
+        baseline_run_id=baseline_run_id,
+        target_run_id=target_run_id,
+        rows=row_dicts,
+        baseline_campaign_id=baseline_campaign,
+        target_campaign_id=target_campaign,
     )
     destination = Path(output_root).expanduser().resolve()
     (destination / "reports").mkdir(parents=True, exist_ok=True)
@@ -519,7 +539,11 @@ def run_comparison(
     write_json(destination / "reports" / f"{stem}.json", report)
     (destination / "reports" / f"{stem}.md").write_text(
         render_comparison_markdown(
-            baseline_run_id=baseline_run_id, target_run_id=target_run_id, rows=row_dicts
+            baseline_run_id=baseline_run_id,
+            target_run_id=target_run_id,
+            rows=row_dicts,
+            baseline_campaign_id=baseline_campaign,
+            target_campaign_id=target_campaign,
         ),
         encoding="utf-8",
     )

@@ -218,6 +218,9 @@ class LiveSettings:
         # Checked with the rest of the settings, which `LiveSession.__init__`
         # validates -- so a mistyped campaign id fails before the SDR is
         # opened and a drive begins, not after the first bin is written.
+        # Checked, not rewritten: these settings hold what the operator
+        # asked for. The store normalises on the way in, and anything that
+        # COMPARES this value against a stored one must normalise it first.
         normalise_campaign_id(self.campaign_id)
         if self.min_windows_per_bin < 1:
             raise ValueError("min_windows_per_bin must be at least 1")
@@ -867,7 +870,9 @@ class LiveSession:
         # A hold is the better measurement of its place, so it supersedes the
         # drive bin taken there -- this session's or an earlier one's -- and
         # is itself superseded by a later day's hold on the same spot.
-        self.stats.bins_superseded += _supersede_earlier_bins(connection, place_key, run_id)
+        self.stats.bins_superseded += _supersede_earlier_bins(
+            connection, place_key, run_id, self.settings.campaign_id
+        )
         if is_hold:
             self._held_places.add(place_key)
         frames = (
@@ -1002,7 +1007,9 @@ def _like_prefix(literal: str) -> str:
     return escaped + "\\_%"
 
 
-def _supersede_earlier_bins(connection: Any, place_key: str, new_run_id: str) -> int:
+def _supersede_earlier_bins(
+    connection: Any, place_key: str, new_run_id: str, campaign_id: str | None = None
+) -> int:
     """Bar every earlier measurement of this place from the solve, naming the
     one that replaces it. Returns how many were superseded.
 
@@ -1011,11 +1018,31 @@ def _supersede_earlier_bins(connection: Any, place_key: str, new_run_id: str) ->
     session-qualified id of the same place. Neither is deleted: the rows,
     their observations and their levels all stay, so the digest can report
     whether two drives of one road agree.
+
+    Confined to the campaign being driven. This is the one place where the
+    absence of a campaign boundary did not merely widen a query but *wrote*
+    across one: re-driving a road under a second round would exclude the
+    first round's bins of the same road, silently deleting evidence from a
+    campaign this drive has nothing to do with. A drive with no campaign
+    still supersedes only other unassigned bins, for the same reason -- the
+    two are separate rounds either way.
     """
+    # Normalised before comparing. The store normalises on the way in, so a
+    # drive holding `Day1` whose runs were written as `day1` would compare
+    # the two, find no match, and silently supersede nothing -- leaving both
+    # passes of a re-driven road counting, which is the double evidence this
+    # function exists to prevent. `""` normalises to `None`, the same as an
+    # unset campaign, which is how those runs were stored.
+    wanted = normalise_campaign_id(campaign_id)
+    if wanted is None:
+        condition, extra = "r.campaign_id IS NULL", ()
+    else:
+        condition, extra = "r.campaign_id = ?", (wanted,)
     rows = connection.execute(
-        "SELECT survey_run_id FROM survey_runs "
-        "WHERE (survey_run_id = ? OR survey_run_id LIKE ? ESCAPE '\\') AND survey_run_id != ?",
-        (place_key, _like_prefix(place_key), new_run_id),
+        "SELECT r.survey_run_id FROM survey_runs r "
+        "WHERE (r.survey_run_id = ? OR r.survey_run_id LIKE ? ESCAPE '\\') "
+        f"AND r.survey_run_id != ? AND {condition}",
+        (place_key, _like_prefix(place_key), new_run_id, *extra),
     ).fetchall()
     superseded = 0
     for row in rows:

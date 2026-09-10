@@ -35,6 +35,7 @@ from dmr_iq_surveyor.geo.store import (
 )
 from dmr_iq_surveyor.reference.p25_sites import ReferenceError
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
+from dmr_iq_surveyor.survey.scope import CampaignScope, CampaignScopeError, resolve_scope
 
 geo_app = typer.Typer(
     no_args_is_help=True,
@@ -49,9 +50,39 @@ DatabaseOption = Annotated[
     Path | None, typer.Option("--database", help="Persistent inventory SQLite path")
 ]
 
+CampaignOption = Annotated[
+    str | None,
+    typer.Option(
+        "--campaign",
+        help=(
+            "Analyse only this collection round. Every derived value -- the "
+            "reference gain, the noise floor, the common-mode offsets, the "
+            "solutions, the plan and the exports -- is computed from its runs "
+            "alone. Runs recorded before campaigns existed carry no campaign "
+            "and are NOT included. Left unset, the whole database is analysed, "
+            "exactly as before"
+        ),
+    ),
+]
+
 
 def _database(value: Path | None) -> Path:
     return value if value is not None else DEFAULT_DATABASE_PATH
+
+
+def _scope(campaign: str | None) -> CampaignScope:
+    """Turn `--campaign` into a scope, or fail before anything is read."""
+    try:
+        return resolve_scope(campaign)
+    except CampaignScopeError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=1) from exc
+
+
+def _scope_note(scope: CampaignScope) -> str:
+    if scope.is_whole_database:
+        return ""
+    return f" (campaign {scope.campaign_id})"
 
 
 @geo_app.command("import-sites")
@@ -113,8 +144,10 @@ def geo_measurements(
             help="Margin held back from measured passband edges before trusting a non-detection",
         ),
     ] = 25_000.0,
+    campaign: CampaignOption = None,
 ) -> None:
     """Materialise site-level measurements from stored survey observations."""
+    scope = _scope(campaign)
     settings = MeasurementSettings(
         level_metric=level_metric,
         frequency_tolerance_hz=tolerance_hz,
@@ -122,14 +155,20 @@ def geo_measurements(
     )
     try:
         result = materialise_measurements(
-            database_path=_database(database), run_ids=run or None, settings=settings
+            database_path=_database(database),
+            run_ids=run or None,
+            settings=settings,
+            scope=scope,
         )
     except (ValueError, OSError, sqlite3.Error) as exc:
         console.print(f"[bold red]Measurement extraction failed:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
 
     summary = result["summary"]
-    table = Table(title=f"Geolocation measurements from {result['run_count']} survey run(s)")
+    table = Table(
+        title=f"Geolocation measurements from {result['run_count']} survey run(s)"
+        + _scope_note(scope)
+    )
     table.add_column("Category", style="bold")
     table.add_column("Count", justify="right")
     table.add_row("Detections", str(summary["detections"]))
@@ -187,6 +226,7 @@ def geo_solve(
             ),
         ),
     ] = True,
+    campaign: CampaignOption = None,
 ) -> None:
     """Estimate a credible region for every site with usable measurements."""
     # The coarse pass must never be finer than the fine pass. Scaling it with
@@ -198,6 +238,7 @@ def geo_solve(
     # default in SolveSettings silently did nothing for anyone using the CLI:
     # `--min-detections` alone still carried the value it had before the gate
     # was rewritten, so `geo solve` kept refusing sites the field app solved.
+    scope = _scope(campaign)
     overrides: dict[str, object] = {}
     if min_detections is not None:
         overrides["min_detections"] = min_detections
@@ -221,6 +262,7 @@ def geo_solve(
             solve_batch_id=batch_id,
             settings=settings,
             common_mode=CommonModeSettings(enabled=common_mode),
+            scope=scope,
         )
     except (ValueError, OSError, sqlite3.Error) as exc:
         console.print(f"[bold red]Solve failed:[/bold red] {exc}")
@@ -305,10 +347,11 @@ def geo_solve(
 
 
 @geo_app.command("sites")
-def geo_sites(database: DatabaseOption = None) -> None:
+def geo_sites(database: DatabaseOption = None, campaign: CampaignOption = None) -> None:
     """List registry sites with their evidence and latest solution status."""
+    scope = _scope(campaign)
     try:
-        overview = site_overview(database_path=_database(database))
+        overview = site_overview(database_path=_database(database), scope=scope)
     except (OSError, sqlite3.Error) as exc:
         console.print(f"[bold red]Could not read the registry:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -351,8 +394,10 @@ def geo_sites(database: DatabaseOption = None) -> None:
 def geo_history(
     site_key: Annotated[str, typer.Argument(help="Site key, e.g. BEE00:37D:1:30")],
     database: DatabaseOption = None,
+    campaign: CampaignOption = None,
 ) -> None:
     """Show how one site's credible region changed as sessions accumulated."""
+    scope = _scope(campaign)
     connection = connect_geo_database(_database(database))
     try:
         row = connection.execute(
@@ -361,7 +406,7 @@ def geo_history(
         if row is None:
             console.print(f"[bold red]Unknown site key:[/bold red] {site_key}")
             raise typer.Exit(code=1)
-        history = solution_history(connection, int(row["p25_site_id"]))
+        history = solution_history(connection, int(row["p25_site_id"]), scope=scope)
     finally:
         connection.close()
 
@@ -387,14 +432,23 @@ def geo_history(
 
 
 @geo_app.command("plan")
-def geo_plan(database: DatabaseOption = None) -> None:
+def geo_plan(database: DatabaseOption = None, campaign: CampaignOption = None) -> None:
     """Show where the next stop would teach the most."""
+    scope = _scope(campaign)
     connection = connect_geo_database(_database(database))
     try:
-        stored = latest_plan(connection)
+        stored = latest_plan(connection, scope=scope)
     finally:
         connection.close()
     if stored is None:
+        if not scope.is_whole_database:
+            console.print(
+                f"No plan for campaign {scope.campaign_id}. Run "
+                f"`dmr-surveyor geo solve --campaign {scope.campaign_id}` first; a plan from "
+                "an unscoped solve is not offered here, because it was computed from every "
+                "run in the database."
+            )
+            return
         console.print("No plan yet. Run `dmr-surveyor geo solve` first.")
         return
     plan = json.loads(stored["plan_json"] or "{}")
@@ -439,8 +493,10 @@ def geo_export(
             help="geojson, kml (regions over imagery in Google Earth), or gpx (stops for a navigator)",
         ),
     ] = None,
+    campaign: CampaignOption = None,
 ) -> None:
     """Write measurements, estimates, regions and the next-stop plan."""
+    scope = _scope(campaign)
     destination = Path(output).expanduser().resolve()
     chosen = (export_format or destination.suffix.lstrip(".") or "geojson").lower()
     if chosen not in ("geojson", "json", "kml", "gpx"):
@@ -450,18 +506,23 @@ def geo_export(
     try:
         connection = connect_geo_database(_database(database))
         try:
-            stored = latest_plan(connection)
+            stored = latest_plan(connection, scope=scope)
+            predicate, parameters = scope.where("r")
             visited = [
                 dict(row)
                 for row in connection.execute(
-                    "SELECT DISTINCT survey_run_id, latitude, longitude FROM geo_measurements "
-                    "WHERE latitude IS NOT NULL"
+                    "SELECT DISTINCT m.survey_run_id, m.latitude, m.longitude "
+                    "FROM geo_measurements m "
+                    "JOIN survey_runs r ON r.survey_run_id = m.survey_run_id "
+                    "WHERE m.latitude IS NOT NULL"
+                    + (f" AND {predicate}" if predicate else ""),
+                    parameters,
                 )
             ]
         finally:
             connection.close()
         plan = json.loads((stored or {}).get("plan_json") or "{}")
-        collection = build_map_geojson(database_path=_database(database))
+        collection = build_map_geojson(database_path=_database(database), scope=scope)
         if stored is not None:
             plan_features = json.loads(stored["geojson"] or "{}").get("features", [])
             collection["features"].extend(plan_features)

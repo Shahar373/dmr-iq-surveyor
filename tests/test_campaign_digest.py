@@ -169,18 +169,39 @@ def test_an_unknown_campaign_reports_an_empty_round_rather_than_everything(
     assert "25.0 dB IFGR" not in output
 
 
-def test_a_campaign_run_skips_the_sections_it_cannot_narrow(tmp_path: Path) -> None:
-    """Only the collection section is campaign-scoped today. Printing
-    whole-database evidence under a heading that names one campaign would
-    invite every number below it to be read as that campaign's."""
+def test_a_campaign_run_now_narrows_every_section(tmp_path: Path) -> None:
+    """This replaces a test that asserted the opposite.
+
+    The digest used to skip evidence, solutions and the plan under
+    `--campaign` and say it was skipping them, because those three sections
+    read the whole database and printing them under a heading naming one
+    round would invite every number to be read as that round's. They are
+    genuinely scoped now -- measurements by joining `survey_runs`, solutions
+    and plans by the campaign their solve was scoped to -- so the sections
+    are shown, and the message saying they could not be is gone.
+
+    The old assertion is preserved by inversion: the notice must NOT appear,
+    so this fails if the skip block ever comes back without the scoping.
+    """
     output = _digest(_database(tmp_path), "--campaign", "day1")
 
-    assert "NOT SHOWN FOR A SINGLE CAMPAIGN" in output
-    assert "not campaign-scoped yet" in output
     assert "campaign day1" in output
-    # The three global sections are absent rather than mislabelled.
-    assert "WHAT COUNTED AS EVIDENCE" not in output
-    assert "WHAT THE SOLVER CONCLUDED" not in output
+    assert "WHAT COUNTED AS EVIDENCE" in output
+    assert "WHAT THE SOLVER CONCLUDED" in output
+    assert "NOT SHOWN FOR A SINGLE CAMPAIGN" not in output
+    assert "not campaign-scoped yet" not in output
+
+
+def test_a_campaign_with_no_solve_of_its_own_says_so_rather_than_borrowing_one(
+    tmp_path: Path,
+) -> None:
+    """A batch solved without `--campaign` read every run in the file.
+    Showing its numbers under one round's heading is exactly the
+    mislabelling the old skip block existed to prevent."""
+    output = _digest(_database(tmp_path), "--campaign", "day1")
+
+    assert "nothing solved for campaign day1" in output
+    assert "no plan for campaign day1" in output
 
 
 def test_without_a_campaign_the_whole_file_is_reported_as_before(tmp_path: Path) -> None:
@@ -236,3 +257,148 @@ def test_a_row_with_junk_inside_a_valid_blob_does_not_bring_the_digest_down(
     assert "25.0 dB IFGR (applied)" not in output
     # The rows that are fine still read normally.
     assert "26.0 dB IFGR (requested)" in output
+
+
+# -- the whole digest, scoped end to end -------------------------------------
+
+
+def _geo_database(tmp_path: Path) -> Path:
+    """A real geo database holding two rounds, each solved for itself.
+
+    Built with the shared geo fixture rather than by hand, so the rows the
+    digest reads are the rows the pipeline actually writes.
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from fixtures.geo_scenario import Transmitter, build_database, fast_solve_settings, seed_run
+
+    from dmr_iq_surveyor.geo.pipeline import materialise_measurements, solve_all_sites
+    from dmr_iq_surveyor.survey.scope import CampaignScope
+
+    transmitter = Transmitter(
+        867_762_500.0, 32.050, 34.800, reference_level_db=25.0, path_loss_exponent=3.4
+    )
+    path = tmp_path / "geo.sqlite3"
+    connection = build_database(path)
+    try:
+        for index, (latitude, longitude) in enumerate(
+            [(32.070, 34.770), (32.075, 34.775), (32.080, 34.790)]
+        ):
+            seed_run(
+                connection,
+                run_id=f"day1_{index}",
+                latitude=latitude,
+                longitude=longitude,
+                transmitters=[transmitter],
+                site_id=f"d1_{index}",
+                campaign_id="day1",
+            )
+        for index, (latitude, longitude) in enumerate(
+            [(32.030, 34.820), (32.035, 34.825), (32.040, 34.830)]
+        ):
+            seed_run(
+                connection,
+                run_id=f"day2_{index}",
+                latitude=latitude,
+                longitude=longitude,
+                transmitters=[transmitter],
+                site_id=f"d2_{index}",
+                campaign_id="day2",
+            )
+    finally:
+        connection.close()
+
+    materialise_measurements(database_path=path)
+    solve_all_sites(
+        database_path=path,
+        settings=fast_solve_settings(),
+        solve_batch_id="b_day1",
+        scope=CampaignScope("day1"),
+    )
+    solve_all_sites(
+        database_path=path,
+        settings=fast_solve_settings(),
+        solve_batch_id="b_day2",
+        scope=CampaignScope("day2"),
+    )
+    return path
+
+
+def _evidence_counts(output: str) -> tuple[int, int]:
+    """The `usable N detection(s), M non-detection(s)` line, as numbers."""
+    for line in output.splitlines():
+        if line.strip().startswith("usable"):
+            parts = line.replace("(s)", "").split()
+            return int(parts[1]), int(parts[3])
+    raise AssertionError(f"no usable line in:\n{output}")
+
+
+def test_the_digest_never_mixes_two_campaigns_end_to_end(tmp_path: Path) -> None:
+    """The no-mixing proof at the level an operator actually reads.
+
+    Each round's evidence counts are strictly smaller than the whole file's,
+    and the two rounds' counts add up to it. If any section leaked, one of
+    those two facts would break.
+    """
+    path = _geo_database(tmp_path)
+
+    whole = _evidence_counts(_digest(path))
+    first = _evidence_counts(_digest(path, "--campaign", "day1"))
+    second = _evidence_counts(_digest(path, "--campaign", "day2"))
+
+    assert first[0] > 0 and second[0] > 0
+    assert first[0] + second[0] == whole[0]
+    assert first[1] + second[1] == whole[1]
+    assert first < whole
+
+
+def test_each_round_reports_its_own_solve_and_plan(tmp_path: Path) -> None:
+    path = _geo_database(tmp_path)
+
+    first = _digest(path, "--campaign", "day1")
+    second = _digest(path, "--campaign", "day2")
+
+    assert "WHAT THE SOLVER CONCLUDED" in first
+    assert "nothing solved for campaign" not in first
+    assert "no plan for campaign" not in second
+    # Each names its own batch and not the other's.
+    assert "b_day1" in first and "b_day2" not in first
+    assert "b_day2" in second and "b_day1" not in second
+
+
+def test_an_unassigned_run_reaches_the_whole_file_digest_only(tmp_path: Path) -> None:
+    path = _geo_database(tmp_path)
+    from fixtures.geo_scenario import Transmitter, seed_run
+
+    from dmr_iq_surveyor.geo.pipeline import materialise_measurements
+    from dmr_iq_surveyor.geo.store import connect_geo_database
+
+    connection = connect_geo_database(path)
+    try:
+        seed_run(
+            connection,
+            run_id="legacy",
+            latitude=32.06,
+            longitude=34.76,
+            transmitters=[
+                Transmitter(
+                    867_762_500.0, 32.050, 34.800, reference_level_db=25.0,
+                    path_loss_exponent=3.4,
+                )
+            ],
+            site_id="legacy_stop",
+            campaign_id=None,
+        )
+    finally:
+        connection.close()
+    materialise_measurements(database_path=path)
+
+    # The unassigned stop's evidence is counted by the whole-file digest and
+    # by neither round's -- it was not taken under either.
+    before = _evidence_counts(_digest(path, "--campaign", "day1"))
+    whole = _evidence_counts(_digest(path))
+    second = _evidence_counts(_digest(path, "--campaign", "day2"))
+
+    assert whole[0] > before[0] + second[0]
+    assert "unassigned" in _digest(path)

@@ -356,7 +356,9 @@ Given one wideband IQ recording, Phase 6A discovers active RF signals with no pr
 
 Runs and observations persist in the same SQLite database as the DMR inventory (`runs/inventory/dmr_inventory.sqlite3` by default), extended additively — existing tables are untouched. `survey compare` works with no protocol decoder installed and reports `NEW`, `MISSING_THIS_RUN`, `STABLE`, `SNR_CHANGE`, `OCCUPANCY_CHANGE`, `PERSISTENCE_CHANGE`, or `NOT_COMPARABLE` between two runs.
 
-`--campaign <id>` tags a run with the collection round it belongs to -- on `survey run`, `survey capture`, `live stop` and `web serve`. Left unset a run is unassigned, which is what every run recorded before campaigns existed is; none was backfilled. `scripts/campaign_digest.py --campaign <id>` narrows the collection section of the digest, and skips the measurement, solution and planning sections rather than showing whole-database numbers under one campaign's heading.
+`--campaign <id>` tags a run with the collection round it belongs to -- on `survey run`, `survey capture`, `live stop` and `web serve`. Left unset a run is unassigned, which is what every run recorded before campaigns existed is; none was backfilled. `--campaign <id>` is also an **analysis boundary**, not only a tag: pass it to `geo measurements`, `geo solve`, `geo sites`, `geo history`, `geo plan`, `geo export` and `scripts/campaign_digest.py`, and every derived value -- the reference gain, the noise floor, the common-mode offsets, the solutions, the next-stop plan and the exports -- is computed from that round's runs alone. Runs recorded before campaigns existed carry no campaign and are excluded rather than swept in. Without the flag every command reads the whole database, exactly as before.
+
+`survey compare` reports `campaign_differs` and names both rounds when two runs come from different ones. It never blocks: comparing two rounds is the point of running a second one, and what a reader needs is to know that a level difference may be the rounds rather than the RF.
 
 Band profiles (`config/bands/*.yaml`, e.g. `central_800.yaml` for 866-870 MHz, `central_800_recon.yaml` for a short first-look capture) describe where to look; site profiles (`config/sites/*.yaml`, copy `home.example.yaml`) record the fixed measurement context. See [`docs/phase6a-survey.md`](docs/phase6a-survey.md) for the full design, schema and acceptance criteria, [`docs/phase6-design.md`](docs/phase6-design.md) for the overall Phase 6 roadmap toward P25, and [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md) for a field-ready capture procedure at a new site.
 
@@ -735,7 +737,11 @@ Precedence is explicit flag, then campaign manifest, then project manifest, then
 
 Without `--project` nothing binds, nothing is opened at startup, and every existing invocation behaves exactly as it did — including today's create-on-open behaviour, which is left alone rather than changed underneath commands that depend on it.
 
-See [`docs/projects-and-campaigns.md`](docs/projects-and-campaigns.md) for the manifest reference, the adoption order of operations and the full precedence table.
+A campaign is an analysis boundary, not only a tag: `--campaign` on the `geo` commands and the digest computes every derived value -- reference gain, noise floor, common-mode, solutions, plan, exports -- from that round's runs alone, and never sweeps in a run recorded before campaigns existed.
+
+`config/hardware/*.yaml` declares the receiver a round is run with; a campaign names one under `defaults.hardware`, and `--hardware` names one directly on `survey run` / `survey capture`. It outranks the site profile for gain, because gain belongs to the radio rather than to the place -- but it is still a declaration, and only the radio's own read-back is ever recorded as `applied`.
+
+See [`docs/projects-and-campaigns.md`](docs/projects-and-campaigns.md) for the manifest reference, the adoption order of operations, the campaign-scoping rules, the hardware profile and the full precedence tables.
 
 ## Result packaging
 

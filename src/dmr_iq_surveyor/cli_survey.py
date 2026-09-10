@@ -27,7 +27,11 @@ from dmr_iq_surveyor.survey.pipeline import (
     run_comparison,
     run_survey,
 )
-from dmr_iq_surveyor.survey.profiles import ProfileError, resolve_band_profile
+from dmr_iq_surveyor.survey.profiles import (
+    ProfileError,
+    resolve_band_profile,
+    resolve_hardware_profile,
+)
 from dmr_iq_surveyor.survey.provenance import ProvenanceError, normalise_campaign_id
 from dmr_iq_surveyor.survey.store import (
     connect_survey_database,
@@ -41,6 +45,21 @@ survey_app = typer.Typer(
     help="Protocol-agnostic RF survey: discovery, persistent inventory, and run comparison.",
 )
 console = Console()
+
+
+def _hardware_profile(name: str | None):
+    """Resolve `--hardware`, or fail before anything is analysed.
+
+    Returns `None` when no profile was named, which is every invocation that
+    predates hardware profiles: the site profile stays the only declaration.
+    """
+    if not name:
+        return None
+    try:
+        return resolve_hardware_profile(name)
+    except (ProfileError, FileNotFoundError, OSError) as exc:
+        console.print(f"[bold red]Hardware profile could not be resolved:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 @survey_app.command("run")
@@ -109,6 +128,18 @@ def survey_run(
             ),
         ),
     ] = None,
+    hardware: Annotated[
+        str | None,
+        typer.Option(
+            "--hardware",
+            help=(
+                "Hardware profile name (config/hardware/<name>.yaml) or a path to one. "
+                "Declares the receiver and the gain this round is run with, across every "
+                "site it visits. Left unset the site profile is the only declaration, "
+                "exactly as before"
+            ),
+        ),
+    ] = None,
     gps_url: Annotated[
         str | None,
         typer.Option(
@@ -159,12 +190,14 @@ def survey_run(
     if gps["source"] == "fetch_failed":
         console.print(f"[yellow]GPS fetch failed:[/yellow] {gps['error']} -- continuing without it")
 
+    declared_hardware = _hardware_profile(hardware)
     try:
         result = run_survey(
             recording,
             output,
             band=band,
             site=site,
+            declared_hardware=declared_hardware,
             run_id=run_id,
             database_path=database,
             assumed_iq_order=iq_order,
@@ -381,6 +414,18 @@ def survey_capture(
             ),
         ),
     ] = None,
+    hardware: Annotated[
+        str | None,
+        typer.Option(
+            "--hardware",
+            help=(
+                "Hardware profile name (config/hardware/<name>.yaml) or a path to one. "
+                "Declares the receiver and the gain this round is run with, across every "
+                "site it visits. Left unset the site profile is the only declaration, "
+                "exactly as before"
+            ),
+        ),
+    ] = None,
     survey_output: Annotated[
         Path | None,
         typer.Option(help="Survey run output directory; defaults to <output>/survey"),
@@ -460,6 +505,10 @@ def survey_capture(
         console.print(f"[bold red]{exc}[/bold red]")
         raise typer.Exit(code=1) from exc
 
+    # Before the radio is touched: a profile that does not resolve must fail
+    # now, not after ninety seconds of recording.
+    declared_hardware = _hardware_profile(hardware)
+
     probe = probe_soapysdr(driver)
     if not probe.available:
         console.print(f"[bold red]SoapySDR device unavailable:[/bold red] {probe.probe_error}")
@@ -520,6 +569,7 @@ def survey_capture(
                 on_progress=report,
                 site_id_override=site_id,
                 campaign_id=campaign,
+                declared_hardware=declared_hardware,
             )
     except (FileNotFoundError, OSError, ValueError, ProfileError, RuntimeError, sqlite3.Error) as exc:
         console.print(f"[bold red]Capture/survey failed:[/bold red] {exc}")
@@ -760,6 +810,11 @@ def survey_compare(
     for status, count in sorted(report["status_counts"].items()):
         table.add_row(status, str(count))
     console.print(table)
+    # Printed, never blocking: comparing two rounds is the point of running a
+    # second one. What the operator needs is to know which differences might
+    # be the rounds rather than the RF.
+    for warning in report.get("warnings", []):
+        console.print(f"[yellow]{warning}[/yellow]")
     console.print(f"[green]Reports written to:[/green] {Path(output).resolve() / 'reports'}")
 
 

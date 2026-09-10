@@ -55,6 +55,12 @@ load_env() {
     : "${FIELD_PORT:=8765}"
     : "${FIELD_SITE:=}"
     : "${FIELD_BAND:=central_800_narrow}"
+    # Empty means "not a project deployment", which is every install made
+    # before these existed. Declared here rather than assumed, because
+    # `set -u` would abort the whole script on an env file that predates
+    # them -- which is exactly the file every existing Pi already has.
+    : "${FIELD_PROJECT:=}"
+    : "${FIELD_CAMPAIGN:=}"
     : "${FIELD_CENTER_FREQUENCY:=867406250}"
     : "${FIELD_SAMPLE_RATE:=5000000}"
     : "${FIELD_DURATION:=90}"
@@ -148,6 +154,17 @@ build_argv() {
         --tls-cert "$FIELD_TLS_CERT"
         --tls-key "$FIELD_TLS_KEY"
     )
+    # Appended only when set, never passed empty. `web serve` gates on
+    # `--project` being not-None rather than truthy, so `--project ""` would
+    # reach project resolution and fail on the empty string; omitting the
+    # flag is what leaves the app behaving exactly as it did before projects
+    # existed.
+    if [[ -n "$FIELD_PROJECT" ]]; then
+        ARGV+=( --project "$FIELD_PROJECT" )
+    fi
+    if [[ -n "$FIELD_CAMPAIGN" ]]; then
+        ARGV+=( --campaign "$FIELD_CAMPAIGN" )
+    fi
 }
 
 # --- reaching the API without leaking the token -------------------------
@@ -293,6 +310,17 @@ cmd_status() {
 
     printf 'site     %s\n' "${FIELD_SITE:-UNSET -- the service cannot start}"
     printf 'band     %s\n' "$FIELD_BAND"
+    # Printed whether set or not. A project binds the service to one database
+    # and refuses every other, and a campaign decides what each stop is
+    # recorded as; both are invisible from the outside otherwise.
+    printf 'project  %s\n' "${FIELD_PROJECT:-none -- not a project deployment}"
+    printf 'campaign %s\n' "${FIELD_CAMPAIGN:-none -- stops recorded here stay unassigned}"
+    if [[ -n "$FIELD_CAMPAIGN" && -z "$FIELD_PROJECT" ]]; then
+        # `web serve` only reads --campaign alongside --project, so this
+        # combination silently does nothing. Said here rather than
+        # discovered after a day of stops came back unassigned.
+        printf 'WARNING  FIELD_CAMPAIGN is set but FIELD_PROJECT is not; stops stay unassigned\n'
+    fi
     # Printed because these decide whether a stop is recordable at all on
     # this storage, and because the values in effect are otherwise invisible
     # until a capture has already failed.
