@@ -59,14 +59,19 @@ def _gain_readings(runs: list[sqlite3.Row]) -> list[tuple]:
     radio reported back beats what it was asked for, which beats what the
     site profile declared before anyone drove anywhere. A reader has to be
     able to tell those apart, because only the first is a measurement.
+
+    `sites.gain` is offered last and labelled apart. It is one mutable row
+    that every run rewrites, so it describes the profile as it stands now,
+    not as it stood for the run being read -- which is exactly why runs
+    began carrying their own declaration.
     """
     readings = []
     for row in runs:
         hardware = load_hardware(row["hardware_json"])
         readings.append(
             (
-                if_gain_reading(hardware, declared=row["gain"]),
-                lna_state_reading(hardware, declared=row["lna_state"]),
+                if_gain_reading(hardware, site_row=row["gain"]),
+                lna_state_reading(hardware, site_row=row["lna_state"]),
             )
         )
     return readings
@@ -433,9 +438,23 @@ def main() -> None:
               + (f", campaign {campaign}" if campaign else ""))
         print()
         stops(connection, campaign)
-        measurements(connection)
-        solutions(connection)
-        plan(connection)
+        if campaign:
+            # Only the collection section can be narrowed today. Printing
+            # whole-database evidence, solutions and a plan under a heading
+            # that names one campaign would invite every number below to be
+            # read as that campaign's, which none of them is. They are
+            # skipped and said to be skipped, rather than shown mislabelled.
+            print()
+            print("== NOT SHOWN FOR A SINGLE CAMPAIGN " + "=" * 34)
+            print("  Measurements, solutions and the next-stop plan are not "
+                  "campaign-scoped yet.")
+            print("  They would cover every run in the database, not just "
+                  f"campaign {campaign}.")
+            print("  Run without --campaign to see them across the whole file.")
+        else:
+            measurements(connection)
+            solutions(connection)
+            plan(connection)
     finally:
         connection.close()
 

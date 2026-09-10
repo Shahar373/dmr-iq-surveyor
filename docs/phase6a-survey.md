@@ -116,34 +116,55 @@ Rules enforced in code, not just convention:
 site profile's *declared* gain -- a statement of intent made before any stop, not a record of
 what a given stop ran at. Two runs sharing a `site_id` cannot be told apart by it.
 
-`survey_runs.hardware_json` is the per-run record, and it keeps two claims separate:
+`survey_runs.hardware_json` is the per-run record, and it keeps three claims separate:
 
 | bucket | what it holds |
 |---|---|
-| `requested` | what this software asked the radio for |
 | `applied` | what the radio reported back when asked (`device_settings_applied`) |
+| `requested` | what this software asked the radio for |
+| `declared` | the site profile as it stood for *this* run |
 | `identity` | the driver and serial the device was opened as |
 
-`source` names the strongest bucket that carries anything: `applied`, `requested`, or
-`not_recorded`. A value that was not observed is absent, never inferred from the profile --
-the geolocation solver reads level as distance, so a declared gain presented as a measured one
-is a confident wrong number. A reader falling back to the `sites` row labels that `declared`,
-which is why `declared` is the one source value never written into a stored blob.
+`source` is derived, never chosen: it names the strongest bucket that carries anything --
+`applied`, `requested`, `declared`, or `not_recorded` -- and a blob whose `source` overstates
+its own buckets is rejected rather than repaired. A value that was not observed is absent,
+never inferred: the geolocation solver reads level as distance, so a declared gain presented
+as a measured one is a confident wrong number.
+
+The declaration is snapshotted per run for the same reason. `sites` is one mutable row that
+`upsert_site` rewrites, so without the snapshot a profile edited next month would retroactively
+change the receiver, antenna and gain that every earlier run appears to have been taken with.
+A reader with nothing else falls back to that row and labels it `declared, from the site row`,
+which is the one source never written into a blob.
 
 What each path can honestly record:
 
-| path | source |
+| path | strongest source |
 |---|---|
-| `survey run` on a recording | `not_recorded` -- the recording was not made here |
+| `survey run` on a recording | `declared`, unless the recording's own capture report is beside it |
 | `survey capture`, field-app stop | `applied`, from the capture report it just wrote |
-| field-app analyse | `applied` only if the recording's own capture report names it back |
-| `live stop`, a drive | `requested` -- a drive never reads the radio back |
+| field-app analyse | the same as `survey run`: both look for that report the same way |
+| a drive or `live stop` | `applied` where the device reports back, `requested` where it does not |
+
+A recording is linked to a capture report only when the report names the recording back. A file
+of a matching name sitting in the same directory is a coincidence, and a coincidence must not
+become a gain reading. `run_survey()` performs that lookup itself, so one recording gets one
+answer whether the CLI or the field app analyses it.
 
 `campaign_id` names the collection round a run belongs to: lower case, digits, `.`, `_` and
-`-`, validated on the one write path. `NULL` means unassigned, which is what every run
-recorded before campaigns existed is; none was backfilled. `--campaign` sets it on
-`survey run`, `survey capture`, `live stop` and `web serve`, and narrows
-`scripts/campaign_digest.py`.
+`-`, validated by one function. `NULL` means unassigned, which is what every run recorded
+before campaigns existed is; none was backfilled. `--campaign` sets it on `survey run`,
+`survey capture`, `live stop` and `web serve`.
+
+Each of those checks the id before it spends anything: before a capture is paid for, before
+the SDR is opened for a drive, and at startup for the served app rather than at the operator's
+first stop. The store validates again on the way in, and does so *before* it deletes the run it
+is replacing, so a rejected re-import cannot cost the run that was already there.
+
+`scripts/campaign_digest.py --campaign <id>` narrows the collection section. It is the only
+section that can be narrowed today, so the digest skips the measurement, solution and planning
+sections in that mode and says it is doing so, rather than printing whole-database numbers
+under a heading that names one campaign.
 
 ## Output layout
 

@@ -15,8 +15,11 @@ from pathlib import Path
 
 from dmr_iq_surveyor.survey.profiles import SiteProfile
 from dmr_iq_surveyor.survey.provenance import (
+    declared_bucket,
     hardware_from_capture_manifest,
-    hardware_requested,
+    hardware_provenance,
+    requested_bucket,
+    with_declared,
 )
 from dmr_iq_surveyor.survey.store import (
     SurveyRunRecord,
@@ -70,18 +73,34 @@ def _database(tmp_path: Path) -> Path:
     connection = connect_survey_database(path)
     try:
         upsert_site(connection, SITE)
-        read_back = hardware_from_capture_manifest(
-            {
-                "wav_path": "/tmp/applied_stop.wav",
-                "settings": {"if_gain_reduction_db": 40.0, "lna_state": 2, "driver": "sdrplay"},
-                "device_settings_applied": {"gains": {"IFGR": 25.0, "RFGR": 2.0}},
-            }
+        read_back = with_declared(
+            hardware_from_capture_manifest(
+                {
+                    "wav_path": "/tmp/applied_stop.wav",
+                    "settings": {
+                        "if_gain_reduction_db": 40.0,
+                        "lna_state": 2,
+                        "driver": "sdrplay",
+                    },
+                    "device_settings_applied": {"gains": {"IFGR": 25.0, "RFGR": 2.0}},
+                }
+            ),
+            declared_bucket(SITE),
         )
         for run_id, campaign, hardware in (
             ("applied_stop", "day1", read_back),
-            ("requested_stop", "day1", hardware_requested(if_gain_reduction_db=26.0, lna_state=8)),
-            # Written before the column existed: nothing about the radio, so
-            # the site profile's declaration is all a reader has.
+            (
+                "requested_stop",
+                "day1",
+                hardware_provenance(
+                    requested=requested_bucket(if_gain_reduction_db=26.0, lna_state=8)
+                ),
+            ),
+            # A run that observed nothing but recorded the profile it was
+            # taken under.
+            ("declared_stop", "day2", hardware_provenance(declared=declared_bucket(SITE))),
+            # Written before the column existed: nothing at all, so the
+            # mutable `sites` row is the only thing a reader can fall back on.
             ("legacy_stop", None, None),
         ):
             import_survey_run(
@@ -113,6 +132,9 @@ def test_every_gain_says_whether_it_was_measured_asked_for_or_declared(tmp_path:
     assert "25.0 dB IFGR (applied)" in output
     assert "26.0 dB IFGR (requested)" in output
     assert "40.0 dB IFGR (declared)" in output
+    # The one run with nothing of its own falls back to the shared row,
+    # and says so rather than passing it off as the run's declaration.
+    assert "40.0 dB IFGR (declared, from the site row)" in output
 
 
 def test_the_campaign_breakdown_names_unassigned_runs_as_such(tmp_path: Path) -> None:
@@ -120,6 +142,7 @@ def test_the_campaign_breakdown_names_unassigned_runs_as_such(tmp_path: Path) ->
 
     assert "campaigns" in output
     assert "day1 (2)" in output
+    assert "day2 (1)" in output
     assert "unassigned (1)" in output
 
 
@@ -130,9 +153,9 @@ def test_a_campaign_filter_narrows_the_digest_to_that_round(tmp_path: Path) -> N
     assert "stops total          2" in output
     assert "day1 (2)" in output
     assert "unassigned" not in output
-    # The stop that only had a declaration is not in this round at all, so
-    # neither is its gain.
-    assert "(declared)" not in output
+    # The stop that only had the shared row is not in this round at all, so
+    # neither is its fallback reading.
+    assert "from the site row" not in output
 
 
 def test_an_unknown_campaign_reports_an_empty_round_rather_than_everything(
@@ -142,3 +165,25 @@ def test_an_unknown_campaign_reports_an_empty_round_rather_than_everything(
 
     assert "stops total          0" in output
     assert "25.0 dB IFGR" not in output
+
+
+def test_a_campaign_run_skips_the_sections_it_cannot_narrow(tmp_path: Path) -> None:
+    """Only the collection section is campaign-scoped today. Printing
+    whole-database evidence under a heading that names one campaign would
+    invite every number below it to be read as that campaign's."""
+    output = _digest(_database(tmp_path), "--campaign", "day1")
+
+    assert "NOT SHOWN FOR A SINGLE CAMPAIGN" in output
+    assert "not campaign-scoped yet" in output
+    assert "campaign day1" in output
+    # The three global sections are absent rather than mislabelled.
+    assert "WHAT COUNTED AS EVIDENCE" not in output
+    assert "WHAT THE SOLVER CONCLUDED" not in output
+
+
+def test_without_a_campaign_the_whole_file_is_reported_as_before(tmp_path: Path) -> None:
+    output = _digest(_database(tmp_path))
+
+    assert "WHAT COUNTED AS EVIDENCE" in output
+    assert "WHAT THE SOLVER CONCLUDED" in output
+    assert "NOT SHOWN FOR A SINGLE CAMPAIGN" not in output
