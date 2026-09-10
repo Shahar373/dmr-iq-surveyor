@@ -341,3 +341,54 @@ def test_config_projects_is_searched_before_a_bare_projects_directory(
     _project(tmp_path / "projects" / "p25", body=PROJECT_YAML.replace("p25_central_il", "other_id"))
 
     assert resolve_project("p25", base_dir=tmp_path).project_id == "p25_central_il"
+
+
+# -- a campaign is found by its filename, so the filename is checked ---------
+
+
+def test_a_campaign_filename_that_is_not_a_slug_is_refused(tmp_path: Path) -> None:
+    """It used to be skipped: an unparseable filename meant the comparison
+    never ran, so the one name that can never be found by `resolve_campaign`
+    was the one name that loaded without complaint."""
+    _project(tmp_path / "p")
+    directory = tmp_path / "p" / "campaigns"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "Day One.yaml"
+    path.write_text(
+        "schema_version: 1\ncampaign_id: 2026-09_day1\nproject_id: p25_central_il\n"
+        "label: Day 1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProjectError, match="not a valid campaign id"):
+        load_campaign_manifest(path)
+
+
+def test_a_campaign_filename_that_only_differs_in_case_is_accepted(tmp_path: Path) -> None:
+    """`2026-09_Day1.yaml` normalises to the same slug, so it agrees."""
+    _project(tmp_path / "p")
+    directory = tmp_path / "p" / "campaigns"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "2026-09_Day1.yaml"
+    path.write_text(
+        "schema_version: 1\ncampaign_id: 2026-09_day1\nproject_id: p25_central_il\n"
+        "label: Day 1\n",
+        encoding="utf-8",
+    )
+
+    assert load_campaign_manifest(path).campaign_id == "2026-09_day1"
+
+
+def test_a_campaign_filename_with_no_stem_is_refused(tmp_path: Path) -> None:
+    _project(tmp_path / "p")
+    directory = tmp_path / "p" / "campaigns"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / ".yaml"
+    path.write_text(
+        "schema_version: 1\ncampaign_id: 2026-09_day1\nproject_id: p25_central_il\n"
+        "label: Day 1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProjectError):
+        load_campaign_manifest(path)

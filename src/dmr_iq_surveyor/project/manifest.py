@@ -340,8 +340,24 @@ def load_campaign_manifest(
     if project_id is None:
         raise ProjectError(f"{resolved} has an empty project_id")
 
-    stem = normalise_project_id(resolved.stem) if _ID_RE.match(resolved.stem.lower()) else None
-    if stem is not None and stem != campaign_id:
+    # The filename is how a campaign is found: `resolve_campaign` builds the
+    # path from the id it was asked for and reads whatever is there. So a name
+    # that is not a slug is not a cosmetic problem -- it is a file that can be
+    # read by path and never by name, which means a campaign that exists when
+    # listed and is missing when asked for. Checked unconditionally: skipping
+    # the comparison because the name is invalid is exactly backwards.
+    try:
+        stem = normalise_campaign_id(resolved.stem)
+    except ProvenanceError as exc:
+        raise ProjectError(
+            f"{resolved}: its filename is not a valid campaign id ({exc}). Rename the file to "
+            f"{campaign_id}.yaml"
+        ) from exc
+    if stem is None:
+        raise ProjectError(
+            f"{resolved} has no filename to match against; rename it to {campaign_id}.yaml"
+        )
+    if stem != campaign_id:
         raise ProjectError(
             f"{resolved} declares campaign_id {campaign_id!r} but its filename says {stem!r}; "
             "the two must agree so a campaign can be found by name"
