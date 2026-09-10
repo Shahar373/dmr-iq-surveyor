@@ -282,6 +282,16 @@ sudo /opt/dmr-field/app/scripts/install_field_service.sh --uninstall --purge
 `--purge` deletes recordings and the inventory database. Copy anything you want
 off the Pi first.
 
+## Validation
+
+`docs/validation/ops-field-service-acceptance.md` records the acceptance run
+on the Raspberry Pi: a full reboot, the service coming back on its own, the
+same bookmark and token still working, and a capture completing with no
+overflows. It also records the two defects that run found before it passed.
+
+The application itself — capture, survey, device recovery, the geolocation
+solve — is validated separately in `docs/validation/pi-smoke-v0.10.md`.
+
 ## What this layer does not do
 
 - It does not change the pipeline. `fieldctl exec` runs `dmr-surveyor web
