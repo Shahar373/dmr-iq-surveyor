@@ -332,13 +332,26 @@ def read_claim(connection: sqlite3.Connection) -> Claim | None:
     if row is None:
         return None
     values = tuple(row)
-    return Claim(
-        project_id=str(values[0]),
-        analyzer=str(values[1]),
-        manifest_schema_version=int(values[2]),
-        claimed_at=str(values[3]),
-        claimed_by_version=str(values[4]),
-    )
+    try:
+        # `str()` on an arbitrary value cannot fail, but `int()` can --
+        # `manifest_schema_version` stored as `'broken'` (hand-edited, or a
+        # future writer with a bug) raises `ValueError` here, and a `NULL` in
+        # that slot raises `TypeError`. Both are read failures, exactly like
+        # a missing table or a malformed page, and are refused the same way
+        # rather than left to propagate as a raw traceback out of what every
+        # caller expects to be either a `Claim` or a clean refusal.
+        return Claim(
+            project_id=str(values[0]),
+            analyzer=str(values[1]),
+            manifest_schema_version=int(values[2]),
+            claimed_at=str(values[3]),
+            claimed_by_version=str(values[4]),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ProjectError(
+            f"the {CLAIM_TABLE} row could not be read ({exc}); refused rather than treated "
+            "as unclaimed"
+        ) from exc
 
 
 def assert_claim(connection: sqlite3.Connection, *, project_id: str, analyzer: str) -> Claim:

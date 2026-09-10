@@ -232,6 +232,22 @@ def project_init(
 
     manifest_path = Path(manifest).expanduser().resolve()
     database_path = Path(database).expanduser().resolve()
+    if manifest_path == database_path:
+        # Checked immediately after resolving both, before anything else runs
+        # -- rendering the manifest text, opening the database, writing a
+        # claim. `--create --write` with the two pointed at the same missing
+        # path would otherwise: create the SQLite file, write a claim into
+        # it, then write the manifest to "the same path", which is
+        # `write_manifest_atomically`'s `os.replace` silently overwriting the
+        # database it had just claimed with the manifest's YAML text. The
+        # command would report success; the claim it had just written would
+        # already be gone.
+        _fail(
+            f"--manifest and --database both resolve to {manifest_path}. A "
+            "project's database and its manifest must be two different "
+            "files -- writing one would silently replace the other."
+        )
+        return
     defaults = ProjectDefaults(
         band=band, site=site, output=None if output is None else str(Path(output).expanduser())
     )
@@ -281,7 +297,13 @@ def _manifest_state(manifest_path: Path, text: str) -> str:
         return _MANIFEST_ABSENT
     try:
         current = manifest_path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # `UnicodeDecodeError` is not an `OSError` -- it is raised by the
+        # decode step inside `read_text`, after the read itself succeeded, so
+        # a file that exists, is permission-readable, and simply is not valid
+        # UTF-8 (binary junk, a different encoding) used to escape this
+        # `except` entirely and crash `_create`/`_adopt` with a raw
+        # traceback instead of the refusal the table already promises.
         return _MANIFEST_UNREADABLE
     return _MANIFEST_IDENTICAL if current == text else _MANIFEST_DIFFERS
 

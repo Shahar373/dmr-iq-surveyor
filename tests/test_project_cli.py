@@ -704,3 +704,109 @@ def test_create_refuses_when_the_existing_databases_claim_cannot_be_read(
     assert result.exit_code == 1
     assert "could not be read" in result.output.replace("\n", "")
     assert _fingerprint(database) == before, "an unreadable claim must not be written over"
+
+
+def test_create_refuses_when_manifest_and_database_are_the_same_path(
+    tmp_path: Path,
+) -> None:
+    """`--create --write` with `--manifest` and `--database` pointed at the
+    same missing path used to create the SQLite file, claim it, and then
+    write the manifest "to the same path" -- which is `os.replace` silently
+    overwriting the just-created, just-claimed database with the manifest's
+    YAML text. The command reported success; the claim it had just written
+    was already gone. Refused up front instead, before anything is created.
+    """
+    same_path = tmp_path / "same.sqlite3"
+
+    result = runner.invoke(
+        app,
+        [
+            "project", "init", "--create", "--write",
+            "--project-id", "p25_central_il",
+            "--label", "P25 central Israel",
+            "--database", str(same_path),
+            "--manifest", str(same_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "must be two different files" in result.output.replace("\n", "")
+    assert not same_path.exists(), "a file was created despite the refusal"
+
+
+def test_create_refuses_the_same_path_given_two_different_ways(tmp_path: Path) -> None:
+    """The comparison is on the resolved path, not the literal string."""
+    real = tmp_path / "same.sqlite3"
+    detoured = tmp_path / "sub" / ".." / "same.sqlite3"
+
+    result = runner.invoke(
+        app,
+        [
+            "project", "init", "--create", "--write",
+            "--project-id", "p25_central_il",
+            "--label", "P25 central Israel",
+            "--database", str(real),
+            "--manifest", str(detoured),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "must be two different files" in result.output.replace("\n", "")
+    assert not real.exists()
+
+
+def test_create_refuses_a_manifest_target_that_is_not_valid_utf8(tmp_path: Path) -> None:
+    """`UnicodeDecodeError` is not an `OSError` -- it is raised by the decode
+    step inside `read_text`, after the read itself succeeded. A manifest
+    target that exists, is permission-readable, and simply is not valid
+    UTF-8 used to escape `_manifest_state`'s `except OSError` entirely and
+    crash the command with a raw traceback instead of the clean refusal the
+    dry-run table already promises for an unreadable target."""
+    manifest_path = tmp_path / "p" / "project.yaml"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_bytes(b"\xff\xfe\x00\x01not valid utf-8")
+
+    result = _init(tmp_path, "--create", "--write")
+
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    flat = result.output.replace("\n", "")
+    assert "cannot be read to compare with" in flat
+    assert not (tmp_path / "db.sqlite3").exists()
+    assert manifest_path.read_bytes() == b"\xff\xfe\x00\x01not valid utf-8"
+
+
+def test_show_reports_a_malformed_claim_row_cleanly_not_as_a_traceback(
+    tmp_path: Path,
+) -> None:
+    """`manifest_schema_version` declared INTEGER still accepts non-numeric
+    text via SQLite's type affinity. `read_claim` used to let `int('broken')`
+    escape as a raw `ValueError`, which `project show` did not catch."""
+    database = tmp_path / "db.sqlite3"
+    connection = connect_geo_database(database)
+    try:
+        connection.execute(
+            "INSERT INTO project_meta"
+            "(id, project_id, analyzer, manifest_schema_version, claimed_at, claimed_by_version)"
+            " VALUES (1, 'p25_central_il', ?, 'broken', '2026-01-01T00:00:00+00:00', '0.1.0')",
+            (ANALYZER,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    manifest = tmp_path / "p" / "project.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        "schema_version: 1\n"
+        "project_id: p25_central_il\n"
+        "label: P25 central Israel\n"
+        "analyzer: p25_site_geolocation\n"
+        f"database: {database}\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["project", "show", "--project", str(manifest)])
+
+    assert result.exit_code == 0, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "could not be read" in result.output.replace("\n", "")

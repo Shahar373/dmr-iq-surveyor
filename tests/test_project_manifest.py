@@ -213,6 +213,19 @@ def test_a_capture_block_that_is_not_a_mapping_is_refused(tmp_path: Path) -> Non
         load_campaign_manifest(_campaign(tmp_path / "p", body=body))
 
 
+@pytest.mark.parametrize("literal", [".nan", ".inf", "-.inf"])
+def test_a_capture_value_that_is_not_finite_is_refused(tmp_path: Path, literal: str) -> None:
+    """YAML 1.1 -- which PyYAML's `safe_load` accepts -- parses `.nan` and
+    `.inf` into real Python floats, not strings that would already have
+    failed the numeric conversion. `number <= 0` alone lets both through:
+    every comparison against NaN is False, and `.inf > 0` is True, so neither
+    is caught by the positivity check on its own -- and neither is a capture
+    setting a radio can actually be tuned to."""
+    body = CAMPAIGN_YAML.replace("center_frequency_hz: 867406250", f"center_frequency_hz: {literal}")
+    with pytest.raises(ProjectError, match="positive number"):
+        load_campaign_manifest(_campaign(tmp_path / "p", body=body))
+
+
 # -- resolution --------------------------------------------------------------
 
 

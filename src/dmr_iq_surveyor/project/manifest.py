@@ -18,6 +18,7 @@ worked this way since Phase 6A:
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -394,8 +395,14 @@ def load_campaign_manifest(
             raise ProjectError(
                 f"{resolved}: defaults.capture.{key} must be a number, got {value!r}"
             ) from exc
-        if number <= 0:
-            raise ProjectError(f"{resolved}: defaults.capture.{key} must be positive")
+        # `number <= 0` alone lets both NaN and Infinity through: every
+        # comparison against NaN is False, so `.nan <= 0` is False, and YAML
+        # 1.1 (which PyYAML's safe_load accepts) parses `.nan` and `.inf`
+        # into real Python floats here, not strings that would have failed
+        # the `float()` conversion above. Neither is a capture setting a
+        # radio can be tuned to.
+        if not math.isfinite(number) or number <= 0:
+            raise ProjectError(f"{resolved}: defaults.capture.{key} must be a positive number")
         capture[key] = number
 
     return CampaignManifest(

@@ -172,6 +172,36 @@ def test_an_absent_claim_table_is_still_read_as_no_claim(tmp_path: Path) -> None
         connection.close()
 
 
+def test_a_claim_row_with_a_malformed_schema_version_is_refused_not_swallowed(
+    tmp_path: Path,
+) -> None:
+    """`manifest_schema_version` is declared INTEGER, but SQLite's type
+    affinity still accepts non-numeric text -- it is stored as TEXT when it
+    does not look like a number, rather than the insert being refused. The
+    `CHECK`/`NOT NULL` constraints on `project_meta` guarantee the row exists
+    and every column is non-null; they do not guarantee the *values* parse.
+    `int('broken')` then raises `ValueError`, which used to propagate as a
+    raw traceback out of what every caller expects to be either a `Claim` or
+    a clean `ProjectError`.
+    """
+    connection = connect_geo_database(tmp_path / "p25.sqlite3")
+    try:
+        connection.execute(
+            f"INSERT INTO {CLAIM_TABLE}"
+            "(id, project_id, analyzer, manifest_schema_version, claimed_at, claimed_by_version)"
+            " VALUES (1, 'p25', ?, 'broken', '2026-01-01T00:00:00+00:00', '0.1.0')",
+            (ANALYZER,),
+        )
+        connection.commit()
+
+        with pytest.raises(ProjectError, match="could not be read"):
+            read_claim(connection)
+        with pytest.raises(ProjectError, match="could not be read"):
+            assert_claim(connection, project_id="p25", analyzer=ANALYZER)
+    finally:
+        connection.close()
+
+
 def test_a_claim_round_trips_and_is_idempotent(tmp_path: Path) -> None:
     connection = connect_geo_database(tmp_path / "p25.sqlite3")
     try:
