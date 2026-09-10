@@ -28,6 +28,7 @@ from dmr_iq_surveyor.survey.pipeline import (
     run_survey,
 )
 from dmr_iq_surveyor.survey.profiles import ProfileError, resolve_band_profile
+from dmr_iq_surveyor.survey.provenance import ProvenanceError, normalise_campaign_id
 from dmr_iq_surveyor.survey.store import (
     connect_survey_database,
     get_run,
@@ -450,6 +451,15 @@ def survey_capture(
     premature live acquisition" principle (see CLAUDE.md) for field-capture
     friction with existing tools; it changes nothing else about the pipeline.
     """
+    # Before the device is probed, before the capture is paid for. A
+    # mistyped campaign id caught after ninety seconds of recording is a
+    # ninety-second recording thrown away.
+    try:
+        campaign = normalise_campaign_id(campaign)
+    except ProvenanceError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=1) from exc
+
     probe = probe_soapysdr(driver)
     if not probe.available:
         console.print(f"[bold red]SoapySDR device unavailable:[/bold red] {probe.probe_error}")

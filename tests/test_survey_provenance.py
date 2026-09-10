@@ -2,8 +2,10 @@
 it is known.
 
 The rule these tests exist to hold: `applied` is only ever what the radio
-reported back. A requested setting, and an operator's declaration in a site
-profile, are different claims and must stay legible as different claims.
+reported back. What it was asked for, and what the operator declared in a
+site profile, are different claims. Keeping them apart is not the same as
+throwing the weaker ones away -- a declaration is recorded per run, so a
+profile edited later cannot rewrite what an earlier run was taken with.
 """
 
 from __future__ import annotations
@@ -20,30 +22,42 @@ from dmr_iq_surveyor.survey.provenance import (
     HARDWARE_SCHEMA_VERSION,
     SOURCE_APPLIED,
     SOURCE_DECLARED,
+    SOURCE_DECLARED_SITE_ROW,
     SOURCE_NOT_RECORDED,
     SOURCE_REQUESTED,
     ProvenanceError,
     capture_report_for,
+    declared_bucket,
     hardware_from_capture_manifest,
     hardware_from_recording,
     hardware_provenance,
-    hardware_requested,
     identity_value,
     if_gain_reading,
     lna_state_reading,
     load_hardware,
     normalise_campaign_id,
     normalise_hardware,
+    requested_bucket,
+    with_declared,
 )
 from dmr_iq_surveyor.survey.store import (
     SurveyRunRecord,
     connect_survey_database,
     get_run,
+    get_run_observations,
     import_survey_run,
     upsert_site,
 )
 
-SITE = SiteProfile(site_id="home", label="Home")
+SITE = SiteProfile(
+    site_id="home",
+    label="Home",
+    receiver="SDRplay RSP1A",
+    antenna="whip",
+    gain_mode="manual",
+    gain=40.0,
+    lna_state=2,
+)
 
 # survey_runs exactly as it stood before campaign_id/hardware_json existed.
 # Hand-written rather than generated so this test keeps describing the old
@@ -171,6 +185,10 @@ def _capture_manifest(wav_path: Path, *, read_back: bool) -> dict:
     return manifest
 
 
+def _requested(**kwargs) -> dict:
+    return hardware_provenance(requested=requested_bucket(**kwargs))
+
+
 # -- campaign id -------------------------------------------------------------
 
 
@@ -234,12 +252,51 @@ def test_nothing_known_is_not_recorded() -> None:
     assert hardware["source"] == SOURCE_NOT_RECORDED
     assert hardware["applied"] == {}
     assert hardware["requested"] == {}
+    assert hardware["declared"] == {}
     assert hardware["identity"] == {}
+
+
+def test_a_declaration_alone_is_recorded_and_named_declared() -> None:
+    """A declaration is the only thing many runs have. Dropping it to keep
+    `applied` honest would trade one silence for another."""
+    hardware = hardware_provenance(declared=declared_bucket(SITE))
+
+    assert hardware["source"] == SOURCE_DECLARED
+    assert hardware["declared"]["gain"] == 40.0
+    assert hardware["declared"]["receiver"] == "SDRplay RSP1A"
+    assert hardware["declared"]["site_id"] == "home"
+    assert hardware["applied"] == {}
+
+
+def test_a_declaration_never_outranks_a_reading(tmp_path: Path) -> None:
+    measured = hardware_from_capture_manifest(_capture_manifest(tmp_path / "a.wav", read_back=True))
+    combined = with_declared(measured, declared_bucket(SITE))
+
+    assert combined["source"] == SOURCE_APPLIED
+    assert combined["declared"]["gain"] == 40.0
+    assert if_gain_reading(combined).source == SOURCE_APPLIED
+    assert if_gain_reading(combined).value == 25.0
+    assert if_gain_reading(combined).measured is True
+
+
+def test_a_profile_edited_later_cannot_rewrite_an_earlier_run() -> None:
+    """The reason the declaration is snapshotted per run instead of read back
+    off the mutable `sites` row."""
+    first = hardware_provenance(declared=declared_bucket(SITE))
+    edited = SiteProfile(site_id="home", label="Home", receiver="RSP1B", gain=25.0)
+    second = hardware_provenance(declared=declared_bucket(edited))
+
+    assert first["declared"]["gain"] == 40.0
+    assert first["declared"]["receiver"] == "SDRplay RSP1A"
+    assert second["declared"]["gain"] == 25.0
 
 
 def test_unknown_values_are_absent_rather_than_null() -> None:
     """A key holding `None` would read as a recorded value at a glance."""
-    hardware = hardware_requested(driver="sdrplay", if_gain_reduction_db=26.0, lna_state=8)
+    hardware = hardware_provenance(
+        identity={"driver": "sdrplay", "serial": None},
+        requested=requested_bucket(if_gain_reduction_db=26.0, lna_state=8),
+    )
 
     assert hardware["source"] == SOURCE_REQUESTED
     assert "serial" not in hardware["identity"]
@@ -247,13 +304,23 @@ def test_unknown_values_are_absent_rather_than_null() -> None:
     assert hardware["requested"]["lna_state"] == 8
 
 
-def test_normalise_hardware_refuses_a_declared_blob() -> None:
-    """`declared` is a reading tier for the sites row, never provenance of a
-    run's own receiver state."""
-    blob = hardware_provenance(requested={"lna_state": 2})
-    blob["source"] = SOURCE_DECLARED
+# -- validation --------------------------------------------------------------
 
-    with pytest.raises(ProvenanceError, match="source"):
+
+def test_a_blob_claiming_better_evidence_than_it_holds_is_refused() -> None:
+    """The one failure this whole design exists to prevent."""
+    blob = hardware_provenance(requested=requested_bucket(lna_state=2))
+    blob["source"] = SOURCE_APPLIED
+
+    with pytest.raises(ProvenanceError, match="buckets say"):
+        normalise_hardware(blob)
+
+
+def test_a_bucket_that_is_not_a_mapping_is_refused() -> None:
+    blob = hardware_provenance(requested=requested_bucket(lna_state=2))
+    blob["applied"] = ["IFGR", 25]
+
+    with pytest.raises(ProvenanceError, match="must be a dict"):
         normalise_hardware(blob)
 
 
@@ -264,14 +331,25 @@ def test_normalise_hardware_accepts_empty_and_refuses_foreign_shapes() -> None:
         normalise_hardware({"source": SOURCE_APPLIED, "schema_version": 99})
     with pytest.raises(ProvenanceError, match="dict"):
         normalise_hardware("IFGR 25")
+    with pytest.raises(ProvenanceError, match="source"):
+        normalise_hardware({"schema_version": 1, "source": "guessed"})
 
 
-def test_load_hardware_survives_a_malformed_row() -> None:
+def test_load_hardware_treats_anything_it_cannot_trust_as_not_recorded() -> None:
+    """A digest must not die on one bad row, and must not believe it either."""
     assert load_hardware("{not json") == {}
     assert load_hardware("") == {}
     assert load_hardware(None) == {}
     assert load_hardware("[1, 2]") == {}
-    assert load_hardware('{"source": "applied"}') == {"source": "applied"}
+    # Structurally valid JSON that is not a blob this module could have built.
+    assert load_hardware('{"source": "applied"}') == {}
+    assert load_hardware('{"schema_version": 1, "source": "applied", "applied": 7}') == {}
+    lying = json.dumps(
+        {"schema_version": 1, "source": "applied", "applied": {}, "requested": {"lna_state": 2}}
+    )
+    assert load_hardware(lying) == {}
+    honest = json.dumps(hardware_provenance(requested=requested_bucket(lna_state=2)))
+    assert load_hardware(honest)["source"] == SOURCE_REQUESTED
 
 
 # -- capture report linkage --------------------------------------------------
@@ -310,31 +388,74 @@ def test_a_recording_with_no_report_invents_nothing(tmp_path: Path) -> None:
     assert hardware_from_recording(lonely) == hardware_provenance()
 
 
-def test_a_malformed_report_invents_nothing(tmp_path: Path) -> None:
+@pytest.mark.parametrize("body", ["{truncated", "[]", '"a string"', "null", "123"])
+def test_a_report_of_the_wrong_shape_fails_safe(tmp_path: Path, body: str) -> None:
     wav = tmp_path / "stop.wav"
     wav.write_bytes(b"RIFF")
-    (tmp_path / "stop_capture_report.json").write_text("{truncated", encoding="utf-8")
+    (tmp_path / "stop_capture_report.json").write_text(body, encoding="utf-8")
 
     assert capture_report_for(wav) is None
     assert hardware_from_recording(wav)["source"] == SOURCE_NOT_RECORDED
 
 
+def test_a_report_whose_settings_are_not_a_mapping_fails_safe(tmp_path: Path) -> None:
+    wav = tmp_path / "stop.wav"
+    wav.write_bytes(b"RIFF")
+    (tmp_path / "stop_capture_report.json").write_text(
+        json.dumps({"wav_path": str(wav), "settings": "IFGR 40", "device_settings_applied": 7}),
+        encoding="utf-8",
+    )
+
+    hardware = hardware_from_recording(wav)
+    assert hardware["source"] == SOURCE_NOT_RECORDED
+    assert hardware["requested"] == {}
+    assert hardware["applied"] == {}
+
+
 # -- readings ----------------------------------------------------------------
 
 
-def test_reading_prefers_applied_then_requested_then_declared(tmp_path: Path) -> None:
+def test_reading_ranks_applied_then_requested_then_declared_then_the_site_row(
+    tmp_path: Path,
+) -> None:
     applied = hardware_from_capture_manifest(_capture_manifest(tmp_path / "a.wav", read_back=True))
-    requested = hardware_requested(if_gain_reduction_db=26.0, lna_state=8)
+    requested = _requested(if_gain_reduction_db=26.0, lna_state=8)
+    declared = hardware_provenance(declared=declared_bucket(SITE))
 
-    assert if_gain_reading(applied, declared=40.0).source == SOURCE_APPLIED
-    assert if_gain_reading(applied, declared=40.0).value == 25.0
-    assert if_gain_reading(requested, declared=40.0).source == SOURCE_REQUESTED
-    assert if_gain_reading({}, declared=40.0).source == SOURCE_DECLARED
+    assert if_gain_reading(applied, site_row=99.0).source == SOURCE_APPLIED
+    assert if_gain_reading(applied, site_row=99.0).value == 25.0
+    assert if_gain_reading(requested, site_row=99.0).source == SOURCE_REQUESTED
+    assert if_gain_reading(declared, site_row=99.0).source == SOURCE_DECLARED
+    assert if_gain_reading(declared, site_row=99.0).value == 40.0
+    # Only a run with no declaration of its own falls back to the shared row.
+    assert if_gain_reading({}, site_row=99.0).source == SOURCE_DECLARED_SITE_ROW
     assert if_gain_reading({}).source == SOURCE_NOT_RECORDED
-    assert lna_state_reading(applied).value == 2.0
+    assert lna_state_reading(applied).value == 2
     assert lna_state_reading(requested).value == 8
+    assert lna_state_reading(declared).value == 2
     assert identity_value(applied, "serial") == "230405A498"
     assert identity_value({}, "driver") is None
+
+
+def test_only_a_read_back_counts_as_measured(tmp_path: Path) -> None:
+    applied = hardware_from_capture_manifest(_capture_manifest(tmp_path / "a.wav", read_back=True))
+
+    assert if_gain_reading(applied).measured is True
+    assert if_gain_reading(_requested(if_gain_reduction_db=26.0)).measured is False
+    assert if_gain_reading(hardware_provenance(declared=declared_bucket(SITE))).measured is False
+    assert if_gain_reading({}, site_row=40.0).measured is False
+
+
+def test_a_reading_always_says_how_well_it_is_known(tmp_path: Path) -> None:
+    applied = hardware_from_capture_manifest(_capture_manifest(tmp_path / "a.wav", read_back=True))
+
+    assert if_gain_reading(applied).render(" dB") == "25.0 dB (applied)"
+    assert if_gain_reading(_requested(if_gain_reduction_db=26.0)).render() == "26.0 (requested)"
+    assert if_gain_reading(hardware_provenance(declared=declared_bucket(SITE))).render() == (
+        "40.0 (declared)"
+    )
+    assert if_gain_reading({}, site_row=40.0).render() == "40.0 (declared, from the site row)"
+    assert if_gain_reading({}).render() == "not recorded"
 
 
 def test_an_lna_state_read_back_as_a_float_is_the_index_it_names(tmp_path: Path) -> None:
@@ -346,19 +467,10 @@ def test_an_lna_state_read_back_as_a_float_is_the_index_it_names(tmp_path: Path)
     measured = lna_state_reading(applied).value
     assert measured == 2
     assert isinstance(measured, int)
-    assert measured == lna_state_reading({}, declared=2).value
+    assert measured == lna_state_reading({}, site_row=2).value
     # An index that is not one is shown as it arrived rather than rounded away.
     odd = hardware_provenance(applied={"gains": {"RFGR": 2.5}})
     assert lna_state_reading(odd).value == 2.5
-
-
-def test_a_reading_always_says_how_well_it_is_known(tmp_path: Path) -> None:
-    applied = hardware_from_capture_manifest(_capture_manifest(tmp_path / "a.wav", read_back=True))
-
-    assert if_gain_reading(applied).render(" dB") == "25.0 dB (applied)"
-    assert if_gain_reading(hardware_requested(if_gain_reduction_db=26.0)).render() == "26.0 (requested)"
-    assert if_gain_reading({}, declared=40.0).render() == "40.0 (declared)"
-    assert if_gain_reading({}).render() == "not recorded"
 
 
 # -- migration and round trip ------------------------------------------------
@@ -410,8 +522,9 @@ def test_campaign_and_hardware_round_trip(tmp_path: Path) -> None:
     connection = connect_survey_database(db_path)
     try:
         upsert_site(connection, SITE)
-        hardware = hardware_from_capture_manifest(
-            _capture_manifest(tmp_path / "a.wav", read_back=True)
+        hardware = with_declared(
+            hardware_from_capture_manifest(_capture_manifest(tmp_path / "a.wav", read_back=True)),
+            declared_bucket(SITE),
         )
         import_survey_run(
             connection,
@@ -425,6 +538,7 @@ def test_campaign_and_hardware_round_trip(tmp_path: Path) -> None:
         stored = load_hardware(row["hardware_json"])
         assert stored == hardware
         assert if_gain_reading(stored).render() == "25.0 (applied)"
+        assert stored["declared"]["gain"] == 40.0
     finally:
         connection.close()
 
@@ -460,5 +574,46 @@ def test_the_store_is_the_one_place_a_campaign_id_is_enforced(tmp_path: Path) ->
                 observations=[],
                 raster_tolerance_hz=6250.0,
             )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("campaign_id", "day 1"),
+        ("hardware", {"schema_version": 1, "source": "applied", "applied": {}}),
+    ],
+)
+def test_a_rejected_reimport_does_not_take_the_stored_run_with_it(
+    tmp_path: Path, field: str, value
+) -> None:
+    """`import_survey_run` replaces by deleting first. Validation therefore
+    has to happen before the delete, or a typo would cost the run that was
+    already there -- and the caller's own commit would make that permanent."""
+    connection = connect_survey_database(tmp_path / "replace.sqlite3")
+    try:
+        upsert_site(connection, SITE)
+        import_survey_run(
+            connection,
+            run=_run_record("r1"),
+            observations=[_observation(868_050_000.0), _observation(868_075_000.0)],
+            raster_tolerance_hz=6250.0,
+        )
+        connection.commit()
+
+        with pytest.raises(ProvenanceError):
+            import_survey_run(
+                connection,
+                run=_run_record("r1", **{field: value}),
+                observations=[_observation(868_050_000.0)],
+                raster_tolerance_hz=6250.0,
+            )
+        # The caller carries on and commits, as a long-lived connection does.
+        connection.commit()
+
+        survivor = get_run(connection, "r1")
+        assert survivor is not None
+        assert len(get_run_observations(connection, "r1")) == 2
     finally:
         connection.close()

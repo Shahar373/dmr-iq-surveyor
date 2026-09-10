@@ -1,35 +1,39 @@
 """Run provenance: the campaign a survey run belongs to, and what the
-receiver was actually set to while it measured.
+receiver was set to while it measured.
 
-Two questions that look alike and are not:
+Three claims about a receiver setting look alike and are not:
 
-    requested   what this software asked the radio for
     applied     what the radio reported back when it was asked
+    requested   what this software asked the radio for
+    declared    what the operator wrote in the site profile beforehand
 
-They are stored in separate buckets and never merged. A value that was not
-observed is absent, not inferred -- the solver reads level as distance, so a
-gain copied out of a profile and presented as measured is exactly the sort of
-confident wrong number this project refuses everywhere else.
-
-A site profile's `gain` and `lna_state` are a *declaration* by the operator.
-They stay in the `sites` row where they have always lived and are never
-copied in here as though the radio had confirmed them. A reader that falls
-back to that row has to say so: `SOURCE_DECLARED` is the label for it, and it
-is the one source value that is never written into a stored blob --
-`normalise_hardware()` rejects it.
+They are stored in separate buckets and never merged. The geolocation solver
+reads level as distance, so a declaration presented as a measurement is the
+kind of confident wrong number this project refuses everywhere else. Keeping
+them apart is not the same as discarding the weaker ones: a declaration is
+the only thing many runs have, and it is recorded per run so that editing a
+site profile later cannot silently rewrite what an earlier run was taken
+with.
 
 The stored shape (`survey_runs.hardware_json`), version 1:
 
     {
       "schema_version": 1,
-      "source": "applied" | "requested" | "not_recorded",
+      "source": "applied" | "requested" | "declared" | "not_recorded",
       "identity":  {"driver": ..., "serial": ...},
-      "requested": {"center_frequency_hz": ..., "if_gain_reduction_db": ..., ...},
-      "applied":   {"center_frequency_hz": ..., "gains": {"IFGR": ..., "RFGR": ...}, ...}
+      "applied":   {"center_frequency_hz": ..., "gains": {"IFGR": ...}, ...},
+      "requested": {"center_frequency_hz": ..., "if_gain_reduction_db": ...},
+      "declared":  {"site_id": ..., "receiver": ..., "gain": ..., ...}
     }
 
-An absent bucket is `{}`, meaning not recorded, never a guess. `source` names
-the strongest bucket that carries anything.
+An absent bucket is `{}`, meaning nothing of that kind is known, never a
+guess. `source` is *derived*, never chosen: it names the strongest bucket
+that carries anything, and `normalise_hardware()` refuses a blob whose
+`source` disagrees with its own contents.
+
+`SOURCE_DECLARED_SITE_ROW` is the one source that is never stored. It marks a
+value read out of the mutable `sites` row, which is all a run written before
+this column existed can offer, and which any later run rewrites.
 """
 
 from __future__ import annotations
@@ -40,6 +44,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from dmr_iq_surveyor.survey.profiles import SiteProfile
+
 HARDWARE_SCHEMA_VERSION = 1
 
 SOURCE_APPLIED = "applied"
@@ -47,16 +53,21 @@ SOURCE_REQUESTED = "requested"
 SOURCE_DECLARED = "declared"
 SOURCE_NOT_RECORDED = "not_recorded"
 
-# What may appear as a stored blob's `source`. `SOURCE_DECLARED` is absent on
-# purpose: a site profile's declaration is not provenance of this run's
-# receiver state, and writing it here would make it indistinguishable from a
-# reading later.
-STORED_SOURCES = (SOURCE_APPLIED, SOURCE_REQUESTED, SOURCE_NOT_RECORDED)
+# Read out of the `sites` row rather than the run's own blob. `sites` is
+# current state -- `upsert_site` rewrites it on every run -- so this is only
+# ever offered for rows written before runs carried their own declaration,
+# and it is labelled distinctly so nobody mistakes it for one.
+SOURCE_DECLARED_SITE_ROW = "declared_site_row"
+
+STORED_SOURCES = (SOURCE_APPLIED, SOURCE_REQUESTED, SOURCE_DECLARED, SOURCE_NOT_RECORDED)
+
+BUCKETS = ("identity", "applied", "requested", "declared")
 
 SOURCE_LABELS = {
     SOURCE_APPLIED: "applied",
     SOURCE_REQUESTED: "requested",
     SOURCE_DECLARED: "declared",
+    SOURCE_DECLARED_SITE_ROW: "declared, from the site row",
     SOURCE_NOT_RECORDED: "not recorded",
 }
 
@@ -74,6 +85,9 @@ _CAMPAIGN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 class ProvenanceError(ValueError):
     """Raised for an invalid campaign id or hardware provenance blob."""
+
+
+# -- campaign id -------------------------------------------------------------
 
 
 def normalise_campaign_id(value: str | None) -> str | None:
@@ -101,46 +115,81 @@ def normalise_campaign_id(value: str | None) -> str | None:
     return candidate
 
 
-def _known(values: dict[str, Any] | None) -> dict[str, Any]:
+# -- building a blob ---------------------------------------------------------
+
+
+def _known(values: Any) -> dict[str, Any]:
     """Keep only the values that are actually known.
 
-    A key that is absent says nothing was observed. A key holding `None`
-    would say the same thing while looking like a recorded reading, so it
-    never reaches the database.
+    A key that is absent says nothing was observed. A key holding `None` would
+    say the same thing while looking like a recorded reading, so it never
+    reaches the database. A bucket that is not a mapping at all contributes
+    nothing rather than propagating its shape.
     """
-    if not values:
+    if not isinstance(values, dict):
         return {}
-    return {key: value for key, value in values.items() if value is not None}
+    return {str(key): value for key, value in values.items() if value is not None}
+
+
+def _derive_source(applied: dict, requested: dict, declared: dict) -> str:
+    """The strongest bucket that carries anything.
+
+    Derived rather than chosen, so a blob cannot claim better evidence than it
+    holds. `normalise_hardware()` recomputes this and rejects a mismatch.
+    """
+    if applied:
+        return SOURCE_APPLIED
+    if requested:
+        return SOURCE_REQUESTED
+    if declared:
+        return SOURCE_DECLARED
+    return SOURCE_NOT_RECORDED
 
 
 def hardware_provenance(
     *,
-    identity: dict[str, Any] | None = None,
-    requested: dict[str, Any] | None = None,
-    applied: dict[str, Any] | None = None,
+    identity: Any = None,
+    applied: Any = None,
+    requested: Any = None,
+    declared: Any = None,
 ) -> dict[str, Any]:
     """Build a provenance blob. The only constructor stored blobs come from."""
     resolved_applied = _known(applied)
     resolved_requested = _known(requested)
-    if resolved_applied:
-        source = SOURCE_APPLIED
-    elif resolved_requested:
-        source = SOURCE_REQUESTED
-    else:
-        source = SOURCE_NOT_RECORDED
+    resolved_declared = _known(declared)
     return {
         "schema_version": HARDWARE_SCHEMA_VERSION,
-        "source": source,
+        "source": _derive_source(resolved_applied, resolved_requested, resolved_declared),
         "identity": _known(identity),
-        "requested": resolved_requested,
         "applied": resolved_applied,
+        "requested": resolved_requested,
+        "declared": resolved_declared,
     }
 
 
-def hardware_requested(
+def applied_bucket(applied_settings: Any) -> dict[str, Any]:
+    """The `applied` bucket from a device's own read-back.
+
+    `SoapyIqDevice._configure()` asks the radio what it ended up at and stores
+    the answer in `applied_settings`. A device that exposes no read-back
+    leaves this empty, which is the honest description of it.
+    """
+    if not isinstance(applied_settings, dict):
+        return {}
+    gains = applied_settings.get("gains")
+    return _known(
+        {
+            "center_frequency_hz": applied_settings.get("center_frequency_hz"),
+            "sample_rate_hz": applied_settings.get("sample_rate_hz"),
+            "bandwidth_hz": applied_settings.get("bandwidth_hz"),
+            "agc": applied_settings.get("agc"),
+            "gains": _known(gains) or None,
+        }
+    )
+
+
+def requested_bucket(
     *,
-    driver: str | None = None,
-    serial: str | None = None,
     center_frequency_hz: float | None = None,
     sample_rate_hz: float | None = None,
     bandwidth_hz: float | None = None,
@@ -149,15 +198,9 @@ def hardware_requested(
     agc: bool | None = None,
     antenna: str | None = None,
 ) -> dict[str, Any]:
-    """Provenance for a capture this software commanded but never read back.
-
-    The live drive path: the settings went to the radio, and nothing asked the
-    radio what it did with them. That is `requested`, and it must not be filed
-    as `applied`.
-    """
-    return hardware_provenance(
-        identity={"driver": driver, "serial": serial},
-        requested={
+    """The `requested` bucket: what this software asked the radio for."""
+    return _known(
+        {
             "center_frequency_hz": center_frequency_hz,
             "sample_rate_hz": sample_rate_hz,
             "bandwidth_hz": bandwidth_hz,
@@ -165,42 +208,67 @@ def hardware_requested(
             "lna_state": lna_state,
             "agc": agc,
             "antenna": antenna,
-        },
+        }
     )
 
 
-def hardware_from_capture_manifest(manifest: dict[str, Any] | None) -> dict[str, Any]:
+def declared_bucket(site: SiteProfile | None) -> dict[str, Any]:
+    """The `declared` bucket: the site profile as it stood for this run.
+
+    Snapshotted per run on purpose. `sites` holds one mutable row that
+    `upsert_site` rewrites, so without this a profile edited next month would
+    retroactively change the receiver, antenna and gain every earlier run
+    appears to have been taken with.
+    """
+    if site is None:
+        return {}
+    return _known(
+        {
+            "site_id": site.site_id,
+            "receiver": site.receiver,
+            "antenna": site.antenna,
+            "gain_mode": site.gain_mode,
+            "gain": site.gain,
+            "lna_state": site.lna_state,
+        }
+    )
+
+
+def with_declared(hardware: Any, declared: Any) -> dict[str, Any]:
+    """Attach a declaration to a blob, leaving its measured buckets alone."""
+    base = normalise_hardware(hardware)
+    return hardware_provenance(
+        identity=base.get("identity"),
+        applied=base.get("applied"),
+        requested=base.get("requested"),
+        declared=declared if declared else base.get("declared"),
+    )
+
+
+def hardware_from_capture_manifest(manifest: Any) -> dict[str, Any]:
     """Provenance for a capture this software ran, from its capture report.
 
-    `device_settings_applied` is the radio's own read-back (`capture/device.py`
-    asks the device what it did), so it is the only thing filed as `applied`.
-    A device that reports nothing back, and a manifest without that key, leave
-    `applied` empty and the run described as `requested` -- which is precisely
-    what was known about it.
+    `device_settings_applied` is the radio's own read-back, so it is the only
+    thing filed as `applied`. A manifest that is malformed, or whose settings
+    are not a mapping, yields an empty blob rather than a half-read one: a
+    report nobody can parse is not evidence about a radio.
     """
-    if not manifest:
+    if not isinstance(manifest, dict):
         return hardware_provenance()
-    settings = manifest.get("settings") or {}
-    applied = manifest.get("device_settings_applied") or {}
-    gains = applied.get("gains") or {}
+    settings = manifest.get("settings")
+    settings = settings if isinstance(settings, dict) else {}
     return hardware_provenance(
         identity={"driver": settings.get("driver"), "serial": settings.get("serial")},
-        requested={
-            "center_frequency_hz": settings.get("center_frequency_hz"),
-            "sample_rate_hz": settings.get("sample_rate_hz"),
-            "bandwidth_hz": settings.get("bandwidth_hz"),
-            "if_gain_reduction_db": settings.get("if_gain_reduction_db"),
-            "lna_state": settings.get("lna_state"),
-            "agc": settings.get("agc"),
-            "antenna": settings.get("antenna"),
-        },
-        applied={
-            "center_frequency_hz": applied.get("center_frequency_hz"),
-            "sample_rate_hz": applied.get("sample_rate_hz"),
-            "bandwidth_hz": applied.get("bandwidth_hz"),
-            "agc": applied.get("agc"),
-            "gains": dict(gains) if gains else None,
-        },
+        applied=applied_bucket(manifest.get("device_settings_applied")),
+        requested=requested_bucket(
+            center_frequency_hz=settings.get("center_frequency_hz"),
+            sample_rate_hz=settings.get("sample_rate_hz"),
+            bandwidth_hz=settings.get("bandwidth_hz"),
+            if_gain_reduction_db=settings.get("if_gain_reduction_db"),
+            lna_state=settings.get("lna_state"),
+            agc=settings.get("agc"),
+            antenna=settings.get("antenna"),
+        ),
     )
 
 
@@ -228,10 +296,10 @@ def capture_report_for(recording: str | Path) -> dict[str, Any] | None:
     if not isinstance(manifest, dict):
         return None
     claimed = manifest.get("wav_path")
-    if not claimed:
+    if not isinstance(claimed, str) or not claimed:
         return None
     try:
-        if Path(str(claimed)).expanduser().resolve() != source:
+        if Path(claimed).expanduser().resolve() != source:
             return None
     except OSError:
         return None
@@ -243,19 +311,27 @@ def hardware_from_recording(recording: str | Path) -> dict[str, Any]:
 
     Nothing about the radio is known unless this very recording's own capture
     report is found beside it and names it back. Analysing a file someone
-    handed over must not invent a receiver setting for it.
+    handed over must not invent a receiver setting for it. Both the CLI and
+    the field app route through here, so one file gets one answer whichever
+    asks.
     """
     return hardware_from_capture_manifest(capture_report_for(recording))
 
 
-def normalise_hardware(value: dict[str, Any] | None) -> dict[str, Any]:
-    """Validate a provenance blob on its way into the database.
+# -- validating and reading a blob ------------------------------------------
+
+
+def normalise_hardware(value: Any) -> dict[str, Any]:
+    """Validate a provenance blob, structure and all, on its way into the
+    database.
 
     `{}` is a legitimate value: it says this run recorded nothing about the
     receiver, which is true of every run written before this column existed.
-    Anything non-empty has to be a blob `hardware_provenance()` built, so no
-    caller can invent a shape that later readers would misread -- including a
-    blob claiming `declared`, which is a reading tier and never provenance.
+    Anything non-empty must be a blob this module could have built -- every
+    bucket a mapping, the schema version known, and `source` agreeing with the
+    contents. A blob whose `source` overstates its buckets is the one failure
+    this whole design exists to prevent, so it is rejected rather than
+    repaired.
     """
     if value is None:
         return {}
@@ -268,29 +344,50 @@ def normalise_hardware(value: dict[str, Any] | None) -> dict[str, Any]:
             f"hardware provenance schema_version must be {HARDWARE_SCHEMA_VERSION}, "
             f"got {value.get('schema_version')!r}"
         )
+    for bucket in BUCKETS:
+        held = value.get(bucket, {})
+        if not isinstance(held, dict):
+            raise ProvenanceError(
+                f"hardware provenance bucket {bucket!r} must be a dict, "
+                f"got {type(held).__name__}"
+            )
     source = value.get("source")
     if source not in STORED_SOURCES:
         raise ProvenanceError(
             f"hardware provenance source must be one of {list(STORED_SOURCES)}, got {source!r}"
         )
-    return dict(value)
+    expected = _derive_source(
+        value.get("applied") or {}, value.get("requested") or {}, value.get("declared") or {}
+    )
+    if source != expected:
+        raise ProvenanceError(
+            f"hardware provenance claims source {source!r} but its buckets say {expected!r}"
+        )
+    return {
+        "schema_version": HARDWARE_SCHEMA_VERSION,
+        "source": source,
+        **{bucket: dict(value.get(bucket) or {}) for bucket in BUCKETS},
+    }
 
 
 def load_hardware(raw: Any) -> dict[str, Any]:
     """Read a stored `hardware_json` back, defensively.
 
-    Anything unreadable reads as not recorded rather than raising: a report
-    about a campaign must not die on one malformed row.
+    Anything that does not validate reads as not recorded. A report about a
+    campaign must not die on one malformed row, and a row that cannot be
+    trusted to say what it means must not be believed either.
     """
-    if isinstance(raw, dict):
-        return dict(raw)
-    if isinstance(raw, str) and raw.strip():
+    if isinstance(raw, str):
+        if not raw.strip():
+            return {}
         try:
-            payload = json.loads(raw)
+            raw = json.loads(raw)
         except ValueError:
             return {}
-        return payload if isinstance(payload, dict) else {}
-    return {}
+    try:
+        return normalise_hardware(raw)
+    except ProvenanceError:
+        return {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +400,11 @@ class Reading:
     @property
     def known(self) -> bool:
         return self.source != SOURCE_NOT_RECORDED
+
+    @property
+    def measured(self) -> bool:
+        """True only where the radio itself reported the value back."""
+        return self.source == SOURCE_APPLIED
 
     def render(self, unit: str = "") -> str:
         """The value and where it came from, in the same breath.
@@ -319,27 +421,35 @@ class Reading:
 NOT_RECORDED = Reading(None, SOURCE_NOT_RECORDED)
 
 
+def _bucket(hardware: Any, name: str) -> dict[str, Any]:
+    if not isinstance(hardware, dict):
+        return {}
+    held = hardware.get(name)
+    return held if isinstance(held, dict) else {}
+
+
 def _gain_reading(
-    hardware: dict[str, Any], *, element: str, requested_key: str, declared: Any | None
+    hardware: Any, *, element: str, key: str, site_row: Any
 ) -> Reading:
-    applied = (hardware.get("applied") or {}).get("gains") or {}
-    if isinstance(applied, dict) and applied.get(element) is not None:
-        return Reading(applied[element], SOURCE_APPLIED)
-    requested = hardware.get("requested") or {}
-    if isinstance(requested, dict) and requested.get(requested_key) is not None:
-        return Reading(requested[requested_key], SOURCE_REQUESTED)
-    if declared is not None:
-        return Reading(declared, SOURCE_DECLARED)
+    gains = _bucket(hardware, "applied").get("gains")
+    if isinstance(gains, dict) and gains.get(element) is not None:
+        return Reading(gains[element], SOURCE_APPLIED)
+    requested = _bucket(hardware, "requested")
+    if requested.get(key) is not None:
+        return Reading(requested[key], SOURCE_REQUESTED)
+    declared = _bucket(hardware, "declared")
+    if declared.get(key if key != "if_gain_reduction_db" else "gain") is not None:
+        name = key if key != "if_gain_reduction_db" else "gain"
+        return Reading(declared[name], SOURCE_DECLARED)
+    if site_row is not None:
+        return Reading(site_row, SOURCE_DECLARED_SITE_ROW)
     return NOT_RECORDED
 
 
-def if_gain_reading(hardware: dict[str, Any], declared: Any | None = None) -> Reading:
+def if_gain_reading(hardware: Any, site_row: Any | None = None) -> Reading:
     """The IF gain reduction this run measured at, and how well it is known."""
     return _gain_reading(
-        hardware,
-        element=GAIN_ELEMENT_IF,
-        requested_key="if_gain_reduction_db",
-        declared=declared,
+        hardware, element=GAIN_ELEMENT_IF, key="if_gain_reduction_db", site_row=site_row
     )
 
 
@@ -358,35 +468,39 @@ def _as_lna_index(value: Any) -> Any:
     return int(value) if float(value).is_integer() else value
 
 
-def lna_state_reading(hardware: dict[str, Any], declared: Any | None = None) -> Reading:
+def lna_state_reading(hardware: Any, site_row: Any | None = None) -> Reading:
     """The LNA state this run measured at, and how well it is known."""
     reading = _gain_reading(
-        hardware,
-        element=GAIN_ELEMENT_RF,
-        requested_key="lna_state",
-        declared=declared,
+        hardware, element=GAIN_ELEMENT_RF, key="lna_state", site_row=site_row
     )
     if not reading.known:
         return reading
     return Reading(_as_lna_index(reading.value), reading.source)
 
 
-def identity_value(hardware: dict[str, Any], key: str) -> Any | None:
+def identity_value(hardware: Any, key: str) -> Any | None:
     """A value from the `identity` bucket, or `None`.
 
     Identity carries no reading tier: a driver name is what the software
     opened the device as, not a quantity anything measured.
     """
-    identity = hardware.get("identity") or {}
-    return identity.get(key) if isinstance(identity, dict) else None
+    return _bucket(hardware, "identity").get(key)
 
 
-def hardware_source_label(hardware: dict[str, Any]) -> str:
+def declared_value(hardware: Any, key: str) -> Any | None:
+    """A value from this run's own snapshot of the site profile."""
+    return _bucket(hardware, "declared").get(key)
+
+
+def hardware_source_label(hardware: Any) -> str:
     """How this run's receiver state is known, in words."""
+    if not isinstance(hardware, dict) or not hardware:
+        return SOURCE_LABELS[SOURCE_NOT_RECORDED]
     return SOURCE_LABELS.get(hardware.get("source", SOURCE_NOT_RECORDED), "unknown")
 
 
 __all__ = [
+    "BUCKETS",
     "CAPTURE_REPORT_SUFFIX",
     "GAIN_ELEMENT_IF",
     "GAIN_ELEMENT_RF",
@@ -394,17 +508,20 @@ __all__ = [
     "NOT_RECORDED",
     "SOURCE_APPLIED",
     "SOURCE_DECLARED",
+    "SOURCE_DECLARED_SITE_ROW",
     "SOURCE_LABELS",
     "SOURCE_NOT_RECORDED",
     "SOURCE_REQUESTED",
     "STORED_SOURCES",
     "ProvenanceError",
     "Reading",
+    "applied_bucket",
     "capture_report_for",
+    "declared_bucket",
+    "declared_value",
     "hardware_from_capture_manifest",
     "hardware_from_recording",
     "hardware_provenance",
-    "hardware_requested",
     "hardware_source_label",
     "identity_value",
     "if_gain_reading",
@@ -412,4 +529,6 @@ __all__ = [
     "load_hardware",
     "normalise_campaign_id",
     "normalise_hardware",
+    "requested_bucket",
+    "with_declared",
 ]

@@ -36,9 +36,11 @@ from dmr_iq_surveyor.survey.profiles import (
     resolve_site_profile,
 )
 from dmr_iq_surveyor.survey.provenance import (
+    declared_bucket,
+    hardware_from_recording,
     hardware_source_label,
     normalise_campaign_id,
-    normalise_hardware,
+    with_declared,
 )
 from dmr_iq_surveyor.survey.store import (
     SurveyRunRecord,
@@ -155,7 +157,6 @@ def run_survey(
     # after it. The store validates again; both calls are the same
     # function and it is idempotent.
     resolved_campaign_id = normalise_campaign_id(campaign_id)
-    resolved_hardware = normalise_hardware(hardware)
 
     source = Path(recording_path).expanduser().resolve()
     if not source.is_file():
@@ -180,6 +181,14 @@ def run_survey(
         )
         site_profile.validate()
     log.info(f"resolved band profile {band_profile.name!r}, site profile {site_profile.site_id!r}")
+    # A recording this software captured carries its own report beside it.
+    # Looking for it HERE rather than in each caller is what makes one
+    # file give one answer whether the CLI or the field app analyses it.
+    # The site profile's declaration is snapshotted alongside whatever was
+    # measured, so editing that profile later cannot rewrite what this run
+    # appears to have been taken with.
+    measured = hardware if hardware is not None else hardware_from_recording(source)
+    resolved_hardware = with_declared(measured, declared_bucket(site_profile))
     log.info(
         f"campaign {resolved_campaign_id!r}; receiver state "
         f"{hardware_source_label(resolved_hardware)}"

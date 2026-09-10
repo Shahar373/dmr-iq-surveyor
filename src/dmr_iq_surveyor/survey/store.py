@@ -378,6 +378,13 @@ def import_survey_run(
     a different run ID accumulates alongside prior runs, exactly matching
     the existing DMR inventory's `replace_run` idempotency contract.
     """
+    # Validated BEFORE anything is deleted. A rejected campaign id or a
+    # malformed provenance blob must not cost the run that is already
+    # stored: `_delete_run` below is not undone by the exception, and a
+    # caller that commits afterwards would make the loss permanent.
+    campaign_id = normalise_campaign_id(run.campaign_id)
+    hardware_json = json.dumps(normalise_hardware(run.hardware), sort_keys=True)
+
     # Frequencies the *previous* version of this run touched must also have
     # their first/last-seen recomputed, even if the new observation set no
     # longer includes them (e.g. re-importing with zero observations) --
@@ -436,8 +443,8 @@ def import_survey_run(
             run.gps_accuracy_m,
             run.gps_source,
             run.gps_fetched_at_utc,
-            normalise_campaign_id(run.campaign_id),
-            json.dumps(normalise_hardware(run.hardware), sort_keys=True),
+            campaign_id,
+            hardware_json,
         ),
     )
 

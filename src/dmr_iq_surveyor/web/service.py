@@ -57,7 +57,7 @@ from dmr_iq_surveyor.survey.profiles import (
 )
 from dmr_iq_surveyor.survey.provenance import (
     hardware_from_capture_manifest,
-    hardware_from_recording,
+    normalise_campaign_id,
 )
 from dmr_iq_surveyor.survey.store import delete_survey_run
 from dmr_iq_surveyor.web.devices import STATE_CHECKING as DEVICE_STATE_CHECKING
@@ -311,6 +311,10 @@ class FieldService:
         *,
         probe_runner: ProbeRunner | None = None,
     ) -> None:
+        # Checked as the service is built, which is startup. A mistyped
+        # campaign id must refuse to serve rather than wait and fail the
+        # operator's first 90-second recording out in the field.
+        settings.campaign_id = normalise_campaign_id(settings.campaign_id)
         self.settings = settings
         self.jobs = JobRegistry()
         # Guards the window between require_device_ready() succeeding and
@@ -1114,11 +1118,10 @@ class FieldService:
                 site_id_override=stop_id,
                 site_label_override=label or stop_id,
                 campaign_id=self.settings.campaign_id,
-                # Only this recording's own capture report may describe
-                # it, and only when it names the file back. A recording
-                # handed over from elsewhere records no receiver state,
-                # which is the truth about it.
-                hardware=hardware_from_recording(recording),
+                # `hardware` is left unset on purpose: `run_survey` looks
+                # for this recording's own capture report itself, so a
+                # file analysed here and the same file analysed by
+                # `survey run` get one answer rather than two.
             )
             job.check_cancelled()
             job.emit("measurements", "matching against the site registry", progress=0.7)

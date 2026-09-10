@@ -23,6 +23,7 @@ from dmr_iq_surveyor.survey.profiles import (
     resolve_band_profile,
     resolve_site_profile,
 )
+from dmr_iq_surveyor.survey.provenance import ProvenanceError, normalise_campaign_id
 from dmr_iq_surveyor.web.recordings import GIB, disk_status
 from dmr_iq_surveyor.web.server import serve_forever
 from dmr_iq_surveyor.web.service import FieldSettings
@@ -442,6 +443,15 @@ def web_serve(
         console.print(f"[bold red]Token could not be resolved:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
     resolved_token = resolved.value
+    # At startup, with a message the operator can read. `FieldService` checks
+    # again, but by then the process is already serving, and a campaign id
+    # that only fails on the first capture fails ninety seconds into a stop
+    # somebody drove to.
+    try:
+        campaign = normalise_campaign_id(campaign)
+    except ProvenanceError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=1) from exc
     settings = FieldSettings(
         database_path=database or DEFAULT_DATABASE_PATH,
         recordings_dir=recordings or (output / "recordings"),
