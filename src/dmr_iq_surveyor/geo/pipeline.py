@@ -8,6 +8,7 @@ each growing their own half-correct version.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -178,7 +179,7 @@ def materialise_measurements(
         campaign_readings = _campaign_gain_readings(connection, every_run)
         gain_sources = _campaign_gain_sources(campaign_readings)
         campaign_gains = {
-            run_id: (None if reading.value is None else float(reading.value))
+            run_id: _as_gain(reading.value)
             for run_id, reading in campaign_readings.items()
         }
         reference_gain = _modal_gain(campaign_gains)
@@ -290,9 +291,27 @@ def _campaign_gains(connection: Any, run_ids: Sequence[str]) -> dict[str, float 
     one the run recorded.
     """
     return {
-        run_id: (None if reading.value is None else float(reading.value))
+        run_id: _as_gain(reading.value)
         for run_id, reading in _campaign_gain_readings(connection, run_ids).items()
     }
+
+
+def _as_gain(value: Any) -> float | None:
+    """A gain as a number, or `None` when it is not one.
+
+    `sites.gain` was a REAL column, so this was a float by construction.
+    Provenance blobs are hand-editable and `_validate_bucket` permits any
+    scalar, so a gain can now arrive as a string. Unknown is the honest
+    answer -- and it keeps one malformed blob from taking down a rebuild of
+    every other run in the campaign.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _campaign_gain_readings(connection: Any, run_ids: Sequence[str]) -> dict[str, Reading]:
@@ -679,7 +698,16 @@ def solve_all_sites(
     planning = plan_settings if plan_settings is not None else PlanSettings()
     planning.validate()
 
-    batch = solve_batch_id or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    # The campaign is part of the default batch id. `geo solve --campaign day1
+    # && geo solve --campaign day2` is a natural pair to run back to back, and
+    # a bare timestamp makes them collide within the same second -- the second
+    # would replace the first's plan outright, since `geo_plans.solve_batch_id`
+    # is the primary key.
+    batch = solve_batch_id or "_".join(
+        part
+        for part in (datetime.now(UTC).strftime("%Y%m%d_%H%M%S"), scope.campaign_id)
+        if part
+    )
     # Measurements built before their run's exclusion changed are rebuilt
     # first, so the evidence the solve reads is the evidence the database
     # says is admissible. A campaign whose exclusions are all older than its

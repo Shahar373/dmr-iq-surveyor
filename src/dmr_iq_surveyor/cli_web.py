@@ -169,7 +169,7 @@ def resolve_capture_gain(
         resolved_gain, gain_origin = FALLBACK_IF_GAIN_REDUCTION_DB, ORIGIN_FALLBACK
         notices.append(
             f"no gain recorded in the {site_profile.site_id!r} site profile"
-            + (" or in a hardware profile" if hardware_profile is None else "")
+            + (" or in a hardware profile" if hardware_profile is not None else "")
             + f"; defaulting IF gain reduction to {resolved_gain:g} dB -- confirm this in "
             "the app before recording"
         )
@@ -190,7 +190,7 @@ def resolve_capture_gain(
         resolved_lna, lna_origin = FALLBACK_LNA_STATE, ORIGIN_FALLBACK
         notices.append(
             f"no LNA state recorded in the {site_profile.site_id!r} site profile"
-            + (" or in a hardware profile" if hardware_profile is None else "")
+            + (" or in a hardware profile" if hardware_profile is not None else "")
             + f"; defaulting to LNA state {resolved_lna} -- confirm this in the app before "
             "recording"
         )

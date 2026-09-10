@@ -148,8 +148,8 @@ def test_no_campaign_produces_no_predicate_at_all() -> None:
     """The backward-compatibility contract, at its source: an unscoped query
     is byte-for-byte the query it was before this existed."""
     assert WHOLE_DATABASE.where("r") == ("", ())
-    assert WHOLE_DATABASE.clause("r") == ("", ())
     assert WHOLE_DATABASE.is_whole_database
+    assert WHOLE_DATABASE.run_ids.__doc__  # documented as "no filter", not "every id"
 
 
 def test_a_campaign_id_is_validated_the_way_one_is_written() -> None:
@@ -577,3 +577,109 @@ def test_the_measurement_report_says_where_its_reference_gain_came_from(
     assert report["reference_gain_sources"] == {SOURCE_APPLIED: len(DAY1_STOPS)}
     # Serialisable: this goes into the run report on disk.
     json.dumps(report["reference_gain_sources"])
+
+
+# -- the two bugs a self-review caught --------------------------------------
+
+
+def test_supersede_normalises_the_campaign_before_comparing(tmp_path: Path) -> None:
+    """`LiveSettings` holds what the operator typed -- `Day1` -- while the
+    store writes `day1`. Comparing the two directly found no match and
+    silently superseded nothing, leaving both passes of a re-driven road
+    counting: the double evidence supersede exists to prevent.
+
+    The settings are deliberately NOT rewritten (a CLI-wiring test asserts
+    the raw value reaches the session); the normalisation belongs at the
+    comparison.
+    """
+    from dmr_iq_surveyor.geo.store import run_exclusion
+    from dmr_iq_surveyor.live.session import _supersede_earlier_bins
+
+    path = tmp_path / "drive.sqlite3"
+    connection = build_database(path)
+    try:
+        for run_id in ("live_a_b_1", "live_a_b_2"):
+            seed_run(
+                connection,
+                run_id=run_id,
+                latitude=32.07,
+                longitude=34.77,
+                transmitters=[TRANSMITTER],
+                site_id="mobile",
+                campaign_id="day1",
+            )
+        # The un-normalised form an operator types, against runs stored
+        # normalised.
+        superseded = _supersede_earlier_bins(
+            connection, "live_a_b", "live_a_b_2", "  Day1 "
+        )
+        assert superseded == 1
+        assert run_exclusion(connection, "live_a_b_1") is not None
+    finally:
+        connection.close()
+
+
+def test_the_field_app_solves_within_the_campaign_it_records_under(
+    tmp_path: Path,
+) -> None:
+    """The field app records every stop under one campaign and solves after
+    each one. If those two disagreed it would solve across every round in the
+    file and stamp the result with no campaign -- and the scoped readers,
+    which refuse an unstamped solve precisely because it was computed from
+    everything, would report the Pi as having solved nothing."""
+    from dmr_iq_surveyor.web.service import FieldService, FieldSettings
+
+    path = _two_campaigns(tmp_path)
+    materialise_measurements(database_path=path)
+
+    service = FieldService(
+        FieldSettings(database_path=path, campaign_id="day1"), probe_runner=lambda **_: None
+    )
+    assert service._scope().campaign_id == "day1"
+
+    unassigned = FieldService(
+        FieldSettings(database_path=path), probe_runner=lambda **_: None
+    )
+    assert unassigned._scope().is_whole_database
+
+
+def test_a_gain_that_is_not_a_number_reads_as_unknown_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    """`sites.gain` was a REAL column, so a gain was a float by construction.
+    A provenance blob is hand-editable and the validator permits any scalar,
+    so one malformed blob must not take down a rebuild of every other run."""
+    from dmr_iq_surveyor.geo.pipeline import _as_gain
+
+    assert _as_gain(40.0) == 40.0
+    assert _as_gain("40") == 40.0
+    assert _as_gain(None) is None
+    assert _as_gain("forty") is None
+    assert _as_gain(True) is None
+    assert _as_gain(float("nan")) is None
+    assert _as_gain(float("inf")) is None
+
+
+def test_two_scoped_solves_in_the_same_second_do_not_collide(tmp_path: Path) -> None:
+    """`geo solve --campaign day1 && geo solve --campaign day2` is a natural
+    pair to run back to back, and `geo_plans.solve_batch_id` is the primary
+    key -- a bare timestamp would let the second replace the first's plan."""
+    path = _two_campaigns(tmp_path)
+    materialise_measurements(database_path=path)
+
+    first = solve_all_sites(
+        database_path=path, settings=fast_solve_settings(), scope=CampaignScope("day1")
+    )
+    second = solve_all_sites(
+        database_path=path, settings=fast_solve_settings(), scope=CampaignScope("day2")
+    )
+
+    assert first["solve_batch_id"] != second["solve_batch_id"]
+    assert first["solve_batch_id"].endswith("day1")
+
+    connection = connect_geo_database(path)
+    try:
+        assert latest_plan(connection, scope=CampaignScope("day1")) is not None
+        assert latest_plan(connection, scope=CampaignScope("day2")) is not None
+    finally:
+        connection.close()

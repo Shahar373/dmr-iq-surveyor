@@ -209,7 +209,14 @@ def run_survey(
         f"campaign {resolved_campaign_id!r}; receiver state "
         f"{hardware_source_label(resolved_hardware)}"
     )
-    if not site_profile.is_gain_comparable:
+    # A hardware profile declares the gain for the whole round, so a run that
+    # names one IS gain-comparable even when its site profile records
+    # nothing. Warning anyway would train an operator to ignore the one
+    # message that says levels cannot be trusted.
+    declares_gain = site_profile.is_gain_comparable or (
+        declared_hardware is not None and declared_hardware.declares_gain
+    )
+    if not declares_gain:
         log.warning(
             f"site {site_profile.site_id!r} has no recorded gain; "
             "cross-run SNR comparisons involving this run are not gain-comparable"

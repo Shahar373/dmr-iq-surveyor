@@ -349,15 +349,21 @@ def solutions(connection: sqlite3.Connection, campaign: str | None = None) -> No
     # it was computed from every run in the file, so presenting its numbers
     # under a heading naming one round would be the mislabelling this whole
     # section used to be skipped to avoid.
+    # By insertion order, never by `solved_at`: a Raspberry Pi has no
+    # real-time clock, so it boots with a stale time and jumps when NTP
+    # arrives over the phone hotspot, and a solve run later in the day can
+    # carry an earlier timestamp than one run before it. `geo/store.py`
+    # settled this for `latest_solutions`; the digest was still ranking on
+    # the string.
     if campaign:
         latest = connection.execute(
             "SELECT solve_batch_id FROM geo_solutions WHERE campaign_id = ? "
-            "ORDER BY solved_at DESC LIMIT 1",
+            "ORDER BY geo_solution_id DESC LIMIT 1",
             (campaign,),
         ).fetchone()
     else:
         latest = connection.execute(
-            "SELECT solve_batch_id FROM geo_solutions ORDER BY solved_at DESC LIMIT 1"
+            "SELECT solve_batch_id FROM geo_solutions ORDER BY geo_solution_id DESC LIMIT 1"
         ).fetchone()
     print()
     print("== WHAT THE SOLVER CONCLUDED " + "=" * 40)

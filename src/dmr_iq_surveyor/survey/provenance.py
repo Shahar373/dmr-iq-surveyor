@@ -278,8 +278,18 @@ def declared_bucket(site: SiteProfile | None, hardware: Any = None) -> dict[str,
         {
             "site_id": getattr(site, "site_id", None),
             # Which file the receiver half came from, so a reader can tell a
-            # campaign-wide declaration from a per-site one.
-            "hardware_id": getattr(hardware, "hardware_id", None),
+            # campaign-wide declaration from a per-site one. Recorded only
+            # when that file actually contributed a value: an id alone would
+            # make a bucket non-empty, and `_derive_source` would then report
+            # the run as "declared" while nothing about the receiver is.
+            "hardware_id": (
+                getattr(hardware, "hardware_id", None)
+                if any(
+                    value is not None
+                    for value in (receiver, antenna, gain_mode, gain, lna_state)
+                )
+                else None
+            ),
             "receiver": receiver if receiver is not None else getattr(site, "receiver", None),
             "antenna": antenna if antenna is not None else getattr(site, "antenna", None),
             "gain_mode": (

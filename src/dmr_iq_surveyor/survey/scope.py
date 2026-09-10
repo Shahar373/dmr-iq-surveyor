@@ -63,13 +63,6 @@ class CampaignScope:
             return "", ()
         return f"{alias}.campaign_id = ?", (self.campaign_id,)
 
-    def clause(self, alias: str = "r", *, keyword: str = "WHERE") -> tuple[str, tuple[Any, ...]]:
-        """`where()` with its leading keyword, or `("", ())` when unscoped."""
-        predicate, parameters = self.where(alias)
-        if not predicate:
-            return "", ()
-        return f" {keyword} {predicate}", parameters
-
     def run_ids(self, connection: sqlite3.Connection) -> list[str] | None:
         """Every run in this campaign, oldest first, or `None` for all runs.
 

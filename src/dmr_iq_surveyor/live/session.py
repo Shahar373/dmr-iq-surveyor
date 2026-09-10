@@ -218,6 +218,9 @@ class LiveSettings:
         # Checked with the rest of the settings, which `LiveSession.__init__`
         # validates -- so a mistyped campaign id fails before the SDR is
         # opened and a drive begins, not after the first bin is written.
+        # Checked, not rewritten: these settings hold what the operator
+        # asked for. The store normalises on the way in, and anything that
+        # COMPARES this value against a stored one must normalise it first.
         normalise_campaign_id(self.campaign_id)
         if self.min_windows_per_bin < 1:
             raise ValueError("min_windows_per_bin must be at least 1")
@@ -1024,10 +1027,17 @@ def _supersede_earlier_bins(
     still supersedes only other unassigned bins, for the same reason -- the
     two are separate rounds either way.
     """
-    if campaign_id is None:
+    # Normalised before comparing. The store normalises on the way in, so a
+    # drive holding `Day1` whose runs were written as `day1` would compare
+    # the two, find no match, and silently supersede nothing -- leaving both
+    # passes of a re-driven road counting, which is the double evidence this
+    # function exists to prevent. `""` normalises to `None`, the same as an
+    # unset campaign, which is how those runs were stored.
+    wanted = normalise_campaign_id(campaign_id)
+    if wanted is None:
         condition, extra = "r.campaign_id IS NULL", ()
     else:
-        condition, extra = "r.campaign_id = ?", (campaign_id,)
+        condition, extra = "r.campaign_id = ?", (wanted,)
     rows = connection.execute(
         "SELECT r.survey_run_id FROM survey_runs r "
         "WHERE (r.survey_run_id = ? OR r.survey_run_id LIKE ? ESCAPE '\\') "
