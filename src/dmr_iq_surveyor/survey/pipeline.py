@@ -35,6 +35,11 @@ from dmr_iq_surveyor.survey.profiles import (
     resolve_band_profile,
     resolve_site_profile,
 )
+from dmr_iq_surveyor.survey.provenance import (
+    hardware_source_label,
+    normalise_campaign_id,
+    normalise_hardware,
+)
 from dmr_iq_surveyor.survey.store import (
     SurveyRunRecord,
     connect_survey_database,
@@ -138,11 +143,19 @@ def run_survey(
     site_id_override: str | None = None,
     site_label_override: str | None = None,
     drive_view: DriveViewSettings | None = None,
+    campaign_id: str | None = None,
+    hardware: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     log = SurveyLog()
     if drive_view is not None:
         drive_view.validate()
+    # Validated here rather than at the insert alone, so a mistyped
+    # campaign id fails before the analysis is paid for rather than
+    # after it. The store validates again; both calls are the same
+    # function and it is idempotent.
+    resolved_campaign_id = normalise_campaign_id(campaign_id)
+    resolved_hardware = normalise_hardware(hardware)
 
     source = Path(recording_path).expanduser().resolve()
     if not source.is_file():
@@ -167,6 +180,10 @@ def run_survey(
         )
         site_profile.validate()
     log.info(f"resolved band profile {band_profile.name!r}, site profile {site_profile.site_id!r}")
+    log.info(
+        f"campaign {resolved_campaign_id!r}; receiver state "
+        f"{hardware_source_label(resolved_hardware)}"
+    )
     if not site_profile.is_gain_comparable:
         log.warning(
             f"site {site_profile.site_id!r} has no recorded gain; "
@@ -263,6 +280,8 @@ def run_survey(
             gps_accuracy_m=gps_accuracy_m,
             gps_source=gps_source,
             gps_fetched_at_utc=gps_fetched_at_utc,
+            campaign_id=resolved_campaign_id,
+            hardware=resolved_hardware,
         )
         log.info(f"capture time resolved as {run_record.capture_start_utc!r} (source={run_record.capture_time_source})")
         if gps_source not in ("unknown", "not_configured"):
@@ -321,6 +340,8 @@ def run_survey(
         "survey_run_id": resolved_run_id,
         "site_id": site_profile.site_id,
         "band_profile": band_profile.name,
+        "campaign_id": resolved_campaign_id,
+        "hardware": resolved_hardware,
         "database_path": str(database),
         "output_dir": str(destination),
         "observation_count": len(observation_rows),
@@ -335,6 +356,7 @@ def run_survey(
 
     return {
         "run_id": resolved_run_id,
+        "campaign_id": resolved_campaign_id,
         "output_dir": str(destination),
         "database_path": str(database),
         "observation_count": len(observation_rows),

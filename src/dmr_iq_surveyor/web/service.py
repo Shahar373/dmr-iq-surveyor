@@ -55,6 +55,10 @@ from dmr_iq_surveyor.survey.profiles import (
     resolve_band_profile,
     resolve_site_profile,
 )
+from dmr_iq_surveyor.survey.provenance import (
+    hardware_from_capture_manifest,
+    hardware_from_recording,
+)
 from dmr_iq_surveyor.survey.store import delete_survey_run
 from dmr_iq_surveyor.web.devices import STATE_CHECKING as DEVICE_STATE_CHECKING
 from dmr_iq_surveyor.web.devices import DeviceMonitor
@@ -130,6 +134,10 @@ class FieldSettings:
     profile_base_dir: Path = field(default_factory=lambda: Path("."))
     band: str = "central_800"
     site_profile: str = "home"
+    # Which collection round the stops taken here belong to. Unset means
+    # unassigned, which is what every stop recorded before campaigns
+    # existed is, and it stays that way rather than being backfilled.
+    campaign_id: str | None = None
     center_frequency_hz: float = 867_406_250.0
     sample_rate_hz: float = 5_000_000.0
     # 90 s at 5 MS/s is 1.68 GiB. With one recording kept that peaks at
@@ -927,6 +935,12 @@ class FieldService:
             gps_fetched_at_utc=position.get("set_at"),
             site_id_override=stop_id,
             site_label_override=label or stop_id,
+            campaign_id=self.settings.campaign_id,
+            # Every stop through this app shares one site profile, so the
+            # `sites` row cannot hold what each stop was recorded at --
+            # `upsert_site` rewrites it. The capture report can, and it
+            # carries the radio's read-back rather than the request.
+            hardware=hardware_from_capture_manifest(manifest),
             drive_view=(
                 DriveViewSettings(
                     fft_size=self.settings.live_fft_size,
@@ -1099,6 +1113,12 @@ class FieldService:
                 gps_fetched_at_utc=position.get("set_at"),
                 site_id_override=stop_id,
                 site_label_override=label or stop_id,
+                campaign_id=self.settings.campaign_id,
+                # Only this recording's own capture report may describe
+                # it, and only when it names the file back. A recording
+                # handed over from elsewhere records no receiver state,
+                # which is the truth about it.
+                hardware=hardware_from_recording(recording),
             )
             job.check_cancelled()
             job.emit("measurements", "matching against the site registry", progress=0.7)
@@ -1194,6 +1214,7 @@ class FieldService:
         settings = LiveSettings(
             band=str(given.get("band") or self.settings.band),
             site_id=self.settings.site_profile,
+            campaign_id=self.settings.campaign_id,
             center_frequency_hz=float(
                 given.get("center_frequency_hz", self.settings.center_frequency_hz)
             ),

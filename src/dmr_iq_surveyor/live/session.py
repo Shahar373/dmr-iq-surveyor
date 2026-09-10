@@ -55,6 +55,7 @@ from dmr_iq_surveyor.survey.discovery import (
     spread_frame_starts,
 )
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
+from dmr_iq_surveyor.survey.provenance import hardware_requested
 from dmr_iq_surveyor.survey.store import SurveyRunRecord, import_survey_run, upsert_site
 
 # Why a window is a second: at 50 km/h it covers 14 m, which is about 40
@@ -81,6 +82,9 @@ class Position:
 class LiveSettings:
     band: str = "central_800_narrow"
     site_id: str = "mobile"
+    # Which collection round these bins belong to. Unset means the
+    # drive was not taken under a declared campaign.
+    campaign_id: str | None = None
     center_frequency_hz: float = 867_406_250.0
     sample_rate_hz: float = 5_000_000.0
     if_gain_reduction_db: float = 26.0
@@ -891,6 +895,19 @@ class LiveSession:
             gps_latitude=latitude,
             gps_longitude=longitude,
             gps_source="live_gps",
+            campaign_id=self.settings.campaign_id,
+            # A drive commands the radio once and never asks it what
+            # it did, so these are requested values and are filed as
+            # such. Calling them applied would put a reading's weight
+            # behind a number nothing measured.
+            hardware=hardware_requested(
+                driver=self.settings.driver,
+                center_frequency_hz=self.settings.center_frequency_hz,
+                sample_rate_hz=self.settings.sample_rate_hz,
+                if_gain_reduction_db=self.settings.if_gain_reduction_db,
+                lna_state=self.settings.lna_state,
+                agc=False,
+            ),
         )
         import_survey_run(
             connection,
