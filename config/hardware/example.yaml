@@ -1,0 +1,54 @@
+# Example hardware profile. Copy it, rename it, and edit.
+#
+# This is the receiver: what it is, and what it is meant to be set to. It is
+# separate from a site profile because the two answer different questions and
+# change on different clocks. A site profile is *where* -- one place, its
+# antenna, its coordinates -- and there is one per stop. This is *what with*,
+# and a campaign that swaps a radio or settles on a gain changes it once for
+# every stop at every site.
+#
+# Name it from a campaign manifest:
+#
+#   defaults:
+#     hardware: example        # or an absolute path to this file
+#
+# or from the command line: `dmr-surveyor survey run --hardware example`.
+#
+# Nothing here is ever recorded as `applied`. Everything in this file is a
+# DECLARATION -- what the operator intends the radio to be set to -- and it is
+# snapshotted into each run's own provenance when the run is recorded, so
+# editing this file later cannot rewrite what an earlier run appears to have
+# been taken with. Only the radio's own read-back is `applied`.
+#
+# Every key below is validated on load; an unknown one is an error rather
+# than a silent no-op.
+
+# ^ any non-empty string; it identifies this receiver in a run's provenance.
+hardware_id: example
+
+label: "Example SDRplay RSP1A"
+
+# Free text. Recorded so a level measured on one radio is not silently
+# compared with a level measured on another.
+receiver: "SDRplay RSP1A"
+
+antenna: "Discone, roof-mounted"
+
+# 'manual' or 'agc'. A campaign whose levels are meant to be comparable wants
+# manual: AGC moves the gain between stops, which is exactly the drift the
+# gain-discipline checks hunt for.
+gain_mode: manual
+
+# IF gain REDUCTION in dB -- larger means less gain. Non-negative and finite.
+# This is what has to stay identical across a round for its levels to mean
+# anything together.
+if_gain_reduction_db: 40.0
+
+# SDRplay LNA state: the other half of a fixed manual gain. IFGR alone does
+# not reproduce a receiver setting, because the LNA stage sets the noise
+# figure ahead of it.
+lna_state: 2
+
+notes: >
+  Replace this file with the receiver actually in use. The values above are
+  the app's own fallbacks, so copying it unedited changes nothing.

@@ -248,24 +248,47 @@ def requested_bucket(
     )
 
 
-def declared_bucket(site: SiteProfile | None) -> dict[str, Any]:
-    """The `declared` bucket: the site profile as it stood for this run.
+def declared_bucket(site: SiteProfile | None, hardware: Any = None) -> dict[str, Any]:
+    """The `declared` bucket: what the operator said, as it stood for this run.
 
     Snapshotted per run on purpose. `sites` holds one mutable row that
     `upsert_site` rewrites, so without this a profile edited next month would
     retroactively change the receiver, antenna and gain every earlier run
     appears to have been taken with.
+
+    A hardware profile, when the campaign names one, is the more specific
+    declaration and supplies the receiver half field by field: it exists
+    precisely to say what the radio is and what it should be set to, across
+    every site a campaign visits. The site profile still supplies whatever
+    the hardware profile leaves unset, so adding one to a campaign never
+    takes information away from a run.
+
+    Still `declared`, never `applied`, however precise the file is. A
+    declaration is what somebody intended; only the radio's own read-back
+    may claim to be what the receiver was actually set to.
     """
-    if site is None:
+    if site is None and hardware is None:
         return {}
+    receiver = getattr(hardware, "receiver", None)
+    antenna = getattr(hardware, "antenna", None)
+    gain_mode = getattr(hardware, "gain_mode", None)
+    gain = getattr(hardware, "if_gain_reduction_db", None)
+    lna_state = getattr(hardware, "lna_state", None)
     return _known(
         {
-            "site_id": site.site_id,
-            "receiver": site.receiver,
-            "antenna": site.antenna,
-            "gain_mode": site.gain_mode,
-            "gain": site.gain,
-            "lna_state": site.lna_state,
+            "site_id": getattr(site, "site_id", None),
+            # Which file the receiver half came from, so a reader can tell a
+            # campaign-wide declaration from a per-site one.
+            "hardware_id": getattr(hardware, "hardware_id", None),
+            "receiver": receiver if receiver is not None else getattr(site, "receiver", None),
+            "antenna": antenna if antenna is not None else getattr(site, "antenna", None),
+            "gain_mode": (
+                gain_mode if gain_mode is not None else getattr(site, "gain_mode", None)
+            ),
+            "gain": gain if gain is not None else getattr(site, "gain", None),
+            "lna_state": (
+                lna_state if lna_state is not None else getattr(site, "lna_state", None)
+            ),
         }
     )
 

@@ -9,6 +9,7 @@ A site profile records the fixed context of one measurement location
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from dmr_iq_surveyor.detect.core import DetectionSettings
 
 _DEFAULT_BAND_DIRS = ("config/bands",)
 _DEFAULT_SITE_DIRS = ("config/sites",)
+_DEFAULT_HARDWARE_DIRS = ("config/hardware",)
 
 
 class ProfileError(ValueError):
@@ -131,6 +133,112 @@ class SiteProfile:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class HardwareProfile:
+    """The receiver itself: what it is, and what it is meant to be set to.
+
+    Separate from `SiteProfile` because the two answer different questions
+    and change on different clocks. A site profile is *where* -- one place,
+    its antenna and its coordinates -- and there is one per stop. A hardware
+    profile is *what with*, and a campaign that swaps a receiver or settles
+    on a gain changes it once for every stop at every site.
+
+    Splitting them also fixes a real ambiguity. `sites` is a single mutable
+    row per profile that every run rewrites, so gain recorded there describes
+    the profile as it stands now rather than as it stood for the run being
+    read. A hardware profile is a file: named in a campaign manifest,
+    snapshotted into each run's own provenance when the run is recorded, and
+    unable to rewrite history afterwards.
+
+    Nothing here is ever labelled `applied`. These are declarations -- what
+    the operator intends -- and only the radio's own read-back may claim to
+    be what the receiver was actually set to.
+    """
+
+    hardware_id: str
+    label: str
+    receiver: str | None = None
+    antenna: str | None = None
+    gain_mode: str | None = None
+    if_gain_reduction_db: float | None = None
+    lna_state: int | None = None
+    notes: str = ""
+
+    def validate(self) -> None:
+        if not self.hardware_id.strip():
+            raise ProfileError("hardware_id must not be empty")
+        if not self.label.strip():
+            raise ProfileError("label must not be empty")
+        if self.if_gain_reduction_db is not None and not math.isfinite(
+            self.if_gain_reduction_db
+        ):
+            raise ProfileError("if_gain_reduction_db must be a finite number")
+        if self.if_gain_reduction_db is not None and self.if_gain_reduction_db < 0:
+            raise ProfileError("if_gain_reduction_db is a reduction: it must not be negative")
+        if self.lna_state is not None and self.lna_state < 0:
+            raise ProfileError("lna_state must not be negative")
+        if self.gain_mode is not None and self.gain_mode not in ("manual", "agc"):
+            raise ProfileError("gain_mode must be 'manual' or 'agc'")
+
+    @property
+    def declares_gain(self) -> bool:
+        return self.if_gain_reduction_db is not None or self.lna_state is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def load_hardware_profile(path: str | Path) -> HardwareProfile:
+    """Parse and fully check one `config/hardware/*.yaml`."""
+    source = Path(path).expanduser().resolve()
+    raw = _load_yaml_mapping(source)
+    allowed = set(HardwareProfile.__dataclass_fields__)
+    _reject_unknown_keys(raw, allowed, str(source))
+    if "hardware_id" not in raw or "label" not in raw:
+        raise ProfileError(f"{source} requires 'hardware_id' and 'label'")
+    profile = HardwareProfile(
+        hardware_id=str(raw["hardware_id"]),
+        label=str(raw["label"]),
+        receiver=(str(raw["receiver"]) if raw.get("receiver") is not None else None),
+        antenna=(str(raw["antenna"]) if raw.get("antenna") is not None else None),
+        gain_mode=(str(raw["gain_mode"]) if raw.get("gain_mode") is not None else None),
+        if_gain_reduction_db=(
+            float(raw["if_gain_reduction_db"])
+            if raw.get("if_gain_reduction_db") is not None
+            else None
+        ),
+        lna_state=(int(raw["lna_state"]) if raw.get("lna_state") is not None else None),
+        notes=str(raw.get("notes", "")),
+    )
+    profile.validate()
+    return profile
+
+
+def resolve_hardware_profile(
+    hardware: str | Path,
+    *,
+    search_dirs: tuple[str, ...] = _DEFAULT_HARDWARE_DIRS,
+    base_dir: str | Path = ".",
+) -> HardwareProfile:
+    """Resolve by explicit path, or by name under `config/hardware/`.
+
+    The same two-step shape as `resolve_band_profile` and
+    `resolve_site_profile`, so an operator who knows one knows all three.
+    """
+    candidate = Path(hardware).expanduser()
+    if candidate.is_file():
+        return load_hardware_profile(candidate)
+    base = Path(base_dir).expanduser().resolve()
+    for directory in search_dirs:
+        guess = base / directory / f"{hardware}.yaml"
+        if guess.is_file():
+            return load_hardware_profile(guess)
+    raise ProfileError(
+        f"Could not resolve hardware profile {hardware!r}: not a file, and not found "
+        f"as '<name>.yaml' under {[str(base / d) for d in search_dirs]}"
+    )
 
 
 def _load_yaml_mapping(path: Path) -> dict[str, Any]:
@@ -263,11 +371,14 @@ def resolve_site_profile(
 
 __all__ = [
     "BandProfile",
+    "HardwareProfile",
     "ComparisonTolerances",
     "ProfileError",
     "SiteProfile",
     "load_band_profile",
+    "load_hardware_profile",
     "load_site_profile",
     "resolve_band_profile",
+    "resolve_hardware_profile",
     "resolve_site_profile",
 ]

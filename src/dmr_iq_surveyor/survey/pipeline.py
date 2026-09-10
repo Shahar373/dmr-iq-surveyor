@@ -31,6 +31,7 @@ from dmr_iq_surveyor.survey.discovery import (
 from dmr_iq_surveyor.survey.profiles import (
     BandProfile,
     ComparisonTolerances,
+    HardwareProfile,
     SiteProfile,
     resolve_band_profile,
     resolve_site_profile,
@@ -148,6 +149,7 @@ def run_survey(
     campaign_id: str | None = None,
     hardware: dict[str, Any] | None = None,
     declared_site: SiteProfile | None = None,
+    declared_hardware: HardwareProfile | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     log = SurveyLog()
@@ -200,7 +202,9 @@ def run_survey(
     # measured, so editing that profile later cannot rewrite what this run
     # appears to have been taken with.
     measured = hardware if hardware is not None else hardware_from_recording(source)
-    resolved_hardware = with_declared(measured, declared_bucket(declaration))
+    resolved_hardware = with_declared(
+        measured, declared_bucket(declaration, declared_hardware)
+    )
     log.info(
         f"campaign {resolved_campaign_id!r}; receiver state "
         f"{hardware_source_label(resolved_hardware)}"

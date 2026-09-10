@@ -50,9 +50,11 @@ from dmr_iq_surveyor.live.session import LiveSession, LiveSettings, Position
 from dmr_iq_surveyor.reference.store import list_sites
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, DriveViewSettings, run_survey
 from dmr_iq_surveyor.survey.profiles import (
+    HardwareProfile,
     ProfileError,
     SiteProfile,
     resolve_band_profile,
+    resolve_hardware_profile,
     resolve_site_profile,
 )
 from dmr_iq_surveyor.survey.provenance import (
@@ -147,6 +149,10 @@ class FieldSettings:
     # is what actually enforces which database this process may open.
     project_id: str | None = None
     project_root: Path | None = None
+    # The receiver this round is run with, by name under config/hardware/ or
+    # by path. `None` is every deployment before hardware profiles existed:
+    # the site profile stays the only declaration source, exactly as before.
+    hardware_profile: str | None = None
     center_frequency_hz: float = 867_406_250.0
     sample_rate_hz: float = 5_000_000.0
     # 90 s at 5 MS/s is 1.68 GiB. With one recording kept that peaks at
@@ -506,6 +512,28 @@ class FieldService:
             }
         finally:
             self._device_transition_lock.release()
+
+    def _hardware_profile(self) -> HardwareProfile | None:
+        """The campaign's hardware profile, or `None` when none is named.
+
+        Resolved per use rather than cached: it is read once per stop, and an
+        operator who corrects the file mid-round should not have to restart
+        the service for the next stop to record the corrected declaration.
+
+        A profile that cannot be resolved is not fatal here -- startup
+        already refused an unresolvable one, so reaching this is a file that
+        moved while the app was running, and losing the receiver half of a
+        declaration is better than losing the stop.
+        """
+        name = self.settings.hardware_profile
+        if not name:
+            return None
+        try:
+            return resolve_hardware_profile(
+                name, base_dir=self.settings.profile_base_dir
+            )
+        except (ProfileError, FileNotFoundError, OSError):
+            return None
 
     def sites_overview(self) -> list[dict[str, Any]]:
         """Just the sites. `/api/sites` used to build the whole state
@@ -969,6 +997,7 @@ class FieldService:
             # carries the radio's read-back rather than the request.
             hardware=hardware_from_capture_manifest(manifest),
             declared_site=declared_profile,
+            declared_hardware=self._hardware_profile(),
             drive_view=(
                 DriveViewSettings(
                     fft_size=self.settings.live_fft_size,

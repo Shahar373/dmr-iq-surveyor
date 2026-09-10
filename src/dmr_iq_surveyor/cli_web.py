@@ -30,9 +30,11 @@ from dmr_iq_surveyor.project.manifest import (
 )
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
 from dmr_iq_surveyor.survey.profiles import (
+    HardwareProfile,
     ProfileError,
     SiteProfile,
     resolve_band_profile,
+    resolve_hardware_profile,
     resolve_site_profile,
 )
 from dmr_iq_surveyor.survey.provenance import ProvenanceError, normalise_campaign_id
@@ -74,49 +76,151 @@ def _local_addresses(port: int, scheme: str = "http") -> list[str]:
     return addresses
 
 
+# What the field app falls back to when nothing has been configured at all.
+# Named rather than inline so the notice and the value cannot drift apart.
+FALLBACK_IF_GAIN_REDUCTION_DB = 40.0
+FALLBACK_LNA_STATE = 2
+
+# Where a capture-time setting came from, most specific first. These name the
+# ORIGIN of a request, and are deliberately distinct from the provenance
+# sources in `survey/provenance.py`: everything decided here is at most a
+# request, and only the radio's own read-back is ever `applied`.
+ORIGIN_FLAG = "command line"
+ORIGIN_HARDWARE = "hardware profile"
+ORIGIN_SITE = "site profile"
+ORIGIN_FALLBACK = "built-in fallback"
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureGain:
+    """The gain the app will ask for, and where each half of it came from."""
+
+    if_gain_reduction_db: float
+    lna_state: int
+    if_gain_origin: str
+    lna_origin: str
+    notices: list[str]
+
+    @property
+    def unconfirmed(self) -> bool:
+        return ORIGIN_FALLBACK in (self.if_gain_origin, self.lna_origin)
+
+    def describe(self) -> str:
+        return (
+            f"IF gain reduction {self.if_gain_reduction_db:g} dB "
+            f"(from the {self.if_gain_origin}), "
+            f"LNA state {self.lna_state} (from the {self.lna_origin})"
+        )
+
+
+def resolve_capture_gain(
+    if_gain_reduction: float | None,
+    lna_state: int | None,
+    site_profile: SiteProfile,
+    hardware_profile: HardwareProfile | None = None,
+) -> CaptureGain:
+    """Resolve the field app's default capture gain, and say where it came from.
+
+    One ladder, each rung named in the result rather than left to be inferred:
+
+        command line -> hardware profile -> site profile -> built-in fallback
+
+    An explicit CLI flag always wins -- it is the operator answering the
+    question directly. A hardware profile comes next when the campaign names
+    one, because it is the file that exists to say what this receiver is set
+    to across every site the round visits, and it outranks the site profile
+    for exactly that reason: gain belongs to the radio, not to the place.
+    The site profile still answers whatever the hardware profile leaves
+    unset, and remains the only source when there is no hardware profile at
+    all, which is every deployment before this existed.
+
+    Only when NOTHING says anything does this reach the built-in fallback,
+    and that is always reported: an unconfirmed default is exactly the risk
+    the project's gain-discipline checks (`gain_differs_from_campaign`) exist
+    to catch after the fact, so it is better caught here, before a single
+    stop is recorded.
+
+    Nothing decided here is ever `applied`. These values are what the app
+    will ASK the radio for; what it was actually set to is the read-back, and
+    it is recorded separately.
+    """
+    notices: list[str] = []
+    declared_gain = getattr(hardware_profile, "if_gain_reduction_db", None)
+    declared_lna = getattr(hardware_profile, "lna_state", None)
+    hardware_id = getattr(hardware_profile, "hardware_id", None)
+
+    if if_gain_reduction is not None:
+        resolved_gain, gain_origin = if_gain_reduction, ORIGIN_FLAG
+        if declared_gain is not None and declared_gain != if_gain_reduction:
+            # Not refused: the operator is at the radio and the flag is them
+            # answering. But a round whose stops were not all taken at the
+            # profile's gain is exactly what the drift check hunts for after
+            # the fact, so it is said out loud now.
+            notices.append(
+                f"--if-gain-reduction {if_gain_reduction:g} dB overrides the "
+                f"{hardware_id!r} hardware profile's {declared_gain:g} dB; this stop will not "
+                "match the rest of the round unless every other stop is overridden too"
+            )
+    elif declared_gain is not None:
+        resolved_gain, gain_origin = declared_gain, ORIGIN_HARDWARE
+    elif site_profile.gain is not None:
+        resolved_gain, gain_origin = site_profile.gain, ORIGIN_SITE
+    else:
+        resolved_gain, gain_origin = FALLBACK_IF_GAIN_REDUCTION_DB, ORIGIN_FALLBACK
+        notices.append(
+            f"no gain recorded in the {site_profile.site_id!r} site profile"
+            + (" or in a hardware profile" if hardware_profile is None else "")
+            + f"; defaulting IF gain reduction to {resolved_gain:g} dB -- confirm this in "
+            "the app before recording"
+        )
+
+    if lna_state is not None:
+        resolved_lna, lna_origin = lna_state, ORIGIN_FLAG
+        if declared_lna is not None and declared_lna != lna_state:
+            notices.append(
+                f"--lna-state {lna_state} overrides the {hardware_id!r} hardware profile's "
+                f"{declared_lna}; this stop will not match the rest of the round unless "
+                "every other stop is overridden too"
+            )
+    elif declared_lna is not None:
+        resolved_lna, lna_origin = declared_lna, ORIGIN_HARDWARE
+    elif site_profile.lna_state is not None:
+        resolved_lna, lna_origin = site_profile.lna_state, ORIGIN_SITE
+    else:
+        resolved_lna, lna_origin = FALLBACK_LNA_STATE, ORIGIN_FALLBACK
+        notices.append(
+            f"no LNA state recorded in the {site_profile.site_id!r} site profile"
+            + (" or in a hardware profile" if hardware_profile is None else "")
+            + f"; defaulting to LNA state {resolved_lna} -- confirm this in the app before "
+            "recording"
+        )
+
+    return CaptureGain(
+        if_gain_reduction_db=float(resolved_gain),
+        lna_state=int(resolved_lna),
+        if_gain_origin=gain_origin,
+        lna_origin=lna_origin,
+        notices=notices,
+    )
+
+
 def _resolve_capture_gain(
     if_gain_reduction: float | None,
     lna_state: int | None,
     site_profile: SiteProfile,
+    hardware_profile: HardwareProfile | None = None,
 ) -> tuple[float, int, list[str]]:
-    """Resolve the field app's default capture gain, and say where it came from.
+    """The three values `resolve_capture_gain` decides, without the origins.
 
-    Precedence: an explicit CLI flag always wins. Otherwise the resolved
-    site profile -- the one file this project's whole field guide tells an
-    operator to fill in -- seeds it silently, since that is a deliberate
-    choice already recorded. Only when NEITHER says anything does this fall
-    back to a hardcoded default, and that fallback is always reported: an
-    unconfirmed default is exactly the risk the project's gain-discipline
-    checks (`gain_differs_from_campaign`) exist to catch after the fact, so
-    it is better caught here, before a single stop is recorded.
+    A projection, not a second ladder: every decision is made once, above.
+    This shape predates hardware profiles and is kept because callers and
+    tests written against it are still correct -- the values it returns are
+    the same values, and the origins are simply not part of what it answers.
     """
-    notices: list[str] = []
-
-    resolved_gain = if_gain_reduction
-    if resolved_gain is None:
-        if site_profile.gain is not None:
-            resolved_gain = site_profile.gain
-        else:
-            resolved_gain = 40.0
-            notices.append(
-                f"no gain recorded in the {site_profile.site_id!r} site profile; "
-                f"defaulting IF gain reduction to {resolved_gain:g} dB -- confirm this in the "
-                "app before recording"
-            )
-
-    resolved_lna = lna_state
-    if resolved_lna is None:
-        if site_profile.lna_state is not None:
-            resolved_lna = site_profile.lna_state
-        else:
-            resolved_lna = 2
-            notices.append(
-                f"no LNA state recorded in the {site_profile.site_id!r} site profile; "
-                f"defaulting to LNA state {resolved_lna} -- confirm this in the app before "
-                "recording"
-            )
-
-    return resolved_gain, resolved_lna, notices
+    resolved = resolve_capture_gain(
+        if_gain_reduction, lna_state, site_profile, hardware_profile
+    )
+    return resolved.if_gain_reduction_db, resolved.lna_state, resolved.notices
 
 
 # The token travels in a URL (`?token=...`), because the page has to load
@@ -235,6 +339,7 @@ class ProjectContext:
     site: str
     output: Path
     database: Path
+    hardware: str | None
     capture: dict[str, float]
     notices: list[str]
 
@@ -326,6 +431,16 @@ def _resolve_project_context(
         flag_explicit=_flag_was_typed(ctx, "output"),
         project=Path(manifest.defaults.output) if manifest.defaults.output else None,
     )
+    # No CLI flag names a hardware profile: the receiver a round is run with
+    # is a property of the round, not of one invocation. The individual gain
+    # flags remain the way to override a single stop, and say so when they do.
+    hardware_choice = resolve_setting(
+        "hardware",
+        flag=None,
+        flag_explicit=False,
+        campaign=campaign_defaults.hardware if campaign_defaults else None,
+        project=manifest.defaults.hardware,
+    )
 
     # An explicit `--database` may point somewhere else -- at a second
     # database of the same project, say -- but it is not exempt from the
@@ -350,7 +465,12 @@ def _resolve_project_context(
         notices.append(
             "No campaign given: project defaults apply and stops recorded here stay unassigned"
         )
-    for key, choice in (("band", band_choice), ("site", site_choice), ("output", output_choice)):
+    for key, choice in (
+        ("band", band_choice),
+        ("site", site_choice),
+        ("output", output_choice),
+        ("hardware", hardware_choice),
+    ):
         if choice.from_manifest:
             notices.append(f"{key} {choice.value!s} from the {choice.origin} manifest")
 
@@ -361,6 +481,9 @@ def _resolve_project_context(
         site=str(site_choice.value),
         output=Path(output_choice.value),
         database=Path(database_choice).expanduser().resolve(),
+        hardware=(
+            str(hardware_choice.value) if hardware_choice.value is not None else None
+        ),
         capture=dict(campaign_defaults.capture) if campaign_defaults else {},
         notices=notices,
     )
@@ -649,27 +772,40 @@ def web_serve(
         # resolved site profile also seeds the gain defaults below -- editing
         # `config/sites/<name>.yaml` is the one thing this project's whole field
         # guide tells an operator to do, so the app has to actually read it.
+        hardware_name = project_context.hardware if project_context else None
         try:
             resolve_band_profile(band)
             resolved_site_profile = resolve_site_profile(site)
+            # Resolved here with the others, so a campaign naming a hardware
+            # profile that does not exist fails at startup rather than at the
+            # operator's first stop.
+            resolved_hardware_profile = (
+                resolve_hardware_profile(hardware_name) if hardware_name else None
+            )
         except (ProfileError, FileNotFoundError, OSError) as exc:
             console.print(f"[bold red]Profile could not be resolved:[/bold red] {exc}")
             console.print(
                 "Band profiles live in config/bands/, site profiles in config/sites/, "
-                "resolved relative to the current directory."
+                "hardware profiles in config/hardware/, resolved relative to the current "
+                "directory."
             )
             raise typer.Exit(code=1) from exc
 
-        resolved_gain, resolved_lna, gain_notices = _resolve_capture_gain(
-            if_gain_reduction, lna_state, resolved_site_profile
+        gain = resolve_capture_gain(
+            if_gain_reduction, lna_state, resolved_site_profile, resolved_hardware_profile
         )
-        for notice in gain_notices:
-            console.print(f"[yellow]Gain default:[/yellow] {notice}")
-        if not gain_notices:
+        resolved_gain = gain.if_gain_reduction_db
+        resolved_lna = gain.lna_state
+        for notice in gain.notices:
+            console.print(f"[yellow]Gain:[/yellow] {notice}")
+        if resolved_hardware_profile is not None:
             console.print(
-                f"[green]Gain from site profile[/green] {site!r}: "
-                f"IF gain reduction {resolved_gain:g} dB, LNA state {resolved_lna}"
+                f"[green]Hardware profile[/green] {resolved_hardware_profile.hardware_id!r} "
+                f"({resolved_hardware_profile.label}) from {hardware_name}"
             )
+        # Always printed, and always naming the origin of each half. A gain
+        # whose source is invisible is one nobody checks.
+        console.print(f"[green]Gain:[/green] {gain.describe()}")
 
         try:
             resolved = resolve_token(token, token_file)
@@ -694,6 +830,7 @@ def web_serve(
             campaign_id=campaign,
             project_id=project_context.manifest.project_id if project_context else None,
             project_root=project_context.manifest.root if project_context else None,
+            hardware_profile=hardware_name,
             site_profile=site,
             center_frequency_hz=center_frequency,
             sample_rate_hz=sample_rate,
