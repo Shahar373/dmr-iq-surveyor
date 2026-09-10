@@ -355,6 +355,8 @@ Given one wideband IQ recording, Phase 6A discovers active RF signals with no pr
 
 Runs and observations persist in the same SQLite database as the DMR inventory (`runs/inventory/dmr_inventory.sqlite3` by default), extended additively — existing tables are untouched. `survey compare` works with no protocol decoder installed and reports `NEW`, `MISSING_THIS_RUN`, `STABLE`, `SNR_CHANGE`, `OCCUPANCY_CHANGE`, `PERSISTENCE_CHANGE`, or `NOT_COMPARABLE` between two runs.
 
+`--campaign <id>` tags a run with the collection round it belongs to -- on `survey run`, `survey capture`, `live stop` and `web serve`. Left unset a run is unassigned, which is what every run recorded before campaigns existed is; none was backfilled. `scripts/campaign_digest.py --campaign <id>` narrows the collection section of the digest, and skips the measurement, solution and planning sections rather than showing whole-database numbers under one campaign's heading.
+
 Band profiles (`config/bands/*.yaml`, e.g. `central_800.yaml` for 866-870 MHz, `central_800_recon.yaml` for a short first-look capture) describe where to look; site profiles (`config/sites/*.yaml`, copy `home.example.yaml`) record the fixed measurement context. See [`docs/phase6a-survey.md`](docs/phase6a-survey.md) for the full design, schema and acceptance criteria, [`docs/phase6-design.md`](docs/phase6-design.md) for the overall Phase 6 roadmap toward P25, and [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md) for a field-ready capture procedure at a new site.
 
 ## Phase 7 — P25 site geolocation
@@ -462,8 +464,13 @@ corrupts it. Three guards, all reported whether or not they fire:
   when the sites actually agree on it (a large but scattered residual is model misfit, not a shared
   shift), and the reported magnitude is a lower bound because the first pass already absorbed part
   of it. `--no-common-mode` reports without applying.
-- **Gain drift.** The gain actually applied is stored per stop, and measurements from a stop
-  recorded at a gain other than the campaign's are flagged.
+- **Gain drift.** Measurements from a stop recorded at a gain other than the campaign's are
+  flagged. That check reads `sites.gain`, the site profile's declaration, which is rewritten on
+  every run -- so stops sharing one site profile all report the same value, and editing that
+  profile later rewrites what earlier stops appear to have used. Each run now also records its
+  own receiver state in `survey_runs.hardware_json`: what the radio reported back, what it was
+  asked for, and the profile as it stood, kept apart. `scripts/campaign_digest.py` shows every
+  gain with that label. The solver still reads the old value.
 - **Noise-floor shift.** Levels are SNR above the local noise floor, so a floor that moves takes
   every level with it. A stop more than 4 dB from the campaign's median floor is flagged.
 

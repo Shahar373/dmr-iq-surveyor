@@ -55,6 +55,10 @@ from dmr_iq_surveyor.survey.profiles import (
     resolve_band_profile,
     resolve_site_profile,
 )
+from dmr_iq_surveyor.survey.provenance import (
+    hardware_from_capture_manifest,
+    normalise_campaign_id,
+)
 from dmr_iq_surveyor.survey.store import delete_survey_run
 from dmr_iq_surveyor.web.devices import STATE_CHECKING as DEVICE_STATE_CHECKING
 from dmr_iq_surveyor.web.devices import DeviceMonitor
@@ -130,6 +134,10 @@ class FieldSettings:
     profile_base_dir: Path = field(default_factory=lambda: Path("."))
     band: str = "central_800"
     site_profile: str = "home"
+    # Which collection round the stops taken here belong to. Unset means
+    # unassigned, which is what every stop recorded before campaigns
+    # existed is, and it stays that way rather than being backfilled.
+    campaign_id: str | None = None
     center_frequency_hz: float = 867_406_250.0
     sample_rate_hz: float = 5_000_000.0
     # 90 s at 5 MS/s is 1.68 GiB. With one recording kept that peaks at
@@ -303,6 +311,10 @@ class FieldService:
         *,
         probe_runner: ProbeRunner | None = None,
     ) -> None:
+        # Checked as the service is built, which is startup. A mistyped
+        # campaign id must refuse to serve rather than wait and fail the
+        # operator's first 90-second recording out in the field.
+        settings.campaign_id = normalise_campaign_id(settings.campaign_id)
         self.settings = settings
         self.jobs = JobRegistry()
         # Guards the window between require_device_ready() succeeding and
@@ -820,6 +832,13 @@ class FieldService:
                 # profile's placeholder. Cross-stop comparability is the
                 # method's foundation, so the number it depends on has to be
                 # stored per stop to be checkable.
+                #
+                # The untouched profile is kept and handed to `run_survey`
+                # separately: these overwritten fields hold what the radio
+                # was ASKED for, and filing them as the operator's
+                # declaration would make the declaration a second copy of
+                # the request rather than an independent claim.
+                declared_profile = site_profile
                 site_profile = replace(
                     site_profile,
                     gain=capture.if_gain_reduction_db,
@@ -839,6 +858,7 @@ class FieldService:
                         label=label,
                         position=position,
                         solve=solve,
+                        declared_profile=declared_profile,
                     )
 
                 return self.jobs.submit(
@@ -862,6 +882,7 @@ class FieldService:
         label: str,
         position: dict[str, Any],
         solve: bool,
+        declared_profile: SiteProfile | None = None,
     ) -> dict[str, Any]:
         # start_capture() already ran a fresh, bounded readiness check
         # immediately before submitting this job (JobRegistry claims the job
@@ -927,6 +948,13 @@ class FieldService:
             gps_fetched_at_utc=position.get("set_at"),
             site_id_override=stop_id,
             site_label_override=label or stop_id,
+            campaign_id=self.settings.campaign_id,
+            # Every stop through this app shares one site profile, so the
+            # `sites` row cannot hold what each stop was recorded at --
+            # `upsert_site` rewrites it. The capture report can, and it
+            # carries the radio's read-back rather than the request.
+            hardware=hardware_from_capture_manifest(manifest),
+            declared_site=declared_profile,
             drive_view=(
                 DriveViewSettings(
                     fft_size=self.settings.live_fft_size,
@@ -1099,6 +1127,11 @@ class FieldService:
                 gps_fetched_at_utc=position.get("set_at"),
                 site_id_override=stop_id,
                 site_label_override=label or stop_id,
+                campaign_id=self.settings.campaign_id,
+                # `hardware` is left unset on purpose: `run_survey` looks
+                # for this recording's own capture report itself, so a
+                # file analysed here and the same file analysed by
+                # `survey run` get one answer rather than two.
             )
             job.check_cancelled()
             job.emit("measurements", "matching against the site registry", progress=0.7)
@@ -1194,6 +1227,7 @@ class FieldService:
         settings = LiveSettings(
             band=str(given.get("band") or self.settings.band),
             site_id=self.settings.site_profile,
+            campaign_id=self.settings.campaign_id,
             center_frequency_hz=float(
                 given.get("center_frequency_hz", self.settings.center_frequency_hz)
             ),

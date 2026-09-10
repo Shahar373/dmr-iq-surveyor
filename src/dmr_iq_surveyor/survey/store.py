@@ -33,6 +33,7 @@ from typing import Any
 from dmr_iq_surveyor.inventory.store import connect_database
 from dmr_iq_surveyor.survey.discovery import RfObservation
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
+from dmr_iq_surveyor.survey.provenance import normalise_campaign_id, normalise_hardware
 
 SURVEY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sites (
@@ -78,7 +79,9 @@ CREATE TABLE IF NOT EXISTS survey_runs (
     gps_altitude_m REAL,
     gps_accuracy_m REAL,
     gps_source TEXT NOT NULL DEFAULT 'unknown',
-    gps_fetched_at_utc TEXT
+    gps_fetched_at_utc TEXT,
+    campaign_id TEXT,
+    hardware_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS rf_frequencies (
     rf_frequency_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,6 +171,15 @@ def connect_survey_database(path: str | Path) -> sqlite3.Connection:
         ("gps_accuracy_m", "REAL"),
         ("gps_source", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("gps_fetched_at_utc", "TEXT"),
+        # Which collection round this run belongs to. NULL on every run
+        # written before campaigns existed, and that is left alone: those
+        # runs were not taken under a declared campaign, and inventing one
+        # for them would put a claim on rows that never faced the question.
+        ("campaign_id", "TEXT"),
+        # What the receiver was actually set to, separated into what was
+        # asked for and what the radio reported back. '{}' on older rows
+        # means not recorded -- see survey/provenance.py.
+        ("hardware_json", "TEXT NOT NULL DEFAULT '{}'"),
     ):
         _ensure_column(connection, "survey_runs", column, declaration)
     # The LNA state is the other half of a fixed manual gain: IFGR alone does
@@ -346,6 +358,11 @@ class SurveyRunRecord:
     gps_accuracy_m: float | None = None
     gps_source: str = "unknown"
     gps_fetched_at_utc: str | None = None
+    campaign_id: str | None = None
+    # Built by survey/provenance.py; `None` means this run recorded
+    # nothing about the receiver. Not a mutable default -- the empty blob
+    # is produced on the way into the database, not shared between records.
+    hardware: dict[str, Any] | None = None
 
 
 def import_survey_run(
@@ -361,6 +378,13 @@ def import_survey_run(
     a different run ID accumulates alongside prior runs, exactly matching
     the existing DMR inventory's `replace_run` idempotency contract.
     """
+    # Validated BEFORE anything is deleted. A rejected campaign id or a
+    # malformed provenance blob must not cost the run that is already
+    # stored: `_delete_run` below is not undone by the exception, and a
+    # caller that commits afterwards would make the loss permanent.
+    campaign_id = normalise_campaign_id(run.campaign_id)
+    hardware_json = json.dumps(normalise_hardware(run.hardware), sort_keys=True)
+
     # Frequencies the *previous* version of this run touched must also have
     # their first/last-seen recomputed, even if the new observation set no
     # longer includes them (e.g. re-importing with zero observations) --
@@ -384,8 +408,9 @@ def import_survey_run(
             occupancy_threshold_db, detection_settings_json, tool_version,
             settings_json, imported_at, status,
             gps_latitude, gps_longitude, gps_altitude_m, gps_accuracy_m,
-            gps_source, gps_fetched_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            gps_source, gps_fetched_at_utc, campaign_id, hardware_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?)
         """,
         (
             run.survey_run_id,
@@ -418,6 +443,8 @@ def import_survey_run(
             run.gps_accuracy_m,
             run.gps_source,
             run.gps_fetched_at_utc,
+            campaign_id,
+            hardware_json,
         ),
     )
 

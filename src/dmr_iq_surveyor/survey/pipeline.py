@@ -35,6 +35,13 @@ from dmr_iq_surveyor.survey.profiles import (
     resolve_band_profile,
     resolve_site_profile,
 )
+from dmr_iq_surveyor.survey.provenance import (
+    declared_bucket,
+    hardware_from_recording,
+    hardware_source_label,
+    normalise_campaign_id,
+    with_declared,
+)
 from dmr_iq_surveyor.survey.store import (
     SurveyRunRecord,
     connect_survey_database,
@@ -138,11 +145,19 @@ def run_survey(
     site_id_override: str | None = None,
     site_label_override: str | None = None,
     drive_view: DriveViewSettings | None = None,
+    campaign_id: str | None = None,
+    hardware: dict[str, Any] | None = None,
+    declared_site: SiteProfile | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     log = SurveyLog()
     if drive_view is not None:
         drive_view.validate()
+    # Validated here rather than at the insert alone, so a mistyped
+    # campaign id fails before the analysis is paid for rather than
+    # after it. The store validates again; both calls are the same
+    # function and it is idempotent.
+    resolved_campaign_id = normalise_campaign_id(campaign_id)
 
     source = Path(recording_path).expanduser().resolve()
     if not source.is_file():
@@ -159,6 +174,12 @@ def run_survey(
     # distinct site, which matters because `survey compare` treats runs from
     # one site_id as the same place and would otherwise report every signal
     # that differs between two locations as NEW or MISSING_THIS_RUN.
+    # What the operator declared, which is not always the profile that is
+    # about to be written to `sites`. A caller that overwrites the gain
+    # fields to record what it asked the radio for -- the field app does --
+    # must still be able to say what the profile itself held, or the
+    # declaration is a second copy of the request wearing another name.
+    declaration = declared_site if declared_site is not None else site_profile
     if site_id_override or site_label_override:
         site_profile = replace(
             site_profile,
@@ -166,7 +187,24 @@ def run_survey(
             label=site_label_override or (site_id_override or site_profile.label),
         )
         site_profile.validate()
+        declaration = replace(
+            declaration,
+            site_id=site_id_override or declaration.site_id,
+            label=site_label_override or (site_id_override or declaration.label),
+        )
     log.info(f"resolved band profile {band_profile.name!r}, site profile {site_profile.site_id!r}")
+    # A recording this software captured carries its own report beside it.
+    # Looking for it HERE rather than in each caller is what makes one
+    # file give one answer whether the CLI or the field app analyses it.
+    # The site profile's declaration is snapshotted alongside whatever was
+    # measured, so editing that profile later cannot rewrite what this run
+    # appears to have been taken with.
+    measured = hardware if hardware is not None else hardware_from_recording(source)
+    resolved_hardware = with_declared(measured, declared_bucket(declaration))
+    log.info(
+        f"campaign {resolved_campaign_id!r}; receiver state "
+        f"{hardware_source_label(resolved_hardware)}"
+    )
     if not site_profile.is_gain_comparable:
         log.warning(
             f"site {site_profile.site_id!r} has no recorded gain; "
@@ -263,6 +301,8 @@ def run_survey(
             gps_accuracy_m=gps_accuracy_m,
             gps_source=gps_source,
             gps_fetched_at_utc=gps_fetched_at_utc,
+            campaign_id=resolved_campaign_id,
+            hardware=resolved_hardware,
         )
         log.info(f"capture time resolved as {run_record.capture_start_utc!r} (source={run_record.capture_time_source})")
         if gps_source not in ("unknown", "not_configured"):
@@ -321,6 +361,8 @@ def run_survey(
         "survey_run_id": resolved_run_id,
         "site_id": site_profile.site_id,
         "band_profile": band_profile.name,
+        "campaign_id": resolved_campaign_id,
+        "hardware": resolved_hardware,
         "database_path": str(database),
         "output_dir": str(destination),
         "observation_count": len(observation_rows),
@@ -335,6 +377,7 @@ def run_survey(
 
     return {
         "run_id": resolved_run_id,
+        "campaign_id": resolved_campaign_id,
         "output_dir": str(destination),
         "database_path": str(database),
         "observation_count": len(observation_rows),

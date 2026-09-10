@@ -55,6 +55,13 @@ from dmr_iq_surveyor.survey.discovery import (
     spread_frame_starts,
 )
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
+from dmr_iq_surveyor.survey.provenance import (
+    applied_bucket,
+    declared_bucket,
+    hardware_provenance,
+    normalise_campaign_id,
+    requested_bucket,
+)
 from dmr_iq_surveyor.survey.store import SurveyRunRecord, import_survey_run, upsert_site
 
 # Why a window is a second: at 50 km/h it covers 14 m, which is about 40
@@ -81,6 +88,9 @@ class Position:
 class LiveSettings:
     band: str = "central_800_narrow"
     site_id: str = "mobile"
+    # Which collection round these bins belong to. Unset means the
+    # drive was not taken under a declared campaign.
+    campaign_id: str | None = None
     center_frequency_hz: float = 867_406_250.0
     sample_rate_hz: float = 5_000_000.0
     if_gain_reduction_db: float = 26.0
@@ -205,6 +215,10 @@ class LiveSettings:
                 # Otherwise the smallest measurement would not even fill one
                 # ledger cell, and the ledger could not tell two of them apart.
                 raise ValueError("ledger_cell_m must not exceed min_bin_size_m")
+        # Checked with the rest of the settings, which `LiveSession.__init__`
+        # validates -- so a mistyped campaign id fails before the SDR is
+        # opened and a drive begins, not after the first bin is written.
+        normalise_campaign_id(self.campaign_id)
         if self.min_windows_per_bin < 1:
             raise ValueError("min_windows_per_bin must be at least 1")
         if self.max_windows_per_bin < self.min_windows_per_bin:
@@ -349,6 +363,11 @@ class LiveSession:
         # written afterwards and count beside it.
         self._held_places: set[str] = set()
         self.stats = LiveStats()
+        # Filled once the device is open, from what it reports back.
+        # Until then this drive knows only what the operator declared.
+        self._hardware: dict[str, Any] = hardware_provenance(
+            declared=declared_bucket(site)
+        )
         self._grid: BinGrid | None = None
         self._visit: BinVisit | None = None
         # The bin the receiver is currently sitting in after it filled up,
@@ -396,7 +415,26 @@ class LiveSession:
             ),
         )
         resolved_device = self.device or SoapyIqDevice()
-        resolved_device.open(self.settings.to_device_settings())
+        requested = self.settings.to_device_settings()
+        resolved_device.open(requested)
+        # Taken once, right after the radio is configured, and carried by
+        # every bin this drive writes. `SoapyIqDevice.open()` asks the
+        # device what it ended up at, so a drive DOES have a read-back;
+        # only a device that exposes none falls back to `requested`.
+        self._hardware = hardware_provenance(
+            identity={"driver": requested.driver, "serial": requested.serial},
+            applied=applied_bucket(getattr(resolved_device, "applied_settings", None)),
+            requested=requested_bucket(
+                center_frequency_hz=requested.center_frequency_hz,
+                sample_rate_hz=requested.sample_rate_hz,
+                bandwidth_hz=requested.bandwidth_hz,
+                if_gain_reduction_db=requested.if_gain_reduction_db,
+                lna_state=requested.lna_state,
+                agc=requested.agc,
+                antenna=requested.antenna,
+            ),
+            declared=declared_bucket(self.site),
+        )
         window_frames = max(
             self.settings.fft_size,
             round(self.settings.window_seconds * self.settings.sample_rate_hz),
@@ -891,6 +929,11 @@ class LiveSession:
             gps_latitude=latitude,
             gps_longitude=longitude,
             gps_source="live_gps",
+            campaign_id=self.settings.campaign_id,
+            # One snapshot taken when the radio was configured, carried by
+            # every bin: the receiver does not change mid-drive, and
+            # re-deriving it per bin would only invite the buckets to drift.
+            hardware=self._hardware,
         )
         import_survey_run(
             connection,

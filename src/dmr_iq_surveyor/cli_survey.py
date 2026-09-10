@@ -28,6 +28,7 @@ from dmr_iq_surveyor.survey.pipeline import (
     run_survey,
 )
 from dmr_iq_surveyor.survey.profiles import ProfileError, resolve_band_profile
+from dmr_iq_surveyor.survey.provenance import ProvenanceError, normalise_campaign_id
 from dmr_iq_surveyor.survey.store import (
     connect_survey_database,
     get_run,
@@ -94,6 +95,17 @@ def survey_run(
             help=(
                 "Override the profile's site_id for this run. Use one profile "
                 "(same equipment) across a mobile session and give each stop its own id"
+            ),
+        ),
+    ] = None,
+    campaign: Annotated[
+        str | None,
+        typer.Option(
+            "--campaign",
+            help=(
+                "Collection round this run belongs to, e.g. 2026-09_day1. Lower case, "
+                "digits, '.', '_' and '-'. Left unset the run is unassigned, which is "
+                "what every run recorded before campaigns existed is"
             ),
         ),
     ] = None,
@@ -166,6 +178,7 @@ def survey_run(
             gps_source=gps["source"],
             gps_fetched_at_utc=gps["fetched_at_utc"],
             site_id_override=site_id,
+            campaign_id=campaign,
             drive_view=DriveViewSettings() if drive_view else None,
         )
     except (FileNotFoundError, OSError, ValueError, ProfileError, sqlite3.Error) as exc:
@@ -357,6 +370,17 @@ def survey_capture(
         str | None,
         typer.Option("--serial", help="Pin to one device by serial number, if more than one is attached"),
     ] = None,
+    campaign: Annotated[
+        str | None,
+        typer.Option(
+            "--campaign",
+            help=(
+                "Collection round this run belongs to, e.g. 2026-09_day1. Lower case, "
+                "digits, '.', '_' and '-'. Left unset the run is unassigned, which is "
+                "what every run recorded before campaigns existed is"
+            ),
+        ),
+    ] = None,
     survey_output: Annotated[
         Path | None,
         typer.Option(help="Survey run output directory; defaults to <output>/survey"),
@@ -427,6 +451,15 @@ def survey_capture(
     premature live acquisition" principle (see CLAUDE.md) for field-capture
     friction with existing tools; it changes nothing else about the pipeline.
     """
+    # Before the device is probed, before the capture is paid for. A
+    # mistyped campaign id caught after ninety seconds of recording is a
+    # ninety-second recording thrown away.
+    try:
+        campaign = normalise_campaign_id(campaign)
+    except ProvenanceError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=1) from exc
+
     probe = probe_soapysdr(driver)
     if not probe.available:
         console.print(f"[bold red]SoapySDR device unavailable:[/bold red] {probe.probe_error}")
@@ -486,6 +519,7 @@ def survey_capture(
                 gps_longitude=longitude,
                 on_progress=report,
                 site_id_override=site_id,
+                campaign_id=campaign,
             )
     except (FileNotFoundError, OSError, ValueError, ProfileError, RuntimeError, sqlite3.Error) as exc:
         console.print(f"[bold red]Capture/survey failed:[/bold red] {exc}")

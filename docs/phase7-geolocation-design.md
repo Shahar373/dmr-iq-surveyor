@@ -95,9 +95,17 @@ and identification are what the correction needs.
 ### Gain drift
 
 Levels recorded at different receiver gain are not on one scale, and the method is a comparison of
-levels between places. The gain actually applied is stored per stop (not the site profile's
-placeholder), and measurements from a stop whose gain differs from the campaign's modal value are
-flagged `gain_differs_from_campaign`.
+levels between places. Measurements from a stop whose gain differs from the campaign's modal
+value are flagged `gain_differs_from_campaign`.
+
+The gain that check reads comes from `sites.gain`, which is the site profile's *declaration*.
+`upsert_site` rewrites that one row on every run, so stops sharing a `site_id` all report the
+same value whatever each was actually recorded at, and a profile edited later rewrites what
+every earlier stop appears to have used. `survey_runs.hardware_json` now records the receiver
+state per run instead, keeping what the radio reported back, what it was asked for, and what
+the profile declared at the time as three separate claims (see `docs/phase6a-survey.md`). The
+solver does not read it yet -- that is a separate change -- so the flag above behaves exactly
+as it did.
 
 The `not_covered` versus `not_observed` split is the same honesty rule Phase 6A already enforces
 between `NOT_COMPARABLE` and `MISSING_THIS_RUN`, applied to geolocation: *"outside our measured

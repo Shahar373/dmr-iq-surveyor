@@ -23,6 +23,7 @@ from dmr_iq_surveyor.survey.profiles import (
     resolve_band_profile,
     resolve_site_profile,
 )
+from dmr_iq_surveyor.survey.provenance import ProvenanceError, normalise_campaign_id
 from dmr_iq_surveyor.web.recordings import GIB, disk_status
 from dmr_iq_surveyor.web.server import serve_forever
 from dmr_iq_surveyor.web.service import FieldSettings
@@ -240,6 +241,17 @@ def web_serve(
     site: Annotated[
         str, typer.Option(help="Site profile name or path, providing the fixed equipment context")
     ] = "home",
+    campaign: Annotated[
+        str | None,
+        typer.Option(
+            "--campaign",
+            help=(
+                "Collection round this run belongs to, e.g. 2026-09_day1. Lower case, "
+                "digits, '.', '_' and '-'. Left unset the run is unassigned, which is "
+                "what every run recorded before campaigns existed is"
+            ),
+        ),
+    ] = None,
     output: Annotated[
         Path, typer.Option("--output", "-o", help="Root for survey outputs and reports")
     ] = Path("runs/field"),
@@ -431,11 +443,21 @@ def web_serve(
         console.print(f"[bold red]Token could not be resolved:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
     resolved_token = resolved.value
+    # At startup, with a message the operator can read. `FieldService` checks
+    # again, but by then the process is already serving, and a campaign id
+    # that only fails on the first capture fails ninety seconds into a stop
+    # somebody drove to.
+    try:
+        campaign = normalise_campaign_id(campaign)
+    except ProvenanceError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=1) from exc
     settings = FieldSettings(
         database_path=database or DEFAULT_DATABASE_PATH,
         recordings_dir=recordings or (output / "recordings"),
         output_root=output,
         band=band,
+        campaign_id=campaign,
         site_profile=site,
         center_frequency_hz=center_frequency,
         sample_rate_hz=sample_rate,

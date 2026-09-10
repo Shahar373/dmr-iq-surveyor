@@ -7,7 +7,7 @@ thrown away and why. Small enough to paste into a conversation, which is
 the whole point -- the GeoJSON export is the machine-readable artefact and
 is far too large to discuss.
 
-    python scripts/campaign_digest.py [--database PATH]
+    python scripts/campaign_digest.py [--database PATH] [--campaign ID]
 
 Reads only. It never solves, never re-materialises measurements, and never
 writes to the database, so it is safe to run at any moment -- including
@@ -31,6 +31,13 @@ from dmr_iq_surveyor.survey.pipeline import (
     DRIVE_VIEW_MODE,
     DRIVE_VIEW_REASON_PREFIX,
 )
+from dmr_iq_surveyor.survey.provenance import (
+    SOURCE_LABELS,
+    if_gain_reading,
+    lna_state_reading,
+    load_hardware,
+    normalise_campaign_id,
+)
 
 
 def _rows(connection: sqlite3.Connection, sql: str, *args) -> list[sqlite3.Row]:
@@ -44,14 +51,67 @@ def _settings(row: sqlite3.Row) -> dict:
         return {}
 
 
-def stops(connection: sqlite3.Connection) -> None:
+def _gain_readings(runs: list[sqlite3.Row]) -> list[tuple]:
+    """One IF gain and one LNA reading per stop, each carrying the
+    strongest evidence behind it.
+
+    The order is not a preference, it is a ranking of claims: what the
+    radio reported back beats what it was asked for, which beats what the
+    site profile declared before anyone drove anywhere. A reader has to be
+    able to tell those apart, because only the first is a measurement.
+
+    `sites.gain` is offered last and labelled apart. It is one mutable row
+    that every run rewrites, so it describes the profile as it stands now,
+    not as it stood for the run being read -- which is exactly why runs
+    began carrying their own declaration.
+    """
+    readings = []
+    for row in runs:
+        hardware = load_hardware(row["hardware_json"])
+        readings.append(
+            (
+                if_gain_reading(hardware, site_row=row["gain"]),
+                lna_state_reading(hardware, site_row=row["lna_state"]),
+            )
+        )
+    return readings
+
+
+def _report_setting(
+    readings: list, *, label: str, unit: str, plural: str
+) -> None:
+    """Print one receiver setting across the campaign, sources and all."""
+    known = Counter((r.value, r.source) for r in readings if r.known)
+    missing = sum(1 for r in readings if not r.known)
+    values = {value for value, _source in known}
+    if not known:
+        if readings:
+            print(f"  {label:<20} not recorded on any of {len(readings)} stop(s)")
+        return
+    if len(values) > 1:
+        print(f"  !! {plural} VARIES ACROSS STOPS -- levels are not comparable:")
+        for (value, source), count in known.most_common():
+            print(f"       {value}{unit} ({SOURCE_LABELS[source]}): {count} stop(s)")
+    else:
+        print(f"  {label:<20} {next(iter(values))}{unit}")
+        for (_value, source), count in known.most_common():
+            print(f"       {SOURCE_LABELS[source]} on {count} stop(s)")
+    if missing:
+        print(f"       not recorded on {missing} stop(s)")
+
+
+def stops(connection: sqlite3.Connection, campaign: str | None = None) -> None:
+    clause = " WHERE r.campaign_id = ?" if campaign else ""
     runs = _rows(
         connection,
         "SELECT r.survey_run_id, r.capture_start_utc, r.coverage_status, r.gps_latitude, "
         "       r.gps_longitude, r.analyzed_seconds, r.segment_count, r.settings_json, "
-        "       r.sample_rate_hz, r.center_frequency_hz, s.gain, s.lna_state "
-        "FROM survey_runs r LEFT JOIN sites s ON s.site_id = r.site_id "
-        "ORDER BY COALESCE(r.capture_start_utc, r.imported_at)",
+        "       r.sample_rate_hz, r.center_frequency_hz, r.campaign_id, r.hardware_json, "
+        "       s.gain, s.lna_state "
+        "FROM survey_runs r LEFT JOIN sites s ON s.site_id = r.site_id"
+        + clause +
+        " ORDER BY COALESCE(r.capture_start_utc, r.imported_at)",
+        *( (campaign,) if campaign else () ),
     )
     # A drive view is a second reading of a recorded stop, not a stop of its
     # own: counted separately so the total is places measured, not rows.
@@ -74,6 +134,12 @@ def stops(connection: sqlite3.Connection) -> None:
         first = runs[0]["capture_start_utc"] or "?"
         last = runs[-1]["capture_start_utc"] or "?"
         print(f"  first / last         {first[:16]}  ->  {last[:16]}")
+    # "unassigned" is not a campaign, it is the absence of one: every run
+    # recorded before campaigns existed sits there, and none was moved.
+    campaigns = Counter(row["campaign_id"] or "unassigned" for row in runs)
+    if campaigns:
+        print("  campaigns            "
+              + ", ".join(f"{name} ({count})" for name, count in campaigns.most_common()))
 
     # Gain discipline: levels measured at different gain are not comparable,
     # and that is the assumption the whole method rests on. Both halves of a
@@ -81,26 +147,24 @@ def stops(connection: sqlite3.Connection) -> None:
     # and a stop written before the LNA state was stored is reported as "not
     # recorded" rather than assumed to match, because a check that silently
     # covers half the setting is worse than no check.
-    gains = Counter(row["gain"] for row in runs if row["gain"] is not None)
-    if len(gains) > 1:
-        print("  !! IF GAIN VARIES ACROSS STOPS -- levels are not comparable:")
-        for gain, count in gains.most_common():
-            print(f"       IFGR {gain} dB: {count} stop(s)")
-    elif gains:
-        gain, _count = gains.most_common(1)[0]
-        print(f"  gain (all stops)     IFGR {gain} dB")
-    lna = Counter(row["lna_state"] for row in runs if row["lna_state"] is not None)
-    lna_missing = sum(1 for row in runs if row["lna_state"] is None)
-    if len(lna) > 1:
-        print("  !! LNA STATE VARIES ACROSS STOPS -- levels are not comparable:")
-        for state, count in lna.most_common():
-            print(f"       LNA state {state}: {count} stop(s)")
-    elif lna:
-        state, count = lna.most_common(1)[0]
-        print(f"  LNA state            {state} on {count} stop(s)"
-              + (f"; not recorded on {lna_missing} earlier stop(s)" if lna_missing else ""))
-    elif runs:
-        print(f"  LNA state            not recorded on any stop (all {lna_missing} predate the column)")
+    #
+    # Every value below says how it is known. A gain the radio reported
+    # back, a gain it was merely asked for and a gain the site profile
+    # declared beforehand are three different claims, and only the first
+    # is evidence about this stop.
+    readings = _gain_readings(runs)
+    _report_setting(
+        [gain for gain, _lna in readings],
+        label="gain (all stops)",
+        unit=" dB IFGR",
+        plural="IF GAIN",
+    )
+    _report_setting(
+        [lna for _gain, lna in readings],
+        label="LNA state",
+        unit="",
+        plural="LNA STATE",
+    )
 
     rates = Counter(row["sample_rate_hz"] for row in runs)
     print(
@@ -359,17 +423,38 @@ def plan(connection: sqlite3.Connection) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE_PATH)
+    parser.add_argument(
+        "--campaign",
+        default=None,
+        help="Only stops from this collection round. Omitted, every stop in the file counts.",
+    )
     arguments = parser.parse_args()
+    campaign = normalise_campaign_id(arguments.campaign)
     if not Path(arguments.database).expanduser().is_file():
         raise SystemExit(f"no database at {arguments.database}")
     connection = connect_geo_database(arguments.database)
     try:
-        print(f"campaign digest for {arguments.database}")
+        print(f"campaign digest for {arguments.database}"
+              + (f", campaign {campaign}" if campaign else ""))
         print()
-        stops(connection)
-        measurements(connection)
-        solutions(connection)
-        plan(connection)
+        stops(connection, campaign)
+        if campaign:
+            # Only the collection section can be narrowed today. Printing
+            # whole-database evidence, solutions and a plan under a heading
+            # that names one campaign would invite every number below to be
+            # read as that campaign's, which none of them is. They are
+            # skipped and said to be skipped, rather than shown mislabelled.
+            print()
+            print("== NOT SHOWN FOR A SINGLE CAMPAIGN " + "=" * 34)
+            print("  Measurements, solutions and the next-stop plan are not "
+                  "campaign-scoped yet.")
+            print("  They would cover every run in the database, not just "
+                  f"campaign {campaign}.")
+            print("  Run without --campaign to see them across the whole file.")
+        else:
+            measurements(connection)
+            solutions(connection)
+            plan(connection)
     finally:
         connection.close()
 

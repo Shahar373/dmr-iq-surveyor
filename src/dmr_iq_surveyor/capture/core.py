@@ -29,6 +29,10 @@ from dmr_iq_surveyor.capture.gps import resolve_gps
 from dmr_iq_surveyor.capture.wav_writer import WaveIQWriter, WaveIQWriterSettings
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_survey
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
+from dmr_iq_surveyor.survey.provenance import (
+    hardware_from_capture_manifest,
+    normalise_campaign_id,
+)
 
 _DEFAULT_CHUNK_FRAMES = 262_144
 
@@ -287,6 +291,7 @@ def run_capture_and_survey(
     on_progress: Callable[[int, int, float], None] | None = None,
     site_id_override: str | None = None,
     site_label_override: str | None = None,
+    campaign_id: str | None = None,
 ) -> dict[str, Any]:
     """Capture live IQ and immediately run the existing `survey run` pipeline
     on the result -- the single command this module was built for. Reuses
@@ -299,6 +304,12 @@ def run_capture_and_survey(
     `gps_source` recording exactly why coordinates are absent rather than
     silently omitting them.
     """
+    # Before the GPS is fetched and long before the radio is opened. The
+    # CLI checks this too, but a caller reaching this function directly --
+    # a script, the field app, a future command -- would otherwise pay for
+    # a whole capture and be told afterwards that its id was a typo.
+    campaign_id = normalise_campaign_id(campaign_id)
+
     # Fetched before the capture starts, so the coordinates describe where
     # the recording was made rather than where it happened to finish.
     gps_info = resolve_gps(
@@ -334,6 +345,11 @@ def run_capture_and_survey(
         gps_fetched_at_utc=gps_info["fetched_at_utc"],
         site_id_override=site_id_override,
         site_label_override=site_label_override,
+        campaign_id=campaign_id,
+        # Straight from the capture this run was made of, so the
+        # radio's own read-back is what reaches the database rather
+        # than the settings it was asked for.
+        hardware=hardware_from_capture_manifest(capture_manifest),
     )
     return {"capture": capture_manifest, "survey": survey_result, "gps": gps_info}
 
