@@ -502,6 +502,11 @@ def run_comparison(
         baseline_row = get_run(connection, baseline_run_id)
         if baseline_row is None:
             raise ValueError(f"Unknown survey run: {baseline_run_id}")
+        target_row = get_run(connection, target_run_id)
+        if target_row is None:
+            raise ValueError(f"Unknown survey run: {target_run_id}")
+        baseline_campaign = baseline_row["campaign_id"]
+        target_campaign = target_row["campaign_id"]
         tolerances = tolerances_from.comparison if tolerances_from is not None else ComparisonTolerances()
         rows = compare_runs(
             connection,
@@ -515,7 +520,11 @@ def run_comparison(
 
     row_dicts = [row.to_dict() for row in rows]
     report = build_comparison_report(
-        baseline_run_id=baseline_run_id, target_run_id=target_run_id, rows=row_dicts
+        baseline_run_id=baseline_run_id,
+        target_run_id=target_run_id,
+        rows=row_dicts,
+        baseline_campaign_id=baseline_campaign,
+        target_campaign_id=target_campaign,
     )
     destination = Path(output_root).expanduser().resolve()
     (destination / "reports").mkdir(parents=True, exist_ok=True)
@@ -523,7 +532,11 @@ def run_comparison(
     write_json(destination / "reports" / f"{stem}.json", report)
     (destination / "reports" / f"{stem}.md").write_text(
         render_comparison_markdown(
-            baseline_run_id=baseline_run_id, target_run_id=target_run_id, rows=row_dicts
+            baseline_run_id=baseline_run_id,
+            target_run_id=target_run_id,
+            rows=row_dicts,
+            baseline_campaign_id=baseline_campaign,
+            target_campaign_id=target_campaign,
         ),
         encoding="utf-8",
     )

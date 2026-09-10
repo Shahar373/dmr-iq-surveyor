@@ -810,6 +810,11 @@ def survey_compare(
     for status, count in sorted(report["status_counts"].items()):
         table.add_row(status, str(count))
     console.print(table)
+    # Printed, never blocking: comparing two rounds is the point of running a
+    # second one. What the operator needs is to know which differences might
+    # be the rounds rather than the RF.
+    for warning in report.get("warnings", []):
+        console.print(f"[yellow]{warning}[/yellow]")
     console.print(f"[green]Reports written to:[/green] {Path(output).resolve() / 'reports'}")
 
 
