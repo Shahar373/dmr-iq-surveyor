@@ -295,17 +295,40 @@ def read_claim(connection: sqlite3.Connection) -> Claim | None:
     `reference/store.py::_site_ids_with_measurements` is: a database written
     before this table existed simply has no claim, which is a fact about it
     rather than an error.
+
+    That is deliberately narrower than "any error means no claim". A
+    `project_meta` table that *exists* but cannot be read -- a corrupt page, a
+    malformed row -- is not a database that has never been claimed; it is one
+    whose answer to "are you claimed?" cannot be trusted, and every caller
+    here (`assert_claim`, the resumability check in `project init --create`,
+    the dry run in `project init --adopt`) treats `None` as "safe to claim or
+    proceed". Silently returning `None` for corruption would let exactly the
+    unsafe case through disguised as the safe one. So only the specific,
+    narrow "no such table" error is swallowed; every other failure to read
+    this table -- including a malformed database image -- is raised, and it
+    is raised from a read-only look, before `connect_geo_database` or any
+    write path is reached.
     """
     try:
         row = connection.execute(
             "SELECT project_id, analyzer, manifest_schema_version, claimed_at, claimed_by_version "
             f"FROM {CLAIM_TABLE} WHERE id = 1"
         ).fetchone()
-    except sqlite3.DatabaseError:
-        # Widened past `OperationalError` -- the absent table -- to cover a
-        # malformed image too. A database that cannot be read carries no claim
-        # that can be trusted, and every caller treats "no claim" as a refusal.
-        return None
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return None
+        raise ProjectError(
+            f"the {CLAIM_TABLE} table could not be read ({exc}); refused rather than treated "
+            "as unclaimed"
+        ) from exc
+    except sqlite3.DatabaseError as exc:
+        # Not `OperationalError`: a malformed database image raises the wider
+        # `DatabaseError` directly, and that is precisely the corruption case
+        # this must not swallow.
+        raise ProjectError(
+            f"the {CLAIM_TABLE} table could not be read ({exc}); refused rather than treated "
+            "as unclaimed"
+        ) from exc
     if row is None:
         return None
     values = tuple(row)

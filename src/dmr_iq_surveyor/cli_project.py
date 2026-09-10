@@ -26,7 +26,6 @@ from dmr_iq_surveyor.project.claim import (
     open_read_only,
     read_claim,
     read_contents,
-    summarise_contents,
     write_claim,
     write_manifest_atomically,
 )
@@ -117,14 +116,32 @@ def project_show(project: ProjectOption) -> None:
     if not found.usable:
         console.print(f"[yellow]Database:[/yellow] {found.reason}")
     else:
-        # Read-only by construction, so looking cannot claim.
+        # Read-only by construction, so looking cannot claim. `read_contents`
+        # is what `--adopt` itself checks before it will write anything, so
+        # `show` reports the same two facts -- SQLite's own integrity check
+        # and the minimum dmr-iq-surveyor schema signature -- rather than
+        # only ever knowing "claimed" or "unclaimed". A foreign or corrupt
+        # file used to fall through to "no claim, run adopt"; adopt would
+        # then refuse it for the same reason, so that advice was never
+        # actionable for exactly the databases it was shown for.
         connection = open_read_only(manifest.database)
         try:
-            claim = read_claim(connection)
-            counts = summarise_contents(connection)
+            contents = read_contents(connection)
+            claim: Claim | None = None
+            claim_error: str | None = None
+            if contents.intact and contents.recognised:
+                try:
+                    claim = read_claim(connection)
+                except ProjectError as exc:
+                    claim_error = str(exc)
         finally:
             connection.close()
-        if claim is None:
+
+        if not contents.intact or not contents.recognised:
+            console.print(f"[bold red]Database:[/bold red] {contents.refusal}")
+        elif claim_error is not None:
+            console.print(f"[bold red]Database:[/bold red] {claim_error}")
+        elif claim is None:
             console.print(
                 "[yellow]Database carries no claim.[/yellow] Run "
                 "`dmr-surveyor project init --adopt` to take it on."
@@ -139,10 +156,10 @@ def project_show(project: ProjectOption) -> None:
                 f"[bold red]Database is claimed by project {claim.project_id!r} "
                 f"(analyzer {claim.analyzer!r})[/bold red], not by this manifest."
             )
-        if counts:
+        if contents.counts:
             console.print(
                 "Contents: "
-                + ", ".join(f"{table_name} {count}" for table_name, count in counts.items())
+                + ", ".join(f"{table_name} {count}" for table_name, count in contents.counts.items())
             )
 
     campaigns = sorted(manifest.campaign_dir.glob("*.yaml")) if manifest.campaign_dir.is_dir() else []
@@ -312,7 +329,19 @@ def _create(
     write: bool,
 ) -> None:
     found = inspect_database(database_path)
-    resuming = found.exists and _resumable(database_path, project_id, analyzer)
+    resuming = False
+    if found.exists:
+        try:
+            resuming = _resumable(database_path, project_id, analyzer)
+        except ProjectError as exc:
+            # A `project_meta` table that exists but cannot be read is not the
+            # same fact as "claimed by someone else" or "not claimed at all" --
+            # it means this existing database cannot be trusted to say whether
+            # it is safe to resume, so it is refused here, before anything is
+            # compared or written, rather than silently treated as fine to
+            # write over.
+            _fail(f"{database_path} exists but its claim could not be read: {exc}")
+            return
     if found.exists and not resuming:
         _fail(
             f"{database_path} already exists. --create makes a new database; "
@@ -337,11 +366,17 @@ def _create(
 
     # Reported before the dry run can say "nothing was written", and refused
     # in the dry run too: a run that cannot succeed must not look like one
-    # that is merely waiting for --write.
-    if manifest_state == _MANIFEST_DIFFERS:
+    # that is merely waiting for --write. Both bad states are refused here,
+    # not just the one that differs -- a target this command cannot read to
+    # compare is exactly as unsafe to write over as one it read and found
+    # different, and the table above already says "this will be refused"
+    # for both.
+    if manifest_state in (_MANIFEST_DIFFERS, _MANIFEST_UNREADABLE):
         _fail(
-            f"{manifest_path} already exists and differs from what this would write. "
-            "Move it aside, or edit it by hand; it will not be overwritten."
+            f"{manifest_path} already exists and "
+            f"{'differs from' if manifest_state == _MANIFEST_DIFFERS else 'cannot be read to compare with'} "
+            "what this would write. Move it aside, or edit it by hand; it will not be "
+            "overwritten."
         )
 
     if not write:
@@ -413,7 +448,11 @@ def _adopt(
     # it was found.
     connection = open_read_only(database_path)
     try:
-        existing = read_claim(connection)
+        try:
+            existing = read_claim(connection)
+        except ProjectError as exc:
+            _fail(f"{database_path} could not be read: {exc}")
+            return
         contents = read_contents(connection)
     finally:
         connection.close()

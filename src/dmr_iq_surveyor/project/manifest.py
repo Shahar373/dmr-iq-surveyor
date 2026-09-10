@@ -341,27 +341,31 @@ def load_campaign_manifest(
     if project_id is None:
         raise ProjectError(f"{resolved} has an empty project_id")
 
-    # The filename is how a campaign is found: `resolve_campaign` builds the
-    # path from the id it was asked for and reads whatever is there. So a name
-    # that is not a slug is not a cosmetic problem -- it is a file that can be
-    # read by path and never by name, which means a campaign that exists when
-    # listed and is missing when asked for. Checked unconditionally: skipping
-    # the comparison because the name is invalid is exactly backwards.
-    try:
-        stem = normalise_campaign_id(resolved.stem)
-    except ProvenanceError as exc:
+    # The filename is how a campaign is found: `resolve_campaign` builds
+    # `campaign_dir / f"{campaign_id}.yaml"` -- the exact, already-lowercased
+    # slug, byte for byte -- and reads whatever is at that literal path. A
+    # filesystem comparison is case-sensitive on the deployment target (Linux,
+    # including the Pi), so the match here has to be exact too: normalising the
+    # stem before comparing would accept `2026-09_Day1.yaml` as agreeing with
+    # `campaign_id: 2026-09_day1`, and that file can be *loaded* by path yet
+    # can never be *found* by `resolve_campaign`, which only ever asks for the
+    # lowercase name. Checked unconditionally: skipping the comparison because
+    # the name is invalid is exactly backwards.
+    if resolved.stem != campaign_id:
+        # A separate message for "not a slug at all" vs. "a valid slug that
+        # simply disagrees" -- both are refused, but only the first is a typo
+        # in the filename's *shape* rather than its *value*.
+        try:
+            normalise_campaign_id(resolved.stem)
+        except ProvenanceError as exc:
+            raise ProjectError(
+                f"{resolved}: its filename is not a valid campaign id ({exc}). Rename the file "
+                f"to {campaign_id}.yaml"
+            ) from exc
         raise ProjectError(
-            f"{resolved}: its filename is not a valid campaign id ({exc}). Rename the file to "
-            f"{campaign_id}.yaml"
-        ) from exc
-    if stem is None:
-        raise ProjectError(
-            f"{resolved} has no filename to match against; rename it to {campaign_id}.yaml"
-        )
-    if stem != campaign_id:
-        raise ProjectError(
-            f"{resolved} declares campaign_id {campaign_id!r} but its filename says {stem!r}; "
-            "the two must agree so a campaign can be found by name"
+            f"{resolved} declares campaign_id {campaign_id!r} but its filename says "
+            f"{resolved.stem!r}; the two must agree exactly, including case, so a campaign can "
+            "be found by name"
         )
     if expect_campaign_id is not None and campaign_id != expect_campaign_id:
         raise ProjectError(

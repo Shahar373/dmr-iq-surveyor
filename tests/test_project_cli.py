@@ -18,6 +18,7 @@ from dmr_iq_surveyor.cli_app import app
 from dmr_iq_surveyor.geo.store import connect_geo_database
 from dmr_iq_surveyor.project.binding import clear_binding
 from dmr_iq_surveyor.project.claim import read_claim, write_claim
+from dmr_iq_surveyor.project.manifest import ProjectError
 
 runner = CliRunner()
 ANALYZER = "p25_site_geolocation"
@@ -584,3 +585,122 @@ def test_a_failed_manifest_write_rolls_the_creation_back(
     assert "was removed" in result.output.replace("\n", "")
     assert not (tmp_path / "db.sqlite3").exists()
     assert not (tmp_path / "p" / "project.yaml").exists()
+
+
+def test_create_refuses_an_unreadable_manifest_target_before_creating_anything(
+    tmp_path: Path,
+) -> None:
+    """The table already says "cannot be read; this will be refused", but the
+    refusal check only tested for `_MANIFEST_DIFFERS`. A target that exists
+    and cannot be read (here: a directory where the manifest file should be)
+    sailed past it, and the command went on to create and claim the database,
+    only failing much later inside `write_manifest_atomically` -- which does
+    roll the creation back, so the end state looked the same, but only after
+    a real create-then-undo cycle the dry run's own table had already
+    promised would not happen.
+
+    The discriminator: the old path's failure message names the write and the
+    rollback ("the manifest could not be written ... the new database was
+    removed"); the fixed path never gets that far and says so up front.
+    """
+    manifest_dir = tmp_path / "p" / "project.yaml"
+    manifest_dir.mkdir(parents=True)
+
+    result = _init(tmp_path, "--create", "--write")
+
+    assert result.exit_code == 1
+    flat = result.output.replace("\n", "")
+    assert "cannot be read to compare with" in flat
+    assert "was removed" not in flat, "the database was created and rolled back, not refused up front"
+    assert not (tmp_path / "db.sqlite3").exists()
+    assert manifest_dir.is_dir(), "the manifest target itself must be untouched"
+
+
+def test_show_reports_a_foreign_database_as_not_recognised_not_as_unclaimed(
+    tmp_path: Path,
+) -> None:
+    """Before this fix, `show` read only `read_claim` and `summarise_contents`.
+    A foreign database has no `project_meta` table, so `read_claim` returned
+    `None` and `show` printed "Database carries no claim. Run ... --adopt" --
+    advice adoption would itself refuse, for the very reason `show` never
+    mentioned: this is not a dmr-iq-surveyor database at all.
+    """
+    foreign_db = tmp_path / "foreign.sqlite3"
+    _foreign_database(foreign_db)
+    manifest = tmp_path / "p" / "project.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        "schema_version: 1\n"
+        "project_id: p25_central_il\n"
+        "label: P25 central Israel\n"
+        "analyzer: p25_site_geolocation\n"
+        f"database: {foreign_db}\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["project", "show", "--project", str(manifest)])
+
+    assert result.exit_code == 0, result.output
+    flat = result.output.replace("\n", "")
+    assert "not a dmr-iq-surveyor one" in flat
+    assert "carries no claim" not in flat, "a foreign database was shown as merely unclaimed"
+
+
+def test_show_reports_a_corrupt_database_as_corrupt_not_as_unclaimed(
+    tmp_path: Path,
+) -> None:
+    """The same trap as the foreign-database case, from the other of the two
+    checks `read_contents` runs: a corrupt database also has no readable
+    `project_meta` row, and used to be shown as merely unclaimed."""
+    database = tmp_path / "db.sqlite3"
+    _seeded(database)
+    raw = bytearray(database.read_bytes())
+    for offset in range(4096, min(len(raw), 20480)):
+        raw[offset] = 0x5A
+    database.write_bytes(bytes(raw))
+    manifest = tmp_path / "p" / "project.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        "schema_version: 1\n"
+        "project_id: p25_central_il\n"
+        "label: P25 central Israel\n"
+        "analyzer: p25_site_geolocation\n"
+        f"database: {database}\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["project", "show", "--project", str(manifest)])
+
+    assert result.exit_code == 0, result.output
+    flat = result.output.replace("\n", "")
+    assert "integrity check" in flat
+    assert "carries no claim" not in flat, "a corrupt database was shown as merely unclaimed"
+
+
+def test_create_refuses_when_the_existing_databases_claim_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_resumable` reads the existing database's claim to decide whether a
+    repeat `--create` is completing an earlier, interrupted one. Before
+    `read_claim` was narrowed to treat only a *missing* `project_meta` table
+    as "no claim", a table that exists but cannot be read would have come
+    back as `None` here too -- indistinguishable from "never claimed", and
+    therefore safe to claim and write into. It is not: this simulates that
+    corrupted-but-present state (real single-table corruption is not
+    reliably reproducible without depending on SQLite's page layout) and
+    checks that the existing database is refused and left untouched, not
+    silently claimed.
+    """
+    database = _seeded(tmp_path / "db.sqlite3")
+    before = _fingerprint(database)
+
+    def _unreadable_claim(connection: object) -> None:
+        raise ProjectError("the project_meta table could not be read (simulated)")
+
+    monkeypatch.setattr("dmr_iq_surveyor.cli_project.read_claim", _unreadable_claim)
+
+    result = _init(tmp_path, "--create", "--write")
+
+    assert result.exit_code == 1
+    assert "could not be read" in result.output.replace("\n", "")
+    assert _fingerprint(database) == before, "an unreadable claim must not be written over"

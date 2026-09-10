@@ -260,9 +260,15 @@ project defaults apply and stops recorded stay unassigned — which is what ever
 run recorded before campaigns existed is.
 
 The filename is checked unconditionally, including when it is not a valid
-slug. A campaign is *found* by its filename, so `Day One.yaml` is not a
-cosmetic problem: it is a file that can be read by path and never by name, a
-campaign that exists when listed and is missing when asked for.
+slug, and it is checked *exactly*: `2026-09_Day1.yaml` is refused even though
+it normalises to the same slug as `campaign_id: 2026-09_day1`. `resolve_campaign`
+builds the literal, already-lowercased path and reads whatever is at it, and a
+filesystem comparison is case-sensitive on the deployment target -- Linux,
+including the Pi -- so a file that only agrees after normalising is a file
+that can be *loaded* by path and can never be *found* by name. A campaign is
+found by its filename, so `Day One.yaml` is not a cosmetic problem either: it
+is a file that can be read by path and never by name, a campaign that exists
+when listed and is missing when asked for.
 
 **The binding lasts exactly as long as the serving.** It is made before the
 verifying open and dropped on every way out — a profile that will not resolve,

@@ -125,6 +125,53 @@ def test_a_fresh_database_carries_no_claim(tmp_path: Path) -> None:
         connection.close()
 
 
+class _UnreadableClaimTable:
+    """A connection stand-in where `project_meta` exists but cannot be read.
+
+    Real corruption confined to exactly one table is not reliably
+    reproducible without depending on SQLite's internal page layout, so this
+    simulates the one distinction `read_claim` has to make: a table that is
+    *there* but unreadable is not the same fact as a table that was never
+    created. Every other query passes through to the real connection
+    untouched.
+    """
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
+        if CLAIM_TABLE in sql:
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return self._connection.execute(sql, *args)
+
+
+def test_a_claim_table_that_exists_but_cannot_be_read_is_refused_not_swallowed(
+    tmp_path: Path,
+) -> None:
+    """Only a *missing* `project_meta` table is "no claim". Every caller here
+    -- `assert_claim`, the resumability check in `project init --create`, the
+    dry run in `project init --adopt` -- treats `None` as safe to proceed, so
+    silently returning `None` for corruption would let the unsafe case through
+    disguised as the safe one."""
+    connection = connect_geo_database(tmp_path / "p25.sqlite3")
+    try:
+        with pytest.raises(ProjectError, match="could not be read"):
+            read_claim(_UnreadableClaimTable(connection))
+    finally:
+        connection.close()
+
+
+def test_an_absent_claim_table_is_still_read_as_no_claim(tmp_path: Path) -> None:
+    """The narrowing must not over-correct: a database written before the
+    `project_meta` table existed -- the ordinary, common case -- is still
+    "no claim", not a refusal."""
+    connection = sqlite3.connect(tmp_path / "no_table.sqlite3")
+    try:
+        assert read_claim(connection) is None
+    finally:
+        connection.close()
+
+
 def test_a_claim_round_trips_and_is_idempotent(tmp_path: Path) -> None:
     connection = connect_geo_database(tmp_path / "p25.sqlite3")
     try:

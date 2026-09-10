@@ -364,8 +364,13 @@ def test_a_campaign_filename_that_is_not_a_slug_is_refused(tmp_path: Path) -> No
         load_campaign_manifest(path)
 
 
-def test_a_campaign_filename_that_only_differs_in_case_is_accepted(tmp_path: Path) -> None:
-    """`2026-09_Day1.yaml` normalises to the same slug, so it agrees."""
+def test_a_campaign_filename_that_only_differs_in_case_is_refused(tmp_path: Path) -> None:
+    """`resolve_campaign` builds `campaign_dir / f"{campaign_id}.yaml"` from the
+    already-lowercased id and reads that literal, case-sensitive path -- on
+    Linux, including the Pi. A filename that normalises to the same slug but
+    is not byte-for-byte identical to it is a file `load_campaign_manifest`
+    could accept by path while `resolve_campaign` could never find by name:
+    exactly the trap regression-tested here. Before this fix it validated."""
     _project(tmp_path / "p")
     directory = tmp_path / "p" / "campaigns"
     directory.mkdir(parents=True, exist_ok=True)
@@ -376,7 +381,26 @@ def test_a_campaign_filename_that_only_differs_in_case_is_accepted(tmp_path: Pat
         encoding="utf-8",
     )
 
-    assert load_campaign_manifest(path).campaign_id == "2026-09_day1"
+    with pytest.raises(ProjectError, match="including case"):
+        load_campaign_manifest(path)
+
+
+def test_a_campaign_found_by_resolve_campaign_has_the_exact_filename(
+    tmp_path: Path,
+) -> None:
+    """The positive case for the same fix: `resolve_campaign` writes and reads
+    the exact lowercase filename, and that one loads and resolves cleanly."""
+    _project(tmp_path / "p")
+    project = resolve_project(tmp_path / "p")
+    directory = tmp_path / "p" / "campaigns"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "2026-09_day1.yaml").write_text(
+        "schema_version: 1\ncampaign_id: 2026-09_day1\nproject_id: p25_central_il\n"
+        "label: Day 1\n",
+        encoding="utf-8",
+    )
+
+    assert resolve_campaign(project, "2026-09_day1").campaign_id == "2026-09_day1"
 
 
 def test_a_campaign_filename_with_no_stem_is_refused(tmp_path: Path) -> None:
