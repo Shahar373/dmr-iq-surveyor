@@ -240,6 +240,17 @@ def web_serve(
     site: Annotated[
         str, typer.Option(help="Site profile name or path, providing the fixed equipment context")
     ] = "home",
+    campaign: Annotated[
+        str | None,
+        typer.Option(
+            "--campaign",
+            help=(
+                "Collection round this run belongs to, e.g. 2026-09_day1. Lower case, "
+                "digits, '.', '_' and '-'. Left unset the run is unassigned, which is "
+                "what every run recorded before campaigns existed is"
+            ),
+        ),
+    ] = None,
     output: Annotated[
         Path, typer.Option("--output", "-o", help="Root for survey outputs and reports")
     ] = Path("runs/field"),
@@ -436,6 +447,7 @@ def web_serve(
         recordings_dir=recordings or (output / "recordings"),
         output_root=output,
         band=band,
+        campaign_id=campaign,
         site_profile=site,
         center_frequency_hz=center_frequency,
         sample_rate_hz=sample_rate,

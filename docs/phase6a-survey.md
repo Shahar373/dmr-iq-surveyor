@@ -94,7 +94,8 @@ Added to the shared database (`inventory.store.connect_database()` runs first; n
 sites               site_id, label, coordinates (optional), antenna, receiver, gain
 survey_runs          one row per survey: site, band profile, source, capture time + provenance,
                       requested vs. measured-usable band, coverage_status, analyzed_seconds,
-                      detection settings, tool version
+                      detection settings, tool version, GPS position and source,
+                      campaign_id, hardware_json
 rf_frequencies        catalog only: nominal_frequency_hz, first/last_seen_at + run id, counts.
                       No protocol, system, site, or role column, ever -- the same RF frequency
                       can belong to different systems/sites/protocols at different times.
@@ -108,6 +109,41 @@ Rules enforced in code, not just convention:
 - **Idempotency.** Re-importing a `survey_run_id` deletes and re-inserts that run's `rf_observations`; `rf_frequencies` first/last-seen columns are *recomputed from surviving observations*, including for frequencies the previous version of the run touched but the new version does not — never incremented in place, so a deleted run's timestamps cannot linger.
 - **Time is capture time, never run ID.** `capture_start_utc` comes from the SDRplay `auxi` chunk when present, else a parsed `YYYYMMDD_HHMMSS` filename pattern, else is recorded `unknown` and excluded from first/last-seen computation (counted separately in `undated_observation_count`). Importing an older capture after a newer one still produces correct history.
 - **Frequency identity stays protocol-neutral.** `rf_frequencies` matches an existing catalog row within a tolerance (not exact float equality, since the same physical channel measures slightly differently each run) rather than creating a new row per run.
+
+## What a run records about the receiver
+
+`sites` holds one row per site and `upsert_site` rewrites it on every run, so it carries the
+site profile's *declared* gain -- a statement of intent made before any stop, not a record of
+what a given stop ran at. Two runs sharing a `site_id` cannot be told apart by it.
+
+`survey_runs.hardware_json` is the per-run record, and it keeps two claims separate:
+
+| bucket | what it holds |
+|---|---|
+| `requested` | what this software asked the radio for |
+| `applied` | what the radio reported back when asked (`device_settings_applied`) |
+| `identity` | the driver and serial the device was opened as |
+
+`source` names the strongest bucket that carries anything: `applied`, `requested`, or
+`not_recorded`. A value that was not observed is absent, never inferred from the profile --
+the geolocation solver reads level as distance, so a declared gain presented as a measured one
+is a confident wrong number. A reader falling back to the `sites` row labels that `declared`,
+which is why `declared` is the one source value never written into a stored blob.
+
+What each path can honestly record:
+
+| path | source |
+|---|---|
+| `survey run` on a recording | `not_recorded` -- the recording was not made here |
+| `survey capture`, field-app stop | `applied`, from the capture report it just wrote |
+| field-app analyse | `applied` only if the recording's own capture report names it back |
+| `live stop`, a drive | `requested` -- a drive never reads the radio back |
+
+`campaign_id` names the collection round a run belongs to: lower case, digits, `.`, `_` and
+`-`, validated on the one write path. `NULL` means unassigned, which is what every run
+recorded before campaigns existed is; none was backfilled. `--campaign` sets it on
+`survey run`, `survey capture`, `live stop` and `web serve`, and narrows
+`scripts/campaign_digest.py`.
 
 ## Output layout
 

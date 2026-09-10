@@ -88,6 +88,17 @@ def live_stop(
         ),
     ] = 26.0,
     lna_state: Annotated[int, typer.Option("--lna-state", help="SDRplay LNA state")] = 8,
+    campaign: Annotated[
+        str | None,
+        typer.Option(
+            "--campaign",
+            help=(
+                "Collection round this run belongs to, e.g. 2026-09_day1. Lower case, "
+                "digits, '.', '_' and '-'. Left unset the run is unassigned, which is "
+                "what every run recorded before campaigns existed is"
+            ),
+        ),
+    ] = None,
     driver: Annotated[str, typer.Option(help="SoapySDR driver name")] = "sdrplay",
     window_seconds: Annotated[
         float, typer.Option("--window-seconds", help="Length of one averaging window")
@@ -143,6 +154,7 @@ def live_stop(
     settings = LiveSettings(
         band=band,
         site_id=site_profile.site_id,
+        campaign_id=campaign,
         center_frequency_hz=center_frequency,
         sample_rate_hz=sample_rate,
         if_gain_reduction_db=if_gain_reduction,

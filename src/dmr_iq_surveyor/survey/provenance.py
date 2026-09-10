@@ -343,14 +343,32 @@ def if_gain_reading(hardware: dict[str, Any], declared: Any | None = None) -> Re
     )
 
 
+def _as_lna_index(value: Any) -> Any:
+    """Narrow an integral LNA state to the index it names.
+
+    An LNA state is an index. The radio reports it through a gain element, so
+    it comes back as a float, while a site profile stores the index itself. A
+    campaign holding both would otherwise look like two settings where there
+    is one, and the digest would warn that levels are incomparable when they
+    are not. A non-integral value is left exactly as it arrived: that is not
+    an LNA state, and rounding it away would hide the fact.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    return int(value) if float(value).is_integer() else value
+
+
 def lna_state_reading(hardware: dict[str, Any], declared: Any | None = None) -> Reading:
     """The LNA state this run measured at, and how well it is known."""
-    return _gain_reading(
+    reading = _gain_reading(
         hardware,
         element=GAIN_ELEMENT_RF,
         requested_key="lna_state",
         declared=declared,
     )
+    if not reading.known:
+        return reading
+    return Reading(_as_lna_index(reading.value), reading.source)
 
 
 def identity_value(hardware: dict[str, Any], key: str) -> Any | None:

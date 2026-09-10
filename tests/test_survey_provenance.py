@@ -337,6 +337,21 @@ def test_reading_prefers_applied_then_requested_then_declared(tmp_path: Path) ->
     assert identity_value({}, "driver") is None
 
 
+def test_an_lna_state_read_back_as_a_float_is_the_index_it_names(tmp_path: Path) -> None:
+    """The radio reports the LNA state through a gain element, so it arrives
+    as 2.0 where a site profile holds 2. Left alone, a campaign mixing the two
+    would be warned as running at two different settings."""
+    applied = hardware_from_capture_manifest(_capture_manifest(tmp_path / "a.wav", read_back=True))
+
+    measured = lna_state_reading(applied).value
+    assert measured == 2
+    assert isinstance(measured, int)
+    assert measured == lna_state_reading({}, declared=2).value
+    # An index that is not one is shown as it arrived rather than rounded away.
+    odd = hardware_provenance(applied={"gains": {"RFGR": 2.5}})
+    assert lna_state_reading(odd).value == 2.5
+
+
 def test_a_reading_always_says_how_well_it_is_known(tmp_path: Path) -> None:
     applied = hardware_from_capture_manifest(_capture_manifest(tmp_path / "a.wav", read_back=True))
 

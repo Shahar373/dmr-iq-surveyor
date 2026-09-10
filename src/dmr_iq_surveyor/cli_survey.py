@@ -97,6 +97,17 @@ def survey_run(
             ),
         ),
     ] = None,
+    campaign: Annotated[
+        str | None,
+        typer.Option(
+            "--campaign",
+            help=(
+                "Collection round this run belongs to, e.g. 2026-09_day1. Lower case, "
+                "digits, '.', '_' and '-'. Left unset the run is unassigned, which is "
+                "what every run recorded before campaigns existed is"
+            ),
+        ),
+    ] = None,
     gps_url: Annotated[
         str | None,
         typer.Option(
@@ -166,6 +177,7 @@ def survey_run(
             gps_source=gps["source"],
             gps_fetched_at_utc=gps["fetched_at_utc"],
             site_id_override=site_id,
+            campaign_id=campaign,
             drive_view=DriveViewSettings() if drive_view else None,
         )
     except (FileNotFoundError, OSError, ValueError, ProfileError, sqlite3.Error) as exc:
@@ -357,6 +369,17 @@ def survey_capture(
         str | None,
         typer.Option("--serial", help="Pin to one device by serial number, if more than one is attached"),
     ] = None,
+    campaign: Annotated[
+        str | None,
+        typer.Option(
+            "--campaign",
+            help=(
+                "Collection round this run belongs to, e.g. 2026-09_day1. Lower case, "
+                "digits, '.', '_' and '-'. Left unset the run is unassigned, which is "
+                "what every run recorded before campaigns existed is"
+            ),
+        ),
+    ] = None,
     survey_output: Annotated[
         Path | None,
         typer.Option(help="Survey run output directory; defaults to <output>/survey"),
@@ -486,6 +509,7 @@ def survey_capture(
                 gps_longitude=longitude,
                 on_progress=report,
                 site_id_override=site_id,
+                campaign_id=campaign,
             )
     except (FileNotFoundError, OSError, ValueError, ProfileError, RuntimeError, sqlite3.Error) as exc:
         console.print(f"[bold red]Capture/survey failed:[/bold red] {exc}")
