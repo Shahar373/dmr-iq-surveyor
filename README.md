@@ -725,11 +725,13 @@ dmr-surveyor project show --project p25
 dmr-surveyor web serve --project p25 --campaign 2026-09_day1 --host 0.0.0.0
 ```
 
-Adoption never moves or rewrites a row: it assigns the whole database, every historical run included, to the project. It assigns no run to a campaign — `campaign_id` stays `NULL` on existing rows, and there is no backfill.
+Both `--adopt` and `--create` report and stop by default; only `--write` changes anything.
+
+Adoption never moves or rewrites a row: it assigns the whole database, every historical run included, to the project. It assigns no run to a campaign — `campaign_id` stays `NULL` on existing rows, and there is no backfill. It also refuses to claim a file just because it is valid SQLite: before anything is written, through a connection that cannot write, it runs SQLite's own integrity check and looks for the Phase 5 table and column signature. A foreign or corrupt file is refused and left byte-for-byte as it was found.
 
 Why this exists: opening a path in this codebase does not read a database, it **makes** one. A mistyped `--database` returns a fresh, fully schema'd, empty database rather than an error, and an existing empty file is silently schema'd the same way. Once a database is claimed, a command run with `--project` must open that path, it must already exist, and it must already carry that project's claim for that project's analyzer — checked by reading the file's first sixteen bytes rather than by connecting, so a wrong path creates no file and no directory. `web serve --project` therefore fails at startup, with a message, instead of on the first page load after somebody has driven somewhere.
 
-Precedence is explicit flag, then campaign manifest, then project manifest, then the CLI's own default. A contradicting explicit `--band` is refused naming both origins, because levels recorded under different bands are not comparable; `--output` and the rest simply win.
+Precedence is explicit flag, then campaign manifest, then project manifest, then the CLI's own default. A contradicting explicit `--band` is refused naming both origins, because levels recorded under different bands are not comparable; `--output` and the rest simply win. Bands are compared by resolved content rather than by spelling, so a name and a path to the same profile agree.
 
 Without `--project` nothing binds, nothing is opened at startup, and every existing invocation behaves exactly as it did — including today's create-on-open behaviour, which is left alone rather than changed underneath commands that depend on it.
 

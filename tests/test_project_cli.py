@@ -79,7 +79,7 @@ def _claim_of(path: Path):
 
 
 def test_validate_accepts_a_project_and_a_campaign(tmp_path: Path) -> None:
-    assert _init(tmp_path, "--create").exit_code == 0
+    assert _init(tmp_path, "--create", "--write").exit_code == 0
     manifest = tmp_path / "p" / "project.yaml"
     assert runner.invoke(app, ["project", "validate", str(manifest)]).exit_code == 0
 
@@ -104,7 +104,7 @@ def test_validate_refuses_a_file_that_is_not_a_manifest(tmp_path: Path) -> None:
 
 
 def test_create_makes_a_database_a_claim_and_a_manifest(tmp_path: Path) -> None:
-    result = _init(tmp_path, "--create")
+    result = _init(tmp_path, "--create", "--write")
 
     assert result.exit_code == 0, result.output
     database = tmp_path / "db.sqlite3"
@@ -118,7 +118,7 @@ def test_create_makes_a_database_a_claim_and_a_manifest(tmp_path: Path) -> None:
 def test_create_refuses_a_database_that_is_already_there(tmp_path: Path) -> None:
     """Creation must never adopt something that already exists."""
     _seeded(tmp_path / "db.sqlite3")
-    result = _init(tmp_path, "--create")
+    result = _init(tmp_path, "--create", "--write")
 
     assert result.exit_code == 1
     assert "use --adopt" in result.output
@@ -290,7 +290,7 @@ def test_show_reports_unclaimed_claimed_and_foreign(tmp_path: Path) -> None:
 
 def test_show_does_not_create_a_database_that_the_manifest_names(tmp_path: Path) -> None:
     """Looking is never claiming, and never creating either."""
-    _init(tmp_path, "--create")
+    _init(tmp_path, "--create", "--write")
     manifest = tmp_path / "p" / "project.yaml"
     (tmp_path / "db.sqlite3").unlink()
 
@@ -305,7 +305,7 @@ def test_show_does_not_create_a_database_that_the_manifest_names(tmp_path: Path)
 
 
 def test_campaign_new_writes_once_and_refuses_to_clobber(tmp_path: Path) -> None:
-    _init(tmp_path, "--create")
+    _init(tmp_path, "--create", "--write")
     manifest = tmp_path / "p" / "project.yaml"
     args = ["project", "campaign", "new", "--project", str(manifest), "--campaign-id", "  Day1 "]
 
@@ -461,3 +461,126 @@ def test_the_dry_run_reports_integrity_and_schema(tmp_path: Path) -> None:
     flat = result.output.replace("\n", "")
     assert "integrity" in flat and "ok" in flat
     assert "dmr-iq-surveyor" in flat
+
+
+# -- create: dry run, refusal, and a state that can always be finished -------
+
+
+def test_create_writes_nothing_without_write(tmp_path: Path) -> None:
+    """Same default as adoption, and for the same reason: the first thing a
+    command does should never be the thing that changes something."""
+    result = _init(tmp_path, "--create")
+
+    assert result.exit_code == 0, result.output
+    assert "Nothing was written" in result.output
+    assert not (tmp_path / "db.sqlite3").exists()
+    assert not (tmp_path / "p").exists()
+
+
+def test_the_create_dry_run_says_what_it_would_do(tmp_path: Path) -> None:
+    result = _init(tmp_path, "--create")
+
+    flat = result.output.replace("\n", "")
+    assert "would be created" in flat
+    assert "p25_central_il" in flat
+    assert "would be written" in flat
+
+
+def test_create_refuses_to_clobber_a_manifest_that_differs(tmp_path: Path) -> None:
+    manifest = tmp_path / "p" / "project.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("schema_version: 1\nproject_id: something_else\n", encoding="utf-8")
+
+    result = _init(tmp_path, "--create", "--write")
+
+    assert result.exit_code == 1
+    assert "will not be overwritten" in result.output.replace("\n", "")
+    assert manifest.read_text(encoding="utf-8").startswith("schema_version: 1\nproject_id: some")
+    assert not (tmp_path / "db.sqlite3").exists(), "a refused manifest still created a database"
+
+
+def test_an_identical_manifest_is_a_no_op_for_create(tmp_path: Path) -> None:
+    assert _init(tmp_path, "--create", "--write").exit_code == 0
+    manifest = tmp_path / "p" / "project.yaml"
+    before = manifest.read_bytes()
+    (tmp_path / "db.sqlite3").unlink()
+
+    result = _init(tmp_path, "--create", "--write")
+
+    assert result.exit_code == 0, result.output
+    assert manifest.read_bytes() == before
+
+
+def test_a_repeated_create_finishes_a_creation_that_was_interrupted(
+    tmp_path: Path,
+) -> None:
+    """The state a crash between the claim and the manifest leaves behind.
+
+    Without this, the re-run would hit "already exists" and the operator
+    would be holding a state no command could finish.
+    """
+    assert _init(tmp_path, "--create", "--write").exit_code == 0
+    manifest = tmp_path / "p" / "project.yaml"
+    manifest.unlink()
+
+    result = _init(tmp_path, "--create", "--write")
+
+    assert result.exit_code == 0, result.output
+    assert "Completed" in result.output
+    assert manifest.is_file()
+    assert _claim_of(tmp_path / "db.sqlite3").project_id == "p25_central_il"
+
+
+def test_a_repeat_create_is_idempotent(tmp_path: Path) -> None:
+    assert _init(tmp_path, "--create", "--write").exit_code == 0
+    claimed_at = _claim_of(tmp_path / "db.sqlite3").claimed_at
+
+    assert _init(tmp_path, "--create", "--write").exit_code == 0
+
+    # Re-running does not rewrite history.
+    assert _claim_of(tmp_path / "db.sqlite3").claimed_at == claimed_at
+
+
+def test_create_still_refuses_a_database_claimed_by_another_project(
+    tmp_path: Path,
+) -> None:
+    """Only a half-done creation of *this* project is resumable. Anything
+    else is adoption's business."""
+    _seeded(tmp_path / "db.sqlite3", project_id="vor_north")
+
+    result = _init(tmp_path, "--create", "--write")
+
+    assert result.exit_code == 1
+    assert "use --adopt" in result.output
+    assert _claim_of(tmp_path / "db.sqlite3").project_id == "vor_north"
+
+
+def test_create_still_refuses_an_unclaimed_database(tmp_path: Path) -> None:
+    _seeded(tmp_path / "db.sqlite3")
+
+    result = _init(tmp_path, "--create", "--write")
+
+    assert result.exit_code == 1
+    assert "use --adopt" in result.output
+    assert _claim_of(tmp_path / "db.sqlite3") is None
+
+
+def test_a_failed_manifest_write_rolls_the_creation_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database that exists, is claimed, and has no manifest is the one
+    state creation must not leave behind. It did not exist when the command
+    started and holds nothing but the claim just written, so removing it
+    restores the filesystem exactly."""
+
+    def _refuse(path: Path, text: str) -> Path:
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr("dmr_iq_surveyor.cli_project.write_manifest_atomically", _refuse)
+
+    result = _init(tmp_path, "--create", "--write")
+
+    assert result.exit_code == 1
+    assert "was removed" in result.output.replace("\n", "")
+    assert not (tmp_path / "db.sqlite3").exists()
+    assert not (tmp_path / "p" / "project.yaml").exists()

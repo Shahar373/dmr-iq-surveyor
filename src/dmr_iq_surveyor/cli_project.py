@@ -21,6 +21,7 @@ from rich.table import Table
 
 from dmr_iq_surveyor.geo.store import connect_geo_database
 from dmr_iq_surveyor.project.claim import (
+    Claim,
     inspect_database,
     open_read_only,
     read_claim,
@@ -170,7 +171,13 @@ def project_init(
     manifest: Annotated[Path, typer.Option("--manifest", help="Where to write project.yaml")],
     create: Annotated[
         bool,
-        typer.Option("--create", help="Make a new, empty project database. Refuses to touch an existing one"),
+        typer.Option(
+            "--create",
+            help=(
+                "Make a new, empty project database. Refuses to touch an existing one. "
+                "Reports only, unless --write"
+            ),
+        ),
     ] = False,
     adopt: Annotated[
         bool,
@@ -178,7 +185,10 @@ def project_init(
     ] = False,
     write: Annotated[
         bool,
-        typer.Option("--write", help="With --adopt, actually claim the database and write the manifest"),
+        typer.Option(
+            "--write",
+            help="Actually write. Without it both --create and --adopt only report",
+        ),
     ] = False,
     analyzer: Annotated[str, typer.Option("--analyzer", help="Analyzer that reads this project")] = (
         ANALYZER_P25_SITE_GEOLOCATION
@@ -224,51 +234,162 @@ def project_init(
         _fail(f"the manifest this would write is not valid: {exc}")
 
     if create:
-        _create(database_path, manifest_path, text, resolved_id, analyzer)
+        _create(database_path, manifest_path, text, resolved_id, analyzer, write=write)
     else:
         _adopt(database_path, manifest_path, text, resolved_id, analyzer, write=write)
 
 
-def _refuse_existing_manifest(manifest_path: Path, text: str) -> bool:
-    """True when the manifest is already exactly what would be written."""
+_MANIFEST_ABSENT = "absent"
+_MANIFEST_IDENTICAL = "identical"
+_MANIFEST_DIFFERS = "differs"
+_MANIFEST_UNREADABLE = "unreadable"
+
+_MANIFEST_STATE_LABEL = {
+    _MANIFEST_ABSENT: "would be written",
+    _MANIFEST_IDENTICAL: "already identical; would be left as it is",
+    _MANIFEST_DIFFERS: "[red]exists and differs; this will be refused[/red]",
+    _MANIFEST_UNREADABLE: "[red]exists and cannot be read; this will be refused[/red]",
+}
+
+
+def _manifest_state(manifest_path: Path, text: str) -> str:
+    """What is at the manifest target, compared with what would be written.
+
+    A state rather than a refusal, so the dry run can *report* a conflict
+    instead of discovering it only once `--write` is passed. "Nothing was
+    written" about a run that could never have written anything reads as
+    "so far, so good", which is the opposite of true.
+    """
     if not manifest_path.exists():
+        return _MANIFEST_ABSENT
+    try:
+        current = manifest_path.read_text(encoding="utf-8")
+    except OSError:
+        return _MANIFEST_UNREADABLE
+    return _MANIFEST_IDENTICAL if current == text else _MANIFEST_DIFFERS
+
+
+def _existing_claim(database_path: Path) -> Claim | None:
+    """The claim on an existing database, read without being able to write."""
+    connection = open_read_only(database_path)
+    try:
+        return read_claim(connection)
+    finally:
+        connection.close()
+
+
+def _resumable(database_path: Path, project_id: str, analyzer: str) -> bool:
+    """Whether an existing database is one a previous `--create` left behind.
+
+    Creation writes the database and its claim first and the manifest second,
+    so a crash between the two leaves a claimed database and no manifest.
+    Without this, re-running would hit "already exists" and the operator would
+    be stuck with a state no command could finish -- so a database carrying
+    *exactly* this project's claim is treated as the half-done creation it is,
+    and the re-run completes it by writing the manifest.
+
+    Any other existing database -- claimed by someone else, or claimed by
+    nobody -- is still refused. Those are adoption's business, not creation's.
+    """
+    found = inspect_database(database_path)
+    if not found.usable:
         return False
-    current = manifest_path.read_text(encoding="utf-8")
-    if current == text:
-        return True
-    _fail(
-        f"{manifest_path} already exists and differs from what this would write. "
-        "Move it aside, or edit it by hand; it will not be overwritten."
+    existing = _existing_claim(database_path)
+    return (
+        existing is not None
+        and existing.project_id == project_id
+        and existing.analyzer == analyzer
     )
-    return False
 
 
 def _create(
-    database_path: Path, manifest_path: Path, text: str, project_id: str, analyzer: str
+    database_path: Path,
+    manifest_path: Path,
+    text: str,
+    project_id: str,
+    analyzer: str,
+    *,
+    write: bool,
 ) -> None:
     found = inspect_database(database_path)
-    if found.exists:
+    resuming = found.exists and _resumable(database_path, project_id, analyzer)
+    if found.exists and not resuming:
         _fail(
             f"{database_path} already exists. --create makes a new database; "
             "use --adopt to take on one that is already there."
         )
-    identical = _refuse_existing_manifest(manifest_path, text)
 
+    manifest_state = _manifest_state(manifest_path, text)
+
+    table = Table(title=f"Creating {database_path}")
+    table.add_column("what")
+    table.add_column("value")
+    table.add_row(
+        "database",
+        "would be created"
+        if not resuming
+        else "[yellow]already created and claimed by this project; would be left as it is[/yellow]",
+    )
+    table.add_row("would claim as", f"{project_id} ({analyzer})")
+    table.add_row("manifest", str(manifest_path))
+    table.add_row("manifest at target", _MANIFEST_STATE_LABEL[manifest_state])
+    console.print(table)
+
+    # Reported before the dry run can say "nothing was written", and refused
+    # in the dry run too: a run that cannot succeed must not look like one
+    # that is merely waiting for --write.
+    if manifest_state == _MANIFEST_DIFFERS:
+        _fail(
+            f"{manifest_path} already exists and differs from what this would write. "
+            "Move it aside, or edit it by hand; it will not be overwritten."
+        )
+
+    if not write:
+        console.print(
+            "\n[yellow]Nothing was written.[/yellow] Re-run with --write to create the "
+            "database and write the manifest."
+        )
+        return
+
+    created_here = not found.exists
     connection = connect_geo_database(database_path)
     try:
         claim = write_claim(connection, project_id=project_id, analyzer=analyzer)
-    except ProjectError as exc:
+    except (ProjectError, sqlite3.Error) as exc:
         connection.close()
+        if created_here:
+            _remove_database(database_path)
         _fail(str(exc))
         return
     finally:
         connection.close()
-    if not identical:
-        write_manifest_atomically(manifest_path, text)
+
+    if manifest_state != _MANIFEST_IDENTICAL:
+        try:
+            write_manifest_atomically(manifest_path, text)
+        except OSError as exc:
+            # Roll the creation back. This database did not exist when this
+            # command started and holds nothing but the claim this command
+            # just wrote, so removing it restores the filesystem exactly.
+            # A database that exists, is claimed, and has no manifest is the
+            # one state creation must not leave behind.
+            if created_here:
+                _remove_database(database_path)
+                _fail(f"the manifest could not be written ({exc}); the new database was removed")
+            _fail(f"the manifest could not be written ({exc})")
+            return
+
     console.print(
-        f"[green]Created[/green] project {claim.project_id} at {database_path}\n"
-        f"Manifest: {manifest_path}"
+        f"[green]{'Completed' if resuming else 'Created'}[/green] project {claim.project_id} "
+        f"at {database_path}\nManifest: {manifest_path}"
     )
+
+
+def _remove_database(database_path: Path) -> None:
+    """Undo a creation this command made, siblings included."""
+    database_path.unlink(missing_ok=True)
+    for suffix in ("-wal", "-shm", "-journal"):
+        database_path.with_name(database_path.name + suffix).unlink(missing_ok=True)
 
 
 def _adopt(
@@ -297,6 +418,7 @@ def _adopt(
     finally:
         connection.close()
     counts = contents.counts
+    manifest_state = _manifest_state(manifest_path, text)
 
     table = Table(title=f"Adopting {database_path}")
     table.add_column("what")
@@ -315,6 +437,7 @@ def _adopt(
     )
     table.add_row("would claim as", f"{project_id} ({analyzer})")
     table.add_row("would write manifest", str(manifest_path))
+    table.add_row("manifest at target", _MANIFEST_STATE_LABEL[manifest_state])
     console.print(table)
 
     # Before anything is said about what would be written. A file that is not
@@ -337,16 +460,22 @@ def _adopt(
             "it cannot be re-claimed"
         )
 
+    # Before "nothing was written", not after it and not only under --write.
+    # The refusal is the same either way; what changes is that the dry run now
+    # tells the operator now rather than on the run they expected to succeed.
+    if manifest_state in (_MANIFEST_DIFFERS, _MANIFEST_UNREADABLE):
+        _fail(
+            f"{manifest_path} already exists and {'differs from' if manifest_state == _MANIFEST_DIFFERS else 'cannot be read to compare with'} "
+            "what this would write. Move it aside, or edit it by hand; it will not be "
+            "overwritten."
+        )
+
     if not write:
         console.print(
             "\n[yellow]Nothing was written.[/yellow] Re-run with --write to claim the database "
             "and write the manifest."
         )
         return
-
-    # The manifest is checked before the claim, so a refused manifest cannot
-    # leave a claimed database behind.
-    identical = _refuse_existing_manifest(manifest_path, text)
 
     connection = connect_geo_database(database_path)
     try:
@@ -358,7 +487,7 @@ def _adopt(
     finally:
         connection.close()
 
-    if not identical:
+    if manifest_state != _MANIFEST_IDENTICAL:
         write_manifest_atomically(manifest_path, text)
     console.print(
         f"[green]Adopted[/green] {database_path} as project {claim.project_id} "

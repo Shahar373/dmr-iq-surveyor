@@ -135,7 +135,7 @@ def _project(
     result = runner.invoke(
         app,
         [
-            "project", "init", "--create",
+            "project", "init", "--create", "--write",
             "--project-id", PROJECT_ID,
             "--label", "P25 central Israel",
             "--database", str(database or (workspace / "db.sqlite3")),

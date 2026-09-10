@@ -97,7 +97,7 @@ way to say so.
 |---|---|---|
 | `project validate <manifest>` | parse and check a project or campaign manifest | no |
 | `project show --project P` | resolved manifest, database, claim, campaigns found | read-only |
-| `project init --create` | manifest + a new database + its claim | yes — the only creating path |
+| `project init --create` | manifest + a new database + its claim; reports unless `--write` | yes — the only creating path |
 | `project init --adopt` | take on an existing database; reports unless `--write` | read-only, then one row |
 | `project campaign new --project P --campaign-id C` | write a campaign manifest | no |
 
@@ -105,6 +105,53 @@ A project is named or pathed. `--project p25` is looked up as
 `config/projects/p25/project.yaml`, then `projects/p25/project.yaml`; a path to
 a manifest or to its directory works too. It is the same two-step shape as
 `--band` and `--site`.
+
+### Creating a new project
+
+```bash
+dmr-surveyor project init --create \
+  --project-id p25_central_il \
+  --label "P25 central Israel" \
+  --database /var/lib/dmr-field/inventory/dmr_inventory.sqlite3 \
+  --manifest /etc/dmr-field/projects/p25/project.yaml
+```
+
+Like adoption, that reports and stops: what would be created, what it would
+be claimed as, and what is at the manifest target. Nothing is written without
+`--write`.
+
+`--create` is the only command in the codebase permitted to bring a project
+database into existence, and it refuses to touch a path that already holds
+one — that is adoption's job.
+
+#### Failure modes, and what each leaves behind
+
+With `--write`, in this order: refuse an existing database; compare the
+manifest target; create the database and claim it; write the manifest.
+
+| what fails | what is left | how to finish |
+|---|---|---|
+| the database path already exists | nothing written | use `--adopt`, or choose another path |
+| the manifest at the target differs | nothing written — **no database is created** | move the manifest aside, or edit it by hand |
+| the claim cannot be written | the just-created database is **removed** | fix the cause and re-run |
+| the manifest cannot be written | the just-created database is **removed** | fix the cause and re-run |
+| the process is killed between the two | database claimed, manifest missing | **re-run the same command**: it completes by writing the manifest |
+
+The last two rows are the same accident handled two ways, because only one of
+them can be. A rollback needs the process to still be alive; a kill leaves
+whatever was on disk. So creation both rolls back what it can and recognises
+what it cannot: a database carrying *exactly* this project's claim is treated
+as the half-done creation it is, and the re-run finishes it. A database
+claimed by another project, or claimed by nobody, is still refused — those are
+adoption's business.
+
+Rolling back means deleting a database, which is only ever safe because of
+what is known at that moment: the path did not exist when the command started,
+and the file holds nothing but the claim this command just wrote. Anything
+that existed beforehand is never touched.
+
+A repeat run is idempotent. An identical claim is left exactly as it was,
+timestamp included, and an identical manifest is a no-op.
 
 ### Adopting the existing database
 
@@ -119,12 +166,31 @@ dmr-surveyor project init --adopt \
   --manifest /etc/dmr-field/projects/p25/project.yaml
 ```
 
-That reports and stops. It prints the database's size, its row counts, any
-claim already on it, and the exact manifest and claim row it *would* write.
-Nothing is written without `--write`.
+That reports and stops. It prints the database's size, the result of SQLite's
+own integrity check, whether the schema is recognised, its row counts, any
+claim already on it, what is at the manifest target, and the exact manifest and
+claim row it *would* write. Nothing is written without `--write`.
 
 The file is identified by reading its first sixteen bytes, not by connecting to
 it — connecting is what manufactures a database on a path that has none.
+
+**A valid SQLite file is not a reason to claim it.** A browser cache, a package
+index and a phone backup are all valid SQLite. Before anything is written, and
+through a connection that structurally cannot write, adoption runs
+`PRAGMA quick_check` and looks for a minimum schema signature: the five Phase 5
+tables (`runs`, `attempts`, `events`, `sessions`, `channels`) and the columns
+that make them this project's rather than something else's. A foreign or
+corrupt file is refused and left byte-for-byte as it was found.
+
+The signature is the *oldest* schema layer on purpose. A database written
+before Phase 6A has only those tables and is still this project's database —
+the later ones arrive by additive migration once it is opened normally.
+Requiring today's eighteen tables would refuse exactly the databases adoption
+exists for.
+
+A manifest already at the target that differs from what would be written is
+reported and refused **in the dry run**, not only under `--write`: a run that
+could never have succeeded must not read as one that is merely waiting.
 
 With `--write`, in this order:
 
