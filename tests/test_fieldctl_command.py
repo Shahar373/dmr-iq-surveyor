@@ -467,3 +467,106 @@ def test_status_reports_the_capture_settings_in_effect(tmp_path: Path) -> None:
     assert "868200000" in result.stdout
     assert "sdrplay" in result.stdout
     assert CAPTURE_SETTINGS["FIELD_BAND"] in result.stdout
+
+
+# -- project and collection round -----------------------------------------
+
+
+def test_neither_flag_is_passed_when_neither_is_configured(tmp_path: Path) -> None:
+    """The backward-compatibility contract for every Pi already in the field.
+    `web serve` gates on `--project` being not-None rather than truthy, so an
+    empty value would reach project resolution and fail; the flag has to be
+    absent, not empty."""
+    argv = _argv(tmp_path)
+
+    assert "--project" not in argv
+    assert "--campaign" not in argv
+
+
+def test_a_configured_project_reaches_the_argv(tmp_path: Path) -> None:
+    argv = _argv(tmp_path, FIELD_PROJECT="/etc/dmr-field/projects/p25/project.yaml")
+
+    assert "--project" in argv
+    assert argv[argv.index("--project") + 1] == "/etc/dmr-field/projects/p25/project.yaml"
+    # A campaign that was not configured stays absent.
+    assert "--campaign" not in argv
+
+
+def test_a_configured_campaign_reaches_the_argv(tmp_path: Path) -> None:
+    argv = _argv(
+        tmp_path,
+        FIELD_PROJECT="/etc/dmr-field/projects/p25/project.yaml",
+        FIELD_CAMPAIGN="2026-09_day1",
+    )
+
+    assert argv[argv.index("--campaign") + 1] == "2026-09_day1"
+
+
+def test_an_empty_value_is_the_same_as_not_configured(tmp_path: Path) -> None:
+    argv = _argv(tmp_path, FIELD_PROJECT="", FIELD_CAMPAIGN="")
+
+    assert "--project" not in argv
+    assert "--campaign" not in argv
+
+
+def test_an_env_file_from_before_these_existed_still_builds_a_command(
+    tmp_path: Path,
+) -> None:
+    """`set -u` is on, so a reference to an undeclared variable aborts the
+    script. Every Pi already in the field has exactly such a file."""
+    env_file = tmp_path / "field.env"
+    env_file.write_text("FIELD_BAND=central_800_narrow\nFIELD_PORT=8765\n", encoding="utf-8")
+
+    argv = _argv(tmp_path, FIELD_ENV_FILE=str(env_file))
+
+    assert argv[0].endswith("dmr-surveyor")
+    assert "--project" not in argv
+
+
+def test_the_project_and_campaign_can_come_from_the_environment_file(
+    tmp_path: Path,
+) -> None:
+    """The real path: systemd reads them from /etc/dmr-field/field.env."""
+    env_file = tmp_path / "field.env"
+    env_file.write_text(
+        "FIELD_PROJECT=/etc/dmr-field/projects/p25/project.yaml\n"
+        "FIELD_CAMPAIGN=2026-09_day1\n",
+        encoding="utf-8",
+    )
+
+    argv = _argv(tmp_path, FIELD_ENV_FILE=str(env_file))
+
+    assert argv[argv.index("--project") + 1] == "/etc/dmr-field/projects/p25/project.yaml"
+    assert argv[argv.index("--campaign") + 1] == "2026-09_day1"
+
+
+def test_status_reports_the_project_and_campaign_in_effect(tmp_path: Path) -> None:
+    result = _run(
+        _config(
+            tmp_path,
+            FIELD_PROJECT="/etc/dmr-field/projects/p25/project.yaml",
+            FIELD_CAMPAIGN="2026-09_day1",
+        ),
+        "status",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "/etc/dmr-field/projects/p25/project.yaml" in result.stdout
+    assert "2026-09_day1" in result.stdout
+
+
+def test_status_says_when_there_is_no_project(tmp_path: Path) -> None:
+    result = _run(_config(tmp_path), "status")
+
+    assert "not a project deployment" in result.stdout
+    assert "stay unassigned" in result.stdout
+
+
+def test_status_warns_about_a_campaign_with_no_project(tmp_path: Path) -> None:
+    """`web serve` reads --campaign only alongside --project, so this
+    combination silently records every stop unassigned. Said here rather
+    than discovered after a day of driving."""
+    result = _run(_config(tmp_path, FIELD_CAMPAIGN="2026-09_day1"), "status")
+
+    assert "WARNING" in result.stdout
+    assert "FIELD_CAMPAIGN is set but FIELD_PROJECT is not" in result.stdout

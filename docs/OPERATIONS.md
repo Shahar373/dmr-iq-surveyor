@@ -110,6 +110,8 @@ later in `/etc/dmr-field/field.env` followed by `fieldctl restart`.
 
 | Flag | Variable | Passed to `web serve` as |
 |---|---|---|
+| `--project` | `FIELD_PROJECT` | `--project`, **only when set** |
+| `--campaign` | `FIELD_CAMPAIGN` | `--campaign`, **only when set** |
 | `--band` | `FIELD_BAND` | `--band` |
 | `--center-frequency` | `FIELD_CENTER_FREQUENCY` | `--center-frequency` |
 | `--sample-rate` | `FIELD_SAMPLE_RATE` | `--sample-rate` |
@@ -171,7 +173,10 @@ fieldctl status
 
 Re-running the installer refreshes `fieldctl` and the unit. Your token,
 certificate and `field.env` are left alone, so the phone bookmark keeps
-working.
+working. That also means new variables are never added to an existing
+`field.env` -- `FIELD_PROJECT` and `FIELD_CAMPAIGN` included. Add them by
+hand if you want them; leaving them out keeps the service behaving exactly as
+it did before projects existed.
 
 ## Troubleshooting
 
@@ -221,6 +226,68 @@ says `UNRESOLVED`, Tailscale is down on the Pi.
 
 **The phone shows a certificate warning again.** The certificate was replaced.
 That should not happen on its own; see the note below.
+
+## Serving one project and one collection round
+
+Optional, off by default, and additive: an install that sets neither behaves
+exactly as it did before projects existed.
+
+```
+FIELD_PROJECT=/etc/dmr-field/projects/p25/project.yaml
+FIELD_CAMPAIGN=2026-09_day1
+```
+
+`FIELD_PROJECT` binds the service to **one** database -- the one its manifest
+names, which must already exist and already carry that project's claim. The
+process will open no other, and a missing, empty, unclaimed or foreign
+database fails at startup rather than being created. Adopt an existing
+database once, by hand, before setting this:
+
+```bash
+dmr-surveyor project init --adopt \
+  --project-id p25_central_il --label "P25 central Israel" \
+  --database /var/lib/dmr-field/inventory/dmr_inventory.sqlite3 \
+  --manifest /etc/dmr-field/projects/p25/project.yaml
+# then, once the report reads right, add --write
+```
+
+`FIELD_CAMPAIGN` is the collection round every stop is recorded under. It
+selects `<project root>/campaigns/<id>.yaml`, which must already exist, and
+it is **only read alongside `FIELD_PROJECT`** -- set on its own it does
+nothing and every stop comes back unassigned. `fieldctl status` says so
+rather than leaving it to be discovered after a day of driving.
+
+### A contradicting band stops the service, on purpose
+
+`fieldctl` passes `--band`, `--site`, `--database` and `--output` explicitly
+on every start. With `FIELD_PROJECT` set, the manifest is a second source for
+those, and the precedence is **explicit flag → campaign manifest → project
+manifest → the CLI's own default**.
+
+For `--band` a contradiction is refused rather than resolved: levels recorded
+under different bands are not comparable, so the service **will not start**,
+and systemd will retry and eventually park it in `start-limit-hit`. That is
+the intended behaviour -- failing loudly beats recording a day of stops under
+a band nobody chose -- but it means `FIELD_BAND` and the manifest's band have
+to agree. Site and output simply win from the environment.
+
+Check before restarting, not after:
+
+```bash
+sudo -u shahar fieldctl print-command   # the exact argv, including --project
+sudo -u shahar fieldctl status          # project, campaign, band, capture
+```
+
+`fieldctl restart` then applies it.
+
+### Gain, and the hardware profile
+
+`FIELD_*` still has no gain setting. Gain comes from the site profile named by
+`FIELD_SITE`, or -- when the campaign manifest names one -- from a hardware
+profile under `config/hardware/`, which outranks the site profile because gain
+belongs to the radio rather than to the place. The startup banner always
+prints which of the two it used, and falls back to a built-in default only
+when neither says anything, saying so when it does.
 
 ## Security notes
 
