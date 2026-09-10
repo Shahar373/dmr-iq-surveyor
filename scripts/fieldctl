@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# Operate the dmr-iq-surveyor field service on a Raspberry Pi.
+#
+#   fieldctl start | stop | restart | status | logs
+#
+# It is also what the systemd unit runs: `fieldctl wait-network` gates the
+# start and `fieldctl exec` becomes the server process. That is deliberate --
+# the launch command is assembled in exactly one function, so
+# `fieldctl print-command` shows the argv the service actually runs rather
+# than a second copy of it that can drift.
+#
+# Configuration comes from /etc/dmr-field/field.env (override with
+# FIELD_ENV_FILE). A variable already set in the environment wins over the
+# file, so a single setting can be overridden for one invocation without
+# editing anything.
+#
+# The shared API token is never passed as an argument, printed, or logged.
+# `fieldctl status` reaches the API through a curl config file precisely so
+# the value stays out of argv, /proc/<pid>/cmdline and `ps`.
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FIELD_ENV_FILE="${FIELD_ENV_FILE:-/etc/dmr-field/field.env}"
+FIELD_UNIT="${FIELD_UNIT:-dmr-field.service}"
+
+log()  { printf '%s\n' "$*" >&2; }
+die()  { printf 'fieldctl: %s\n' "$*" >&2; exit 1; }
+
+# --- configuration ------------------------------------------------------
+
+load_env() {
+    # Parsed rather than sourced. systemd's EnvironmentFile= is not shell:
+    # there is no expansion and no command substitution, and `FIELD_BAND=a b`
+    # means exactly the two words. Sourcing the same file would give it shell
+    # semantics that the running service does not have, so fieldctl would
+    # disagree with systemd about the configuration it is reporting on.
+    local line key value
+    if [[ -r "$FIELD_ENV_FILE" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+            [[ "$line" == *=* ]] || continue
+            key="${line%%=*}"
+            value="${line#*=}"
+            key="${key//[[:space:]]/}"
+            [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+            # Already set and non-empty in the environment: leave it alone.
+            [[ -n "${!key:-}" ]] && continue
+            printf -v "$key" '%s' "$value"
+            export "${key?}"
+        done < "$FIELD_ENV_FILE"
+    fi
+
+    : "${FIELD_SURVEYOR_BIN:=/opt/dmr-field/venv/bin/dmr-surveyor}"
+    : "${FIELD_HOST:=}"
+    : "${FIELD_PORT:=8765}"
+    : "${FIELD_SITE:=}"
+    : "${FIELD_BAND:=central_800_narrow}"
+    : "${FIELD_CENTER_FREQUENCY:=867406250}"
+    : "${FIELD_SAMPLE_RATE:=5000000}"
+    : "${FIELD_DURATION:=90}"
+    : "${FIELD_DRIVER:=sdrplay}"
+    : "${FIELD_SOLVE_RESOLUTION_M:=250}"
+    : "${FIELD_OUTPUT:=/var/lib/dmr-field}"
+    : "${FIELD_DATABASE:=/var/lib/dmr-field/inventory/dmr_inventory.sqlite3}"
+    : "${FIELD_KEEP_RECORDINGS:=1}"
+    : "${FIELD_TOKEN_FILE:=/etc/dmr-field/token}"
+    : "${FIELD_TLS_CERT:=/var/lib/dmr-field/tls/field-app.crt}"
+    : "${FIELD_TLS_KEY:=/var/lib/dmr-field/tls/field-app.key}"
+    : "${FIELD_TAILSCALE_BIN:=tailscale}"
+    : "${FIELD_TAILSCALE_IP:=}"
+    : "${FIELD_TAILSCALE_WAIT:=90}"
+}
+
+# --- where to listen ----------------------------------------------------
+
+tailscale_ipv4() {
+    if [[ -n "$FIELD_TAILSCALE_IP" ]]; then
+        printf '%s\n' "$FIELD_TAILSCALE_IP"
+        return 0
+    fi
+    command -v "$FIELD_TAILSCALE_BIN" >/dev/null 2>&1 || return 1
+    local address
+    address="$("$FIELD_TAILSCALE_BIN" ip -4 2>/dev/null | head -n 1)" || return 1
+    [[ -n "$address" ]] || return 1
+    printf '%s\n' "$address"
+}
+
+resolve_host() {
+    # An explicit FIELD_HOST always wins -- including 0.0.0.0, which an
+    # operator may genuinely want on a hotspot. What never happens is falling
+    # back to it: with no address to bind, this fails and lets systemd retry,
+    # because a service that quietly binds every interface is worse than one
+    # that is briefly down.
+    if [[ -n "$FIELD_HOST" ]]; then
+        printf '%s\n' "$FIELD_HOST"
+        return 0
+    fi
+    tailscale_ipv4
+}
+
+# --- the launch command -------------------------------------------------
+
+ARGV=()
+
+build_argv() {
+    local host
+    if ! host="$(resolve_host)"; then
+        die "no address to bind: FIELD_HOST is unset and no Tailscale IPv4 address is available. Set FIELD_HOST in ${FIELD_ENV_FILE}, or bring Tailscale up."
+    fi
+    [[ -n "$FIELD_SITE" ]] || die "FIELD_SITE is not set in ${FIELD_ENV_FILE}. It must be the absolute path of this campaign's site profile; there is no default, because the profile records the antenna, receiver and fixed gain and guessing one would record every stop against the wrong equipment."
+    [[ -f "$FIELD_SITE" ]] || die "site profile ${FIELD_SITE} does not exist"
+
+    # Every path is absolute: band and site names, and the default database
+    # path, all resolve relative to the current directory in the library, so
+    # a relative value here would depend on WorkingDirectory.
+    #
+    # --verbose is deliberately absent. It logs request lines, and those carry
+    # ?token= for the event stream and the export download.
+    #
+    # The capture settings are passed explicitly rather than left to the
+    # CLI's defaults. Nobody is watching this process start, so a default
+    # that is never named is a default nobody reads -- and the pair the CLI
+    # falls back to, 5 MS/s for 90 s, is 1.68 GiB per stop and has already
+    # been shown on this hardware to outrun what the storage can sustain.
+    # Storage that cannot keep up drops samples rather than refusing, so the
+    # failure arrives as a quietly damaged recording. Naming them here also
+    # means `fieldctl print-command` and `fieldctl status` show what is
+    # actually in effect.
+    #
+    # IF gain reduction and LNA state are deliberately absent: they come from
+    # the site profile, which is where the field guide puts them, and the app
+    # reports at startup which source it used.
+    ARGV=(
+        "$FIELD_SURVEYOR_BIN" web serve
+        --host "$host"
+        --port "$FIELD_PORT"
+        --site "$FIELD_SITE"
+        --band "$FIELD_BAND"
+        --center-frequency "$FIELD_CENTER_FREQUENCY"
+        --sample-rate "$FIELD_SAMPLE_RATE"
+        --duration "$FIELD_DURATION"
+        --driver "$FIELD_DRIVER"
+        --solve-resolution-m "$FIELD_SOLVE_RESOLUTION_M"
+        --database "$FIELD_DATABASE"
+        --output "$FIELD_OUTPUT"
+        --keep-recordings "$FIELD_KEEP_RECORDINGS"
+        --token-file "$FIELD_TOKEN_FILE"
+        --tls-cert "$FIELD_TLS_CERT"
+        --tls-key "$FIELD_TLS_KEY"
+    )
+}
+
+# --- reaching the API without leaking the token -------------------------
+
+api_get() {
+    # Fetch an API path and print the response body, or print nothing and
+    # return non-zero.
+    #
+    # The token goes into a mode-0600 config file that curl reads, never onto
+    # the command line. `curl -H "X-Auth-Token: $(cat ...)"` would put the
+    # secret in this process's argv, where /proc/<pid>/cmdline exposes it to
+    # every local account and `ps` prints it.
+    local path="$1" host url config status
+    host="$(resolve_host)" || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    [[ -r "$FIELD_TOKEN_FILE" ]] || return 1
+
+    url="https://${host}:${FIELD_PORT}${path}"
+    config="$(mktemp)"
+    chmod 600 "$config"
+    {
+        printf 'header = "X-Auth-Token: '
+        tr -d '\r\n' < "$FIELD_TOKEN_FILE"
+        printf '"\n'
+    } > "$config"
+
+    status=0
+    curl --silent --show-error --max-time 5 \
+         --cacert "$FIELD_TLS_CERT" \
+         --config "$config" \
+         "$url" 2>/dev/null || status=$?
+    rm -f "$config"
+    return "$status"
+}
+
+# --- subcommands --------------------------------------------------------
+
+cmd_exec() {
+    build_argv
+    exec "${ARGV[@]}"
+}
+
+cmd_print_command() {
+    # The separator cannot be held in a variable and then interpolated: bash
+    # strings are NUL-terminated, so $'\0' is the empty string and every
+    # argument would run into the next one. Two literal formats instead.
+    local null=0
+    if [[ "${1:-}" == "--null" ]]; then
+        null=1
+    fi
+    build_argv
+    if (( null )); then
+        printf '%s\0' "${ARGV[@]}"
+    else
+        printf '%s\n' "${ARGV[@]}"
+    fi
+}
+
+cmd_wait_network() {
+    if [[ -n "$FIELD_HOST" ]]; then
+        log "bind address pinned to ${FIELD_HOST}; not waiting for Tailscale"
+        return 0
+    fi
+    local deadline=$(( SECONDS + FIELD_TAILSCALE_WAIT )) address
+    while (( SECONDS < deadline )); do
+        if address="$(tailscale_ipv4)"; then
+            log "tailscale address ${address}"
+            return 0
+        fi
+        sleep 2
+    done
+    # Failing here, rather than falling back to loopback, is what makes the
+    # service self-healing: systemd retries on its RestartSec cadence and
+    # binds correctly as soon as the tailnet appears. A successful start on
+    # loopback would never re-bind, and the app would sit there looking
+    # healthy and unreachable.
+    die "no Tailscale IPv4 address after ${FIELD_TAILSCALE_WAIT}s; systemd will retry"
+}
+
+cmd_start()   { sudo systemctl start "$FIELD_UNIT"; }
+cmd_stop()    { sudo systemctl stop "$FIELD_UNIT"; }
+
+cmd_restart() {
+    local jobs
+    if jobs="$(api_get /api/jobs)" && [[ "$jobs" == *'"state": "running"'* || "$jobs" == *'"state":"running"'* ]]; then
+        log "WARNING: a job is running; restarting will abandon it."
+        log "Press Ctrl+C within 5 seconds to cancel."
+        sleep 5
+    fi
+    sudo systemctl restart "$FIELD_UNIT"
+}
+
+cmd_logs() {
+    if [[ $# -eq 0 ]]; then
+        set -- -n 50
+    fi
+    journalctl -u "$FIELD_UNIT" "$@"
+}
+
+cmd_status() {
+    local host state enabled mode
+
+    printf 'unit     %s\n' "$FIELD_UNIT"
+    enabled="$(systemctl is-enabled "$FIELD_UNIT" 2>/dev/null || true)"
+    state="$(systemctl is-active "$FIELD_UNIT" 2>/dev/null || true)"
+    printf 'state    %s (%s at boot)\n' "${state:-unknown}" "${enabled:-unknown}"
+    systemctl show "$FIELD_UNIT" \
+        --property=ActiveEnterTimestamp --property=NRestarts --property=ExecMainStatus \
+        --value 2>/dev/null | paste -sd' ' - | sed 's/^/since    /' || true
+
+    if host="$(resolve_host)"; then
+        printf 'bind     %s:%s\n' "$host" "$FIELD_PORT"
+        # Checked against the bound address, not 127.0.0.1: binding one
+        # specific address is the whole design, so a loopback probe would
+        # always report "not listening" and be wrong.
+        if command -v ss >/dev/null 2>&1; then
+            if ss -ltn 2>/dev/null | grep -q "${host}:${FIELD_PORT}"; then
+                printf 'listen   yes, on %s:%s\n' "$host" "$FIELD_PORT"
+            else
+                printf 'listen   NO -- nothing bound on %s:%s\n' "$host" "$FIELD_PORT"
+            fi
+        fi
+    else
+        printf 'bind     UNRESOLVED -- no FIELD_HOST and no Tailscale address\n'
+    fi
+
+    if [[ -e "$FIELD_TOKEN_FILE" ]]; then
+        mode="$(stat -c '%a' "$FIELD_TOKEN_FILE" 2>/dev/null || echo '?')"
+        # The mode, never the value.
+        printf 'token    %s mode %s%s\n' "$FIELD_TOKEN_FILE" "$mode" \
+            "$([[ "$mode" == "600" ]] || printf ' -- should be 600')"
+    else
+        printf 'token    MISSING at %s\n' "$FIELD_TOKEN_FILE"
+    fi
+
+    if [[ -r "$FIELD_TLS_CERT" ]] && command -v openssl >/dev/null 2>&1; then
+        printf 'cert     %s\n' "$(openssl x509 -in "$FIELD_TLS_CERT" -noout -enddate 2>/dev/null | sed 's/notAfter=/expires /')"
+        openssl x509 -in "$FIELD_TLS_CERT" -noout -checkend 2592000 >/dev/null 2>&1 \
+            || printf 'cert     WARNING: expires within 30 days; reissuing changes the fingerprint and the phone will warn again\n'
+    else
+        printf 'cert     MISSING at %s\n' "$FIELD_TLS_CERT"
+    fi
+
+    printf 'site     %s\n' "${FIELD_SITE:-UNSET -- the service cannot start}"
+    printf 'band     %s\n' "$FIELD_BAND"
+    # Printed because these decide whether a stop is recordable at all on
+    # this storage, and because the values in effect are otherwise invisible
+    # until a capture has already failed.
+    printf 'capture  %s Hz, %s S/s, %ss, driver %s, solve %s m\n' \
+        "$FIELD_CENTER_FREQUENCY" "$FIELD_SAMPLE_RATE" "$FIELD_DURATION" \
+        "$FIELD_DRIVER" "$FIELD_SOLVE_RESOLUTION_M"
+
+    if api_get /api/state >/dev/null 2>&1; then
+        printf 'api      reachable\n'
+    else
+        printf 'api      not reachable\n'
+    fi
+
+    printf '\nlast log lines:\n'
+    journalctl -u "$FIELD_UNIT" -n 5 --no-pager 2>/dev/null || true
+}
+
+cmd_url() {
+    # The one command that deliberately prints the token: the operator is
+    # asking for their own bookmark, on their own terminal. Everything else
+    # in this script goes out of its way to keep the value out of argv and
+    # out of the journal, so the warning goes to stderr and the URL to
+    # stdout -- `fieldctl url | qrencode -t ansiutf8` stays useful.
+    local host token
+    host="$(resolve_host)" || die "no address to bind: FIELD_HOST is unset and no Tailscale IPv4 address is available"
+    [[ -r "$FIELD_TOKEN_FILE" ]] || die "cannot read ${FIELD_TOKEN_FILE}"
+    token="$(tr -d '\r\n' < "$FIELD_TOKEN_FILE")"
+    [[ -n "$token" ]] || die "${FIELD_TOKEN_FILE} is empty"
+    log "This URL contains the API token. Do not paste it into a log, an issue or a chat."
+    printf 'https://%s:%s/?token=%s\n' "$host" "$FIELD_PORT" "$token"
+}
+
+cmd_render_unit() {
+    # Used by the installer. Kept here so the substitution and the template
+    # never disagree about which placeholders exist.
+    local user="$1" group="$2" workdir="$3" fieldctl="$4"
+    sed -e "s|@FIELD_USER@|${user}|g" \
+        -e "s|@FIELD_GROUP@|${group}|g" \
+        -e "s|@FIELD_WORKDIR@|${workdir}|g" \
+        -e "s|@FIELDCTL@|${fieldctl}|g" \
+        "${ROOT_DIR}/deploy/dmr-field.service"
+}
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: fieldctl <command>
+
+  start | stop | restart      control the service (uses sudo)
+  status                      one screen of diagnosis
+  logs [journalctl args...]   default: -n 50
+  url                         the phone bookmark, token included
+
+  print-command [--null]      the exact argv the service would run
+  wait-network                block until a bind address exists (ExecStartPre)
+  exec                        become the server process (ExecStart)
+  render-unit U G W F         fill the unit template (used by the installer)
+USAGE
+    exit 2
+}
+
+main() {
+    [[ $# -ge 1 ]] || usage
+    local command="$1"
+    shift
+    load_env
+    case "$command" in
+        start)          cmd_start "$@" ;;
+        stop)           cmd_stop "$@" ;;
+        restart)        cmd_restart "$@" ;;
+        status)         cmd_status "$@" ;;
+        logs)           cmd_logs "$@" ;;
+        url)            cmd_url "$@" ;;
+        print-command)  cmd_print_command "$@" ;;
+        wait-network)   cmd_wait_network "$@" ;;
+        exec)           cmd_exec "$@" ;;
+        render-unit)    [[ $# -eq 4 ]] || usage; cmd_render_unit "$@" ;;
+        *)              usage ;;
+    esac
+}
+
+main "$@"

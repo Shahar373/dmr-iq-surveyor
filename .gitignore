@@ -32,3 +32,12 @@ config/p25_sites.csv
 # does not carry third-party minified bundles.
 src/dmr_iq_surveyor/web/static/vendor/*
 !src/dmr_iq_surveyor/web/static/vendor/README.md
+
+# Operational files for the field service. The repository carries templates
+# (deploy/field.env.example) and tools; a filled-in configuration, the shared
+# API token and a real site profile stay out of Git.
+deploy/field.env
+deploy/field.env.local
+*.token
+config/sites/*.yaml
+!config/sites/*.example.yaml

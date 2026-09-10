@@ -5,8 +5,11 @@ Mounted additively; no existing command changes.
 
 from __future__ import annotations
 
+import re
 import secrets
 import socket
+import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
@@ -103,6 +106,112 @@ def _resolve_capture_gain(
     return resolved_gain, resolved_lna, notices
 
 
+# The token travels in a URL (`?token=...`), because the page has to load
+# before `app.js` can read the token out of its own address and start sending
+# it as a header -- see web/server.py's `_serve_static`. So the value has to
+# survive a query string intact: anything outside the URL-unreserved set is
+# rejected up front rather than producing an app that silently cannot
+# authenticate. Non-ASCII in particular is the case web/server.py documents as
+# having dropped the connection with no response at all.
+_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._~-]+$")
+
+
+class TokenError(ValueError):
+    """The shared token could not be resolved from what was given."""
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedToken:
+    """A resolved token, and where it came from.
+
+    The source is not bookkeeping: it decides whether the value may be
+    printed. A token the operator typed, or asked this process to generate,
+    is already on their screen and printing it back is how they get the URL.
+    A token read from a file exists precisely so that it never reaches a log
+    -- under systemd this banner goes straight to the journal.
+    """
+
+    value: str | None
+    source: str  # "none" | "flag" | "generated" | "file"
+
+
+def _read_token_file(path: Path) -> str:
+    """Read a token from `path`, refusing anything that cannot safely be one.
+
+    Every failure here is a refusal rather than a fallback, and the empty
+    case is why. `web/server.py`'s `_authorised` treats a falsy token as
+    "this server has no token", which authorises *every* request. A token
+    file that is empty -- truncated by a failed write, or created by a
+    `touch` that was never followed up -- would therefore turn an app
+    reachable over Tailscale into an open one, silently. Refusing to start
+    is the safe direction.
+    """
+    resolved = Path(path).expanduser()
+    try:
+        mode = resolved.stat().st_mode
+    except OSError as exc:
+        raise TokenError(f"token file {str(resolved)!r} could not be read: {exc}") from exc
+    if stat.S_ISDIR(mode):
+        raise TokenError(f"token file {str(resolved)!r} is a directory")
+    if mode & 0o077:
+        raise TokenError(
+            f"token file {str(resolved)!r} is readable by more than its owner "
+            f"(mode {stat.S_IMODE(mode):04o}). Run: chmod 600 {resolved}"
+        )
+    try:
+        raw = resolved.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TokenError(f"token file {str(resolved)!r} could not be read: {exc}") from exc
+    # Stripped because the ordinary way to write one of these is `echo`, and a
+    # trailing newline is not part of the secret.
+    value = raw.strip()
+    if not value:
+        raise TokenError(
+            f"token file {str(resolved)!r} is empty. An empty token would disable "
+            "authentication for every request, so it is refused rather than served."
+        )
+    if not _TOKEN_PATTERN.match(value):
+        raise TokenError(
+            f"token file {str(resolved)!r} contains characters that cannot survive a "
+            "URL query string; use only A-Z a-z 0-9 and . _ ~ -"
+        )
+    return value
+
+
+def resolve_token(token: str | None, token_file: Path | None) -> ResolvedToken:
+    """Resolve the shared token from `--token` or `--token-file`.
+
+    `--token`'s three existing behaviours are unchanged: absent means no
+    authentication, `auto` mints a fresh one, anything else is used verbatim.
+    """
+    if token is not None and token_file is not None:
+        raise TokenError(
+            "--token and --token-file cannot be given together; pass one or the other"
+        )
+    if token_file is not None:
+        return ResolvedToken(_read_token_file(token_file), "file")
+    if token == "auto":
+        return ResolvedToken(secrets.token_urlsafe(12), "generated")
+    if token is None:
+        return ResolvedToken(None, "none")
+    return ResolvedToken(token, "flag")
+
+
+def token_query_suffix(resolved: ResolvedToken) -> str:
+    """The `?token=...` a printed URL may carry, or "" when it may not.
+
+    A file-sourced token is withheld deliberately. It is the one source whose
+    whole purpose is to keep the secret out of this process's output, and the
+    startup banner is captured by journald when the app runs as a service.
+    """
+    # `not resolved.value`, not `is None`: `--token ""` resolves to an empty
+    # string, which `_authorised` treats as "no token configured". It printed
+    # a bare URL before this helper existed and must keep doing so.
+    if not resolved.value or resolved.source == "file":
+        return ""
+    return f"?token={resolved.value}"
+
+
 @web_app.command("serve")
 def web_serve(
     host: Annotated[
@@ -190,6 +299,18 @@ def web_serve(
         str | None,
         typer.Option(
             help="Shared token required by the API; use --token auto to generate one"
+        ),
+    ] = None,
+    token_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--token-file",
+            help=(
+                "Read the shared token from this file instead of --token, so it never "
+                "appears in this process's command line or in the service journal. The "
+                "file must be readable by its owner only (chmod 600) and must not be "
+                "empty"
+            ),
         ),
     ] = None,
     capture_enabled: Annotated[
@@ -304,7 +425,12 @@ def web_serve(
             f"IF gain reduction {resolved_gain:g} dB, LNA state {resolved_lna}"
         )
 
-    resolved_token = secrets.token_urlsafe(12) if token == "auto" else token
+    try:
+        resolved = resolve_token(token, token_file)
+    except TokenError as exc:
+        console.print(f"[bold red]Token could not be resolved:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    resolved_token = resolved.value
     settings = FieldSettings(
         database_path=database or DEFAULT_DATABASE_PATH,
         recordings_dir=recordings or (output / "recordings"),
@@ -365,7 +491,7 @@ def web_serve(
             raise typer.Exit(code=1) from exc
 
     scheme = "https" if certificate is not None else "http"
-    suffix = f"?token={resolved_token}" if resolved_token else ""
+    suffix = token_query_suffix(resolved)
     console.print("[bold]Field app[/bold]")
     for address in _local_addresses(port, scheme):
         console.print(f"  {address}/{suffix}")
@@ -381,6 +507,11 @@ def web_serve(
             "[dim]The certificate is self-signed, so the phone shows a warning once per "
             "device: Advanced -> Proceed. After that the page is a secure context and the "
             "browser will share GPS.[/dim]"
+        )
+    if resolved.source == "file":
+        console.print(
+            f"[bold]Token[/bold] read from {token_file}; it is deliberately not printed "
+            "here, so it stays out of the service journal."
         )
     if host == "127.0.0.1":
         console.print(

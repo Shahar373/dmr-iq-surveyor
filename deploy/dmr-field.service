@@ -1,0 +1,131 @@
+# systemd unit for the dmr-iq-surveyor field web app.
+#
+# This is a TEMPLATE. scripts/install_field_service.sh substitutes the four
+# at-sign-delimited placeholders below and writes the result to
+# /etc/systemd/system/dmr-field.service. Everything else that varies between
+# installs lives in /etc/dmr-field/field.env, not here, so that an update
+# never has to re-edit the unit.
+
+[Unit]
+Description=DMR-IQ Surveyor field web app
+Documentation=https://github.com/Shahar373/dmr-iq-surveyor/blob/main/docs/OPERATIONS.md
+
+# network-online, not network: the app binds one specific address (the Pi's
+# Tailscale address), and network.target does not promise that any address
+# exists yet -- only that the stack is up.
+Wants=network-online.target
+After=network-online.target
+
+# Wants=, not Requires=, for both of these. A Requires= on a unit that is
+# masked, failed or simply not installed refuses to start this service at
+# all, and an operator standing next to the Pi with no Tailscale still needs
+# the app (FIELD_HOST= covers that case). sdrplay.service in particular may
+# not exist under that name on every install -- scripts/pi_soapysdr_setup.sh
+# also pgreps for the daemon -- and a Wants= on a unit that does not exist is
+# silently ignored, which is the behaviour we want.
+Wants=tailscaled.service
+After=tailscaled.service
+Wants=sdrplay.service
+After=sdrplay.service
+
+# These belong in [Unit]; systemd moved them here in v229 and ignores them in
+# [Service]. Raspberry Pi OS bookworm ships systemd 252.
+#
+# The two numbers are chosen against the retry cadence, not picked round.
+# `fieldctl wait-network` waits up to FIELD_TAILSCALE_WAIT (90 s) for a
+# Tailscale address before failing, so a boot where Tailscale is slow, or a
+# field session where it is simply absent, retries on a ~105 s cycle
+# (90 s wait + 15 s RestartSec). At most three of those fit in a 300 s
+# window, so a Pi waiting for its tailnet keeps retrying indefinitely and is
+# never parked in start-limit-hit.
+#
+# A genuinely broken start -- an unreadable token file, a site profile that
+# does not resolve -- exits within a second or two, so its cycle is just
+# RestartSec: five attempts inside 75 s, which trips the limit and stops.
+# That is the distinction the two inequalities in tests/test_deploy_unit.py
+# pin:
+#     StartLimitBurst * (FIELD_TAILSCALE_WAIT + RestartSec) > StartLimitIntervalSec
+#     StartLimitBurst * RestartSec                          < StartLimitIntervalSec
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=@FIELD_USER@
+Group=@FIELD_GROUP@
+# libusb reaches the RSP1A through /dev/bus/usb, whose udev rules grant
+# plugdev.
+SupplementaryGroups=plugdev
+
+# fieldctl passes every path as an absolute one, because band and site names
+# resolve relative to the current directory (survey/profiles.py) and so does
+# the default database path (survey/pipeline.py). WorkingDirectory is set
+# anyway so that anything which does fall back to a relative path lands in
+# the checkout rather than in /.
+WorkingDirectory=@FIELD_WORKDIR@
+
+EnvironmentFile=/etc/dmr-field/field.env
+# Optional local overrides, kept in a second file so an update can replace
+# field.env without discarding them. The leading - means "skip if absent".
+EnvironmentFile=-/etc/dmr-field/field.env.local
+# Without this, rich/typer write the startup banner to a pipe, Python
+# block-buffers it, and nothing reaches the journal until the process exits
+# -- which is precisely when you no longer need it.
+Environment=PYTHONUNBUFFERED=1
+
+ExecStartPre=@FIELDCTL@ wait-network
+ExecStart=@FIELDCTL@ exec
+
+# serve_forever() installs no signal handler: it joins the serving thread and
+# cleans up (shutdown() then server_close(), which is what releases the SDR
+# probe child) only on KeyboardInterrupt. The default SIGTERM would kill the
+# process before any of that runs, so send SIGINT instead.
+KillSignal=SIGINT
+# mixed, so only the main process is signalled. Under the default
+# control-group mode systemd would also SIGINT the probe subprocess directly,
+# racing the parent's own bounded close() rather than letting it reap.
+KillMode=mixed
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=15
+# A clean stop returns 0. A SIGINT that lands during startup -- inside the
+# openssl call that issues a certificate, say -- propagates out of the
+# command and exits 130. Neither is a crash to restart from.
+SuccessExitStatus=130 SIGINT
+# Exit 2 is click's usage error: a flag this unit passes is wrong, and no
+# number of retries will make it right. Exit 1 stays retryable, because it
+# also covers "the state directory is not mounted yet".
+RestartPreventExitStatus=2
+
+StateDirectory=dmr-field
+StateDirectoryMode=0750
+
+# --- hardening that is safe with a USB SDR ---
+NoNewPrivileges=yes
+# full, not strict: /usr, /boot and /efi become read-only while /opt, /var
+# and the state directory stay writable. strict would require an explicit
+# ReadWritePaths for every output path the operator can configure.
+ProtectSystem=full
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+UMask=0077
+
+# --- deliberately NOT set; each of these breaks something real ---
+# PrivateDevices=yes  implies DevicePolicy=closed, which hides /dev/bus/usb.
+#                     libusb then enumerates nothing and every capture fails.
+# DeviceAllow=        any DeviceAllow= line flips DevicePolicy to closed too.
+# ProtectHome=        an operator may point FIELD_OUTPUT at a home directory.
+# PrivateNetwork=     this is a network server.
+# PrivateTmp=         unverified: some SDRplay API builds hand off between
+#                     client and sdrplay_apiService through /tmp or /dev/shm.
+#                     Enable it only after a real capture has been shown to
+#                     still work; see docs/OPERATIONS.md.
+# DynamicUser=        needs a stable uid for plugdev membership and for
+#                     ownership of the state directory.
+
+[Install]
+WantedBy=multi-user.target

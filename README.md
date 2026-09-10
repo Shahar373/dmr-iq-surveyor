@@ -481,6 +481,12 @@ dmr-surveyor geo export map.geojson               # everything, for anything els
 
 ### Field web app
 
+For a Raspberry Pi that should bring the app back by itself after a reboot, install it as a service
+instead of running any of the commands below by hand -- see **[docs/OPERATIONS.md](docs/OPERATIONS.md)**.
+That path binds the Tailscale address rather than every interface, and keeps a token that survives a
+restart so the bookmark on the phone keeps working. The commands here remain exactly as they were,
+for running it by hand.
+
 ```bash
 dmr-surveyor web serve --host 0.0.0.0 --token auto \
   --band central_800_narrow --site mobile --output runs/field

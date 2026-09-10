@@ -7,6 +7,12 @@
 #
 #   bash scripts/pi_soapysdr_setup.sh
 #
+# By default it works on this checkout's own .venv. Pass VENV to point it at
+# a virtualenv somewhere else -- which is what the deployed field service
+# needs, since its virtualenv lives outside the checkout:
+#
+#   sudo VENV=/opt/dmr-field/venv bash scripts/pi_soapysdr_setup.sh
+#
 # It is safe to re-run: every step checks before it acts.
 #
 # The venv step is the one that is easy to miss. Debian's python3-soapysdr
@@ -18,7 +24,12 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV="$REPO_ROOT/.venv"
+# The virtualenv to make SoapySDR importable from. Defaults to this
+# checkout's own .venv, which is what the batch-analysis install uses, but a
+# deployment keeps its virtualenv outside the checkout -- so an explicit
+# VENV must win. Without this the deployment install silently linked into,
+# or failed on, a .venv beside the code that nothing runs from.
+VENV="${VENV:-$REPO_ROOT/.venv}"
 BUILD_DIR="${SOAPY_BUILD_DIR:-$HOME/Projects}"
 
 # Resolved explicitly, NOT via `python3` on PATH: if this script is run with
@@ -87,7 +98,7 @@ else
 fi
 
 say "4/6  Making SoapySDR importable from the project virtualenv"
-[ -d "$VENV" ] || die "no virtualenv at $VENV -- create it first: python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'"
+[ -d "$VENV" ] || die "no virtualenv at $VENV -- create it first: python3 -m venv '$VENV' && '$VENV/bin/pip' install -e '$REPO_ROOT'"
 if "$VENV/bin/python" -c 'import SoapySDR' 2>/dev/null; then
     ok "the venv can already import SoapySDR"
 else
