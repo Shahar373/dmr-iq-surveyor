@@ -683,3 +683,93 @@ def test_two_scoped_solves_in_the_same_second_do_not_collide(tmp_path: Path) -> 
         assert latest_plan(connection, scope=CampaignScope("day2")) is not None
     finally:
         connection.close()
+
+
+# -- the field app's stop list, and what it may do to a stop -----------------
+#
+# `sites_overview`/`geojson`/`plan`/`site_history` all went through `_scope()`
+# in the review that added it. `stops()` and `survey_runs()` are two more
+# reads behind the same `/api/state`, and `set_stop_excluded`/`delete_stop`
+# are two writes reachable from the same screen -- all four were missed, so a
+# session serving one campaign could list, and even exclude or permanently
+# delete, another campaign's stops.
+
+
+def test_the_field_apps_stop_list_does_not_include_another_campaigns_stops(
+    tmp_path: Path,
+) -> None:
+    from dmr_iq_surveyor.web.service import FieldService, FieldSettings
+
+    path = _two_campaigns(tmp_path)
+    materialise_measurements(database_path=path)
+
+    scoped = FieldService(
+        FieldSettings(database_path=path, campaign_id="day1"), probe_runner=lambda **_: None
+    )
+    stop_ids = {row["survey_run_id"] for row in scoped.stops()}
+    run_ids = {row["survey_run_id"] for row in scoped.survey_runs()}
+    assert stop_ids == {f"day1_{i}" for i in range(len(DAY1_STOPS))}
+    assert run_ids == {f"day1_{i}" for i in range(len(DAY1_STOPS))}
+
+    unassigned = FieldService(
+        FieldSettings(database_path=path), probe_runner=lambda **_: None
+    )
+    assert {row["survey_run_id"] for row in unassigned.stops()} == (
+        {f"day1_{i}" for i in range(len(DAY1_STOPS))}
+        | {f"day2_{i}" for i in range(len(DAY2_STOPS))}
+    ), "unscoped behaviour (no --campaign) must stay whole-database"
+
+
+def test_excluding_a_stop_outside_the_apps_campaign_is_refused_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """The refusal has to come before the write. `geo_run_exclusions` has no
+    campaign of its own, so if the exclusion landed and only the *rebuild*
+    afterwards noticed the run was out of scope, the client would see a clean
+    400 while another campaign's stop was quietly excluded underneath it."""
+    from dmr_iq_surveyor.geo.store import run_exclusion
+    from dmr_iq_surveyor.web.service import FieldService, FieldSettings
+
+    path = _two_campaigns(tmp_path)
+    materialise_measurements(database_path=path)
+
+    scoped = FieldService(
+        FieldSettings(database_path=path, campaign_id="day1"), probe_runner=lambda **_: None
+    )
+
+    with pytest.raises(CampaignScopeError):
+        scoped.set_stop_excluded("day2_0", excluded=True, reason="not this session's stop")
+
+    connection = connect_geo_database(path)
+    try:
+        assert run_exclusion(connection, "day2_0") is None
+    finally:
+        connection.close()
+
+    # A stop inside the campaign is unaffected by the refusal above.
+    result = scoped.set_stop_excluded("day1_0", excluded=True, reason="fine")
+    assert result["excluded"] is True
+
+
+def test_deleting_a_stop_outside_the_apps_campaign_is_refused(tmp_path: Path) -> None:
+    from dmr_iq_surveyor.web.service import FieldService, FieldSettings
+
+    path = _two_campaigns(tmp_path)
+    materialise_measurements(database_path=path)
+
+    scoped = FieldService(
+        FieldSettings(database_path=path, campaign_id="day1"), probe_runner=lambda **_: None
+    )
+
+    with pytest.raises(CampaignScopeError):
+        scoped.delete_stop("day2_0")
+
+    assert "day2_0" in _run_ids(path, "day2")
+
+    # An unscoped app (no --campaign) keeps today's behaviour: it may act on
+    # any stop, exactly as before this review.
+    unassigned = FieldService(
+        FieldSettings(database_path=path), probe_runner=lambda **_: None
+    )
+    result = unassigned.delete_stop("day2_0")
+    assert result["existed"] is True

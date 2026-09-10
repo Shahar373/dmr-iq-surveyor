@@ -184,7 +184,13 @@ class HardwareProfile:
 
     @property
     def declares_gain(self) -> bool:
-        return self.if_gain_reduction_db is not None or self.lna_state is not None
+        # Mirrors `SiteProfile.is_gain_comparable`: `lna_state` alone sets the
+        # noise figure ahead of the IF stage, it does not answer "what was
+        # the gain" -- `if_gain_reduction_db` is the one field every gain
+        # reader (`if_gain_reading`) actually compares across runs. A profile
+        # that names only `lna_state` has not declared a gain, and must not
+        # suppress the "not gain-comparable" warning.
+        return self.if_gain_reduction_db is not None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

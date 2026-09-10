@@ -594,6 +594,7 @@ class FieldService:
         self.devices.close()
 
     def survey_runs(self, limit: int = 25) -> list[dict[str, Any]]:
+        predicate, parameters = self._scope().where("r")
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
             rows = connection.execute(
@@ -603,10 +604,13 @@ class FieldService:
                        (SELECT COUNT(*) FROM rf_observations o
                         WHERE o.survey_run_id = r.survey_run_id) AS observation_count
                 FROM survey_runs r
+                """
+                + (f"WHERE {predicate} " if predicate else "")
+                + """
                 ORDER BY COALESCE(capture_start_utc, imported_at) DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (*parameters, limit),
             ).fetchall()
         finally:
             connection.close()
@@ -700,7 +704,14 @@ class FieldService:
         return {"site_key": site_key, "history": history}
 
     def stops(self) -> list[dict[str, Any]]:
-        """Every stop, with whether it is contributing and why not."""
+        """Every stop in this app's campaign, with whether it is contributing
+        and why not.
+
+        Scoped like every other read here: a session serving one campaign
+        must not list -- and, through `set_stop_excluded`/`delete_stop`,
+        must not be able to touch -- another campaign's stops.
+        """
+        predicate, parameters = self._scope().where("r")
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
             rows = connection.execute(
@@ -718,8 +729,12 @@ class FieldService:
                        (SELECT reason FROM geo_run_exclusions e
                         WHERE e.survey_run_id = r.survey_run_id) AS exclusion_reason
                 FROM survey_runs r LEFT JOIN sites s ON s.site_id = r.site_id
-                ORDER BY COALESCE(r.capture_start_utc, r.imported_at) DESC
                 """
+                + (f"WHERE {predicate} " if predicate else "")
+                + """
+                ORDER BY COALESCE(r.capture_start_utc, r.imported_at) DESC
+                """,
+                parameters,
             ).fetchall()
         finally:
             connection.close()
@@ -740,6 +755,10 @@ class FieldService:
                 "SELECT COUNT(*) AS n FROM survey_runs WHERE survey_run_id = ?", (run_id,)
             ).fetchone()["n"] == 0:
                 raise ValueError(f"unknown stop: {run_id}")
+            # Checked before either write below: a stop outside this app's
+            # campaign is refused, not silently excluded/included then
+            # reported as a failure after the exclusion already landed.
+            self._scope().narrow(connection, [run_id])
             if excluded:
                 exclude_run(
                     connection, run_id, reason or "excluded by the operator in the field"
@@ -757,9 +776,19 @@ class FieldService:
         return {"survey_run_id": run_id, "excluded": current is not None, "reason": current or ""}
 
     def delete_stop(self, run_id: str) -> dict[str, Any]:
-        """Remove a stop entirely, including its observations."""
+        """Remove a stop entirely, including its observations.
+
+        `delete_survey_run` itself has no notion of a campaign, so the check
+        has to happen here: a session serving one campaign must not be able
+        to delete another campaign's evidence through this endpoint.
+        """
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
+            if connection.execute(
+                "SELECT COUNT(*) AS n FROM survey_runs WHERE survey_run_id = ?", (run_id,)
+            ).fetchone()["n"] == 0:
+                raise ValueError(f"unknown stop: {run_id}")
+            self._scope().narrow(connection, [run_id])
             result = delete_survey_run(connection, run_id)
         finally:
             connection.close()

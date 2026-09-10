@@ -79,6 +79,25 @@ def test_a_valid_hardware_profile_parses(tmp_path: Path) -> None:
     assert profile.declares_gain
 
 
+def test_lna_state_alone_does_not_declare_a_gain() -> None:
+    """`declares_gain` gates `run_survey`'s "not gain-comparable" warning
+    (see `survey/pipeline.py`). `lna_state` sets the noise figure ahead of
+    the IF stage -- it answers a different question from `gain` -- so a
+    profile that names only `lna_state` has not declared the value every
+    gain reader (`if_gain_reading`) actually compares across runs, and must
+    not silently suppress that warning."""
+    lna_only = HardwareProfile(hardware_id="field", label="Field", lna_state=4)
+    assert not lna_only.declares_gain
+
+    gain_only = HardwareProfile(hardware_id="field", label="Field", if_gain_reduction_db=33.0)
+    assert gain_only.declares_gain
+
+    both = HardwareProfile(
+        hardware_id="field", label="Field", if_gain_reduction_db=33.0, lna_state=4
+    )
+    assert both.declares_gain
+
+
 def test_an_unknown_key_is_an_error_not_a_silent_no_op(tmp_path: Path) -> None:
     """A misspelled setting is one an operator believes is in force when it
     is not -- the same rule band and site profiles have always had."""
