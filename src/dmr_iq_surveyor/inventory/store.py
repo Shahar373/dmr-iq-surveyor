@@ -8,6 +8,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from dmr_iq_surveyor.project.binding import ProjectBinding, active_binding
+from dmr_iq_surveyor.project.claim import assert_claim, require_existing_database
+from dmr_iq_surveyor.project.manifest import ProjectError
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS runs (
@@ -108,11 +112,56 @@ def _ensure_column(
         )
 
 
+def _guarded_destination(path: str | Path, binding: ProjectBinding) -> Path:
+    """The one database a bound process may open, or `ProjectError`.
+
+    Both checks happen before anything is created. `Path.resolve()` does
+    not touch the filesystem, and `require_existing_database` reads a
+    header rather than connecting, so a project-aware path cannot bring a
+    database into existence however wrong it is.
+    """
+    requested = Path(path).expanduser().resolve()
+    if requested != binding.database:
+        raise ProjectError(
+            f"this process is bound to project {binding.project_id!r} and its database "
+            f"{binding.database}; it will not open {requested}"
+        )
+    return require_existing_database(requested)
+
+
 def connect_database(path: str | Path) -> sqlite3.Connection:
-    destination = Path(path).expanduser().resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    """Open the shared database, applying the Phase 5 schema.
+
+    With no project bound this behaves exactly as it always has, creating
+    the directories and the file when they are not there. Every existing
+    invocation depends on that, so it is left alone.
+
+    With a project bound -- which only a project-aware entry point does --
+    the path must be that project's database, must already exist, and must
+    already carry that project's claim. This is the single place in the
+    codebase that calls `sqlite3.connect`, so one check here covers every
+    direct and indirect open: the field app's `/api/state`, `run_survey`,
+    `materialise_measurements`, `solve_all_sites` and the live drive alike.
+    """
+    binding = active_binding()
+    if binding is None:
+        destination = Path(path).expanduser().resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        destination = _guarded_destination(path, binding)
     connection = sqlite3.connect(destination)
     connection.row_factory = sqlite3.Row
+    if binding is not None:
+        # Before the first DDL statement. A database that fails the guard
+        # must not be written to at all, not even by a schema statement
+        # that would have been a no-op.
+        try:
+            assert_claim(
+                connection, project_id=binding.project_id, analyzer=binding.analyzer
+            )
+        except BaseException:
+            connection.close()
+            raise
     connection.executescript(SCHEMA)
     _ensure_column(
         connection,

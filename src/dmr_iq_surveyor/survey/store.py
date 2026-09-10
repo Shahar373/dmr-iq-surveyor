@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from dmr_iq_surveyor.inventory.store import connect_database
+from dmr_iq_surveyor.project.claim import CLAIM_SCHEMA
 from dmr_iq_surveyor.survey.discovery import RfObservation
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
 from dmr_iq_surveyor.survey.provenance import normalise_campaign_id, normalise_hardware
@@ -161,6 +162,11 @@ def connect_survey_database(path: str | Path) -> sqlite3.Connection:
     the survey tables exist. Never touches the pre-existing DMR tables."""
     connection = connect_database(path)
     connection.executescript(SURVEY_SCHEMA)
+    # The table that lets a database say which project it belongs to.
+    # Creating it claims nothing: an empty `project_meta` is exactly
+    # today's unclaimed database, and every command that does not name a
+    # project ignores it entirely.
+    connection.executescript(CLAIM_SCHEMA)
     # A pre-existing survey_runs table (created before GPS support was
     # added) needs these columns added in place -- CREATE TABLE IF NOT
     # EXISTS above is a no-op on an already-created table.

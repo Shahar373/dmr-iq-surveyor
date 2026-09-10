@@ -1,0 +1,262 @@
+"""The claim a database carries, and the checks that must happen before one is
+opened at all.
+
+Two facts drive this module, both measured on this codebase:
+
+  * `sqlite3.connect` does not read a database, it *manufactures* one. Opening
+    a mistyped path creates the directories, the file, all four schema layers
+    and commits them -- about 180 KB of empty database on a path that never
+    existed. So a project-aware caller must decide whether a file is a database
+    BEFORE it opens anything, which is what `inspect_database` is for: it reads
+    sixteen bytes and connects to nothing.
+  * an existing empty file is opened and fully schema'd without complaint, so
+    "the file exists" is not evidence that it is a project database. Size and
+    header are.
+
+The claim itself is one typed row with a singleton constraint, so a partial or
+duplicated claim cannot exist -- SQLite refuses both rather than this module
+having to check for them.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import tempfile
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+from dmr_iq_surveyor import __version__
+from dmr_iq_surveyor.project.manifest import MANIFEST_SCHEMA_VERSION, ProjectError
+
+SQLITE_HEADER = b"SQLite format 3\x00"
+
+CLAIM_TABLE = "project_meta"
+
+# Applied by `survey.store.connect_survey_database` with the rest of the survey
+# schema. `CHECK (id = 1)` is what makes a second claim impossible, and NOT NULL
+# on every column is what makes a partial one impossible; both are enforced by
+# SQLite rather than by code that could be bypassed.
+CLAIM_SCHEMA = """
+CREATE TABLE IF NOT EXISTS project_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    project_id TEXT NOT NULL,
+    analyzer TEXT NOT NULL,
+    manifest_schema_version INTEGER NOT NULL,
+    claimed_at TEXT NOT NULL,
+    claimed_by_version TEXT NOT NULL
+);
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class DatabaseFile:
+    """What can be known about a path without opening it as a database."""
+
+    path: Path
+    exists: bool
+    size_bytes: int
+    is_sqlite: bool
+    reason: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return not self.reason
+
+
+def inspect_database(path: str | Path) -> DatabaseFile:
+    """Decide what a path is, without connecting to it.
+
+    Connecting is the thing that would create it, so this reads the header and
+    nothing else. Every refusal carries the sentence an operator needs.
+    """
+    resolved = Path(path).expanduser().resolve()
+    if resolved.is_dir():
+        return DatabaseFile(resolved, True, 0, False, f"{resolved} is a directory, not a database")
+    if not resolved.exists():
+        return DatabaseFile(
+            resolved,
+            False,
+            0,
+            False,
+            f"no database at {resolved}. A project never creates one by opening it; "
+            "use `dmr-surveyor project init --create` to make a new one, or "
+            "`--adopt` to take on an existing one",
+        )
+    try:
+        size = resolved.stat().st_size
+        header = resolved.open("rb").read(len(SQLITE_HEADER))
+    except OSError as exc:
+        return DatabaseFile(resolved, True, 0, False, f"{resolved} could not be read: {exc}")
+    if size == 0:
+        return DatabaseFile(
+            resolved,
+            True,
+            0,
+            False,
+            f"{resolved} is an empty file. An empty file and a mistyped path look the same, "
+            "so it is refused rather than filled in",
+        )
+    if header != SQLITE_HEADER:
+        return DatabaseFile(resolved, True, size, False, f"{resolved} is not a SQLite database")
+    return DatabaseFile(resolved, True, size, True)
+
+
+def require_existing_database(path: str | Path) -> Path:
+    """The path, or `ProjectError`. Creates nothing, ever."""
+    found = inspect_database(path)
+    if not found.usable:
+        raise ProjectError(found.reason)
+    return found.path
+
+
+@dataclass(frozen=True, slots=True)
+class Claim:
+    project_id: str
+    analyzer: str
+    manifest_schema_version: int
+    claimed_at: str
+    claimed_by_version: str
+
+
+def read_claim(connection: sqlite3.Connection) -> Claim | None:
+    """The claim this database carries, or `None` if it carries none.
+
+    Defensive about the table's absence, the same way
+    `reference/store.py::_site_ids_with_measurements` is: a database written
+    before this table existed simply has no claim, which is a fact about it
+    rather than an error.
+    """
+    try:
+        row = connection.execute(
+            "SELECT project_id, analyzer, manifest_schema_version, claimed_at, claimed_by_version "
+            f"FROM {CLAIM_TABLE} WHERE id = 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    values = tuple(row)
+    return Claim(
+        project_id=str(values[0]),
+        analyzer=str(values[1]),
+        manifest_schema_version=int(values[2]),
+        claimed_at=str(values[3]),
+        claimed_by_version=str(values[4]),
+    )
+
+
+def assert_claim(connection: sqlite3.Connection, *, project_id: str, analyzer: str) -> Claim:
+    """Refuse to go on unless this database is the one it was asked to be.
+
+    Both fields are compared. A database claimed by the right project but read
+    by the wrong analyzer would be interpreted under rules it was not written
+    under, which is the same failure as opening the wrong file.
+    """
+    claim = read_claim(connection)
+    if claim is None:
+        raise ProjectError(
+            "this database carries no project claim. Run "
+            "`dmr-surveyor project init --adopt` to take it on deliberately; "
+            "nothing here will claim it by opening it"
+        )
+    if claim.project_id != project_id or claim.analyzer != analyzer:
+        raise ProjectError(
+            f"this database is claimed by project {claim.project_id!r} "
+            f"(analyzer {claim.analyzer!r}), but {project_id!r} (analyzer {analyzer!r}) "
+            "was asked for"
+        )
+    return claim
+
+
+def write_claim(
+    connection: sqlite3.Connection,
+    *,
+    project_id: str,
+    analyzer: str,
+    manifest_schema_version: int = MANIFEST_SCHEMA_VERSION,
+) -> Claim:
+    """Claim this database for a project, in one transaction.
+
+    Idempotent: an identical claim already present is left exactly as it was,
+    timestamp included, so re-running adoption does not rewrite history. A
+    different claim is refused rather than replaced.
+    """
+    # Close any implicit transaction left open by schema work, so the explicit
+    # one below is the only one in flight.
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        existing = read_claim(connection)
+        if existing is not None:
+            if existing.project_id != project_id or existing.analyzer != analyzer:
+                raise ProjectError(
+                    f"this database is already claimed by project {existing.project_id!r} "
+                    f"(analyzer {existing.analyzer!r}); it cannot be re-claimed as "
+                    f"{project_id!r} (analyzer {analyzer!r})"
+                )
+            connection.commit()
+            return existing
+        claim = Claim(
+            project_id=project_id,
+            analyzer=analyzer,
+            manifest_schema_version=manifest_schema_version,
+            claimed_at=datetime.now(UTC).isoformat(),
+            claimed_by_version=__version__,
+        )
+        connection.execute(
+            f"INSERT INTO {CLAIM_TABLE}(id, project_id, analyzer, manifest_schema_version, "
+            "claimed_at, claimed_by_version) VALUES (1, ?, ?, ?, ?, ?)",
+            (
+                claim.project_id,
+                claim.analyzer,
+                claim.manifest_schema_version,
+                claim.claimed_at,
+                claim.claimed_by_version,
+            ),
+        )
+        connection.commit()
+        return claim
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def write_manifest_atomically(path: str | Path, text: str) -> Path:
+    """Write a manifest so a reader never sees a half-written one.
+
+    A temporary sibling, flushed and fsynced, then `os.replace`, which is
+    atomic within a filesystem. A failure anywhere leaves the original exactly
+    as it was and removes the temporary.
+    """
+    destination = Path(path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(
+        dir=destination.parent, prefix=f"{destination.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+    return destination
+
+
+__all__ = [
+    "CLAIM_SCHEMA",
+    "CLAIM_TABLE",
+    "SQLITE_HEADER",
+    "Claim",
+    "DatabaseFile",
+    "assert_claim",
+    "inspect_database",
+    "read_claim",
+    "require_existing_database",
+    "write_claim",
+    "write_manifest_atomically",
+]
