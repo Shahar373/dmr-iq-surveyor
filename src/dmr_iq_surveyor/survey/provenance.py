@@ -553,6 +553,70 @@ def lna_state_reading(hardware: Any, site_row: Any | None = None) -> Reading:
     return Reading(_as_lna_index(reading.value), reading.source)
 
 
+@dataclass(frozen=True, slots=True)
+class ReceiverSettings:
+    """What one run's receiver was set to, each half with its own evidence."""
+
+    survey_run_id: str
+    if_gain_reduction: Reading
+    lna_state: Reading
+
+    @property
+    def sources(self) -> tuple[str, str]:
+        return self.if_gain_reduction.source, self.lna_state.source
+
+    @property
+    def from_legacy_site_row(self) -> bool:
+        """True when a value could only be had from the mutable `sites` row."""
+        return SOURCE_DECLARED_SITE_ROW in self.sources
+
+
+def receiver_settings(row: Any) -> ReceiverSettings:
+    """Resolve one run's receiver settings from the row that holds them.
+
+    THE resolver. Every reader of a run's gain goes through here, so there is
+    one precedence and one set of labels rather than a ladder per caller:
+
+        applied -> requested -> declared -> the legacy `sites` row
+
+    `applied` means the radio reported the value back; nothing else may ever
+    be labelled that way. `declared` is the operator's own claim, snapshotted
+    into the run when it was recorded, so editing a profile afterwards cannot
+    rewrite what a run appears to have been taken with.
+
+    The `sites` row is last and labelled apart because it is *current state*:
+    `upsert_site` rewrites it on every run, so it describes the profile as it
+    stands now, not as it stood for the run being read. It is offered only
+    when the run's own blob says nothing at all -- which is exactly the case
+    of a row written before runs carried their own declaration. A run WITH
+    provenance never falls through to it.
+
+    `row` needs `survey_run_id` and `hardware_json`; `gain` and `lna_state`
+    are consulted only if the caller joined them in, and their absence simply
+    removes the legacy tier.
+    """
+    hardware = load_hardware(_column(row, "hardware_json"))
+    return ReceiverSettings(
+        survey_run_id=str(_column(row, "survey_run_id")),
+        if_gain_reduction=if_gain_reading(hardware, site_row=_column(row, "gain")),
+        lna_state=lna_state_reading(hardware, site_row=_column(row, "lna_state")),
+    )
+
+
+def _column(row: Any, name: str) -> Any:
+    """One column, or `None` when the caller did not select it.
+
+    `sqlite3.Row` raises `IndexError` for a column that is not in the query
+    rather than returning `None`, and a mapping raises `KeyError`; both mean
+    the same thing here -- the caller did not ask for it, so that tier of
+    evidence is simply not available.
+    """
+    try:
+        return row[name]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
 def identity_value(hardware: Any, key: str) -> Any | None:
     """A value from the `identity` bucket, or `None`.
 
@@ -581,6 +645,7 @@ __all__ = [
     "GAIN_ELEMENT_RF",
     "HARDWARE_SCHEMA_VERSION",
     "NOT_RECORDED",
+    "ReceiverSettings",
     "SOURCE_APPLIED",
     "SOURCE_DECLARED",
     "SOURCE_DECLARED_SITE_ROW",
@@ -604,6 +669,7 @@ __all__ = [
     "load_hardware",
     "normalise_campaign_id",
     "normalise_hardware",
+    "receiver_settings",
     "requested_bucket",
     "with_declared",
 ]

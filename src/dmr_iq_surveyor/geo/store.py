@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from dmr_iq_surveyor.reference.store import connect_reference_database
+from dmr_iq_surveyor.survey.scope import WHOLE_DATABASE, CampaignScope
 
 GEO_SCHEMA = """
 CREATE TABLE IF NOT EXISTS geo_measurements (
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS geo_solutions (
     geojson TEXT NOT NULL DEFAULT '{}',
     input_run_ids_json TEXT NOT NULL DEFAULT '[]',
     tool_version TEXT NOT NULL,
+    campaign_id TEXT,
     UNIQUE(solve_batch_id, p25_site_id)
 );
 CREATE INDEX IF NOT EXISTS idx_geo_solutions_site
@@ -94,7 +96,8 @@ CREATE TABLE IF NOT EXISTS geo_plans (
     status TEXT NOT NULL,
     reason TEXT NOT NULL DEFAULT '',
     plan_json TEXT NOT NULL DEFAULT '{}',
-    geojson TEXT NOT NULL DEFAULT '{}'
+    geojson TEXT NOT NULL DEFAULT '{}',
+    campaign_id TEXT
 );
 CREATE TABLE IF NOT EXISTS geo_run_exclusions (
     survey_run_id TEXT PRIMARY KEY REFERENCES survey_runs(survey_run_id) ON DELETE CASCADE,
@@ -126,6 +129,17 @@ def connect_geo_database(path: str | Path) -> sqlite3.Connection:
         connection.execute(
             "ALTER TABLE geo_solutions ADD COLUMN fit_status TEXT NOT NULL DEFAULT 'unknown'"
         )
+    # Which campaign a solve was scoped to. NULL means the solve read the
+    # whole database, which is what every solve before this column did and
+    # what an unscoped solve still does. It is deliberately NOT backfilled
+    # from `input_run_ids_json`: a batch that happens to contain only one
+    # campaign's runs was still solved against every run in the file, and
+    # labelling it afterwards would claim a boundary that was never applied.
+    if "campaign_id" not in solution_columns:
+        connection.execute("ALTER TABLE geo_solutions ADD COLUMN campaign_id TEXT")
+    plan_columns = {row[1] for row in connection.execute("PRAGMA table_info(geo_plans)")}
+    if "campaign_id" not in plan_columns:
+        connection.execute("ALTER TABLE geo_plans ADD COLUMN campaign_id TEXT")
     connection.commit()
     return connection
 
@@ -136,10 +150,11 @@ def store_plan(
     solve_batch_id: str,
     plan: dict[str, Any],
     geojson: dict[str, Any],
+    campaign_id: str | None = None,
 ) -> None:
     connection.execute(
         "INSERT OR REPLACE INTO geo_plans(solve_batch_id, created_at, status, reason, "
-        "plan_json, geojson) VALUES (?, ?, ?, ?, ?, ?)",
+        "plan_json, geojson, campaign_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             solve_batch_id,
             datetime.now(UTC).isoformat(),
@@ -147,16 +162,31 @@ def store_plan(
             plan.get("reason", ""),
             json.dumps(plan),
             json.dumps(geojson),
+            campaign_id,
         ),
     )
     connection.commit()
 
 
-def latest_plan(connection: sqlite3.Connection) -> dict[str, Any] | None:
-    """The most recent plan, by insertion order rather than by clock."""
-    row = connection.execute(
-        "SELECT * FROM geo_plans ORDER BY rowid DESC LIMIT 1"
-    ).fetchone()
+def latest_plan(
+    connection: sqlite3.Connection, *, scope: CampaignScope = WHOLE_DATABASE
+) -> dict[str, Any] | None:
+    """The most recent plan, by insertion order rather than by clock.
+
+    Scoped, this is the most recent plan *this campaign* produced. A plan
+    written by an unscoped solve carries no campaign and is not offered as
+    one campaign's next stop, because it was computed from every run in the
+    file -- including rounds this one is meant to be separate from.
+    """
+    if scope.is_whole_database:
+        row = connection.execute(
+            "SELECT * FROM geo_plans ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    else:
+        row = connection.execute(
+            "SELECT * FROM geo_plans WHERE campaign_id = ? ORDER BY rowid DESC LIMIT 1",
+            (scope.campaign_id,),
+        ).fetchone()
     return dict(row) if row is not None else None
 
 
@@ -278,32 +308,47 @@ def replace_run_measurements(
 
 
 def fetch_site_measurements(
-    connection: sqlite3.Connection, p25_site_id: int, *, usable_only: bool = True
+    connection: sqlite3.Connection,
+    p25_site_id: int,
+    *,
+    usable_only: bool = True,
+    scope: CampaignScope = WHOLE_DATABASE,
 ) -> list[dict[str, Any]]:
+    # A measurement carries no campaign of its own; the run that produced it
+    # does. The join is what makes `survey_runs.campaign_id` the one place
+    # the fact lives, so a run reassigned there is reassigned everywhere.
+    predicate, parameters = scope.where("r")
     query = """
         SELECT m.*, s.site_key
         FROM geo_measurements m
         JOIN p25_sites s ON s.p25_site_id = m.p25_site_id
+        JOIN survey_runs r ON r.survey_run_id = m.survey_run_id
         WHERE m.p25_site_id = ?
     """
     if usable_only:
         query += " AND m.usability = 'usable'"
+    if predicate:
+        query += f" AND {predicate}"
     query += " ORDER BY COALESCE(m.capture_start_utc, m.created_at) ASC"
-    return [dict(row) for row in connection.execute(query, (p25_site_id,))]
-
-
-def fetch_all_measurements(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     return [
-        dict(row)
-        for row in connection.execute(
-            """
-            SELECT m.*, s.site_key
-            FROM geo_measurements m
-            JOIN p25_sites s ON s.p25_site_id = m.p25_site_id
-            ORDER BY m.p25_site_id, COALESCE(m.capture_start_utc, m.created_at)
-            """
-        )
+        dict(row) for row in connection.execute(query, (p25_site_id, *parameters))
     ]
+
+
+def fetch_all_measurements(
+    connection: sqlite3.Connection, *, scope: CampaignScope = WHOLE_DATABASE
+) -> list[dict[str, Any]]:
+    predicate, parameters = scope.where("r")
+    query = """
+        SELECT m.*, s.site_key
+        FROM geo_measurements m
+        JOIN p25_sites s ON s.p25_site_id = m.p25_site_id
+        JOIN survey_runs r ON r.survey_run_id = m.survey_run_id
+    """
+    if predicate:
+        query += f" WHERE {predicate}"
+    query += " ORDER BY m.p25_site_id, COALESCE(m.capture_start_utc, m.created_at)"
+    return [dict(row) for row in connection.execute(query, parameters)]
 
 
 def store_solution(
@@ -322,8 +367,8 @@ def store_solution(
             area_km2_50, area_km2_90, path_loss_exponent, reference_level_db,
             level_metric, residual_rms_db, fit_status, azimuth_span_deg, warnings_json,
             settings_json, diagnostics_json, residuals_json, geojson,
-            input_run_ids_json, tool_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            input_run_ids_json, tool_version, campaign_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             solve_batch_id,
@@ -355,12 +400,15 @@ def store_solution(
             json.dumps(row.get("geojson", {})),
             json.dumps(row.get("input_run_ids", [])),
             row["tool_version"],
+            row.get("campaign_id"),
         ),
     )
     connection.commit()
 
 
-def latest_solutions(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+def latest_solutions(
+    connection: sqlite3.Connection, *, scope: CampaignScope = WHOLE_DATABASE
+) -> list[dict[str, Any]]:
     """The most recent solution per site.
 
     History is kept deliberately -- watching a site's region shrink across
@@ -374,35 +422,57 @@ def latest_solutions(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     Ranking on that string showed a superseded solution and, when two solves
     landed in the same second, returned the same site twice.
     """
+    # Scoped, both the outer row and the "which is latest" subquery are
+    # narrowed. Narrowing only the outer one would rank this campaign's
+    # solutions against another campaign's and then find none of them
+    # current, reporting a site as unsolved that this campaign had solved.
+    if scope.is_whole_database:
+        condition, parameters = "", ()
+    else:
+        condition, parameters = " AND g.campaign_id = ?", (scope.campaign_id,)
+    inner = (
+        "" if scope.is_whole_database else " AND inner_solution.campaign_id = ?"
+    )
+    inner_parameters = () if scope.is_whole_database else (scope.campaign_id,)
     rows = connection.execute(
-        """
+        f"""
         SELECT g.*, s.site_key, s.rfss, s.site, s.observation_status
         FROM geo_solutions g
         JOIN p25_sites s ON s.p25_site_id = g.p25_site_id
         WHERE g.geo_solution_id = (
             SELECT MAX(inner_solution.geo_solution_id)
             FROM geo_solutions inner_solution
-            WHERE inner_solution.p25_site_id = g.p25_site_id
-        )
+            WHERE inner_solution.p25_site_id = g.p25_site_id{inner}
+        ){condition}
         ORDER BY s.rfss, s.site
-        """
+        """,
+        (*inner_parameters, *parameters),
     ).fetchall()
     return [dict(row) for row in rows]
 
 
-def solution_history(connection: sqlite3.Connection, p25_site_id: int) -> list[dict[str, Any]]:
+def solution_history(
+    connection: sqlite3.Connection,
+    p25_site_id: int,
+    *,
+    scope: CampaignScope = WHOLE_DATABASE,
+) -> list[dict[str, Any]]:
+    if scope.is_whole_database:
+        condition, parameters = "", ()
+    else:
+        condition, parameters = " AND campaign_id = ?", (scope.campaign_id,)
     return [
         dict(row)
         for row in connection.execute(
-            """
+            f"""
             SELECT solve_batch_id, solved_at, status, detection_count,
                    non_detection_count, area_km2_50, area_km2_90,
                    mode_latitude, mode_longitude
             FROM geo_solutions
-            WHERE p25_site_id = ?
+            WHERE p25_site_id = ?{condition}
             ORDER BY geo_solution_id ASC
             """,
-            (p25_site_id,),
+            (p25_site_id, *parameters),
         )
     ]
 

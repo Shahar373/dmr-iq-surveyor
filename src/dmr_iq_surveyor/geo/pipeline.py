@@ -54,6 +54,8 @@ from dmr_iq_surveyor.inspection import write_json
 from dmr_iq_surveyor.reference.p25_sites import load_p25_site_csv
 from dmr_iq_surveyor.reference.store import import_snapshot, list_sites
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
+from dmr_iq_surveyor.survey.provenance import Reading, receiver_settings
+from dmr_iq_surveyor.survey.scope import WHOLE_DATABASE, CampaignScope
 
 METHOD = "bayesian_grid_log_distance"
 
@@ -131,24 +133,37 @@ def materialise_measurements(
     database_path: str | Path | None = None,
     run_ids: Sequence[str] | None = None,
     settings: MeasurementSettings | None = None,
+    scope: CampaignScope = WHOLE_DATABASE,
 ) -> dict[str, Any]:
     """Rebuild geolocation measurements for the given runs (all, by default).
 
     Rebuilding rather than appending is deliberate: a corrected reference
     import can turn an ambiguous frequency into an attributable one, and
     stale rows would keep the old verdict alive.
+
+    `scope` decides which runs exist as far as this rebuild is concerned --
+    both the runs rebuilt and, more consequentially, the population the
+    reference gain and noise floor are taken from. Unscoped that population
+    is every run in the file, exactly as before.
     """
     resolved = settings or MeasurementSettings()
     resolved.validate()
     connection = connect_geo_database(_database(database_path))
     try:
+        predicate, parameters = scope.where("survey_runs")
         every_run = [
             str(row["survey_run_id"])
             for row in connection.execute(
-                "SELECT survey_run_id FROM survey_runs ORDER BY "
-                "COALESCE(capture_start_utc, imported_at) ASC"
+                "SELECT survey_run_id FROM survey_runs"
+                + (f" WHERE {predicate}" if predicate else "")
+                + " ORDER BY COALESCE(capture_start_utc, imported_at) ASC",
+                parameters,
             )
         ]
+        # A run the caller named that is outside the campaign is refused
+        # rather than dropped: a rebuild that silently skipped a stop the
+        # operator asked for would report success over work it never did.
+        run_ids = scope.narrow(connection, run_ids)
         if run_ids is None:
             run_ids = every_run
         # The reference gain and noise floor are the CAMPAIGN's, whichever
@@ -156,7 +171,16 @@ def materialise_measurements(
         # the field app's one-run-at-a-time rebuild compare each stop with
         # itself, so a stop recorded at the wrong gain was never flagged
         # until someone ran a full `geo measurements` by hand.
-        campaign_gains = _campaign_gains(connection, every_run)
+        #
+        # With a campaign given, "the campaign" now means that campaign
+        # rather than the whole file: a second round recorded at a different
+        # gain no longer drags the first round's reference with it.
+        campaign_readings = _campaign_gain_readings(connection, every_run)
+        gain_sources = _campaign_gain_sources(campaign_readings)
+        campaign_gains = {
+            run_id: (None if reading.value is None else float(reading.value))
+            for run_id, reading in campaign_readings.items()
+        }
         reference_gain = _modal_gain(campaign_gains)
         campaign_noise = _campaign_noise_floors(connection, every_run)
         reference_noise = _median_noise_floor(campaign_noise)
@@ -183,7 +207,9 @@ def materialise_measurements(
         "run_count": len(per_run),
         "summary": summarise(total),
         "settings": resolved.to_dict(),
+        "campaign_id": scope.campaign_id,
         "reference_gain": reference_gain,
+        "reference_gain_sources": gain_sources,
         "gain_drift_runs": drifted,
         "reference_noise_floor_dbfs_per_hz": reference_noise,
         "noise_floor_by_run": noise_floors,
@@ -246,18 +272,56 @@ def _flag_noise_floor_shift(
 
 
 def _campaign_gains(connection: Any, run_ids: Sequence[str]) -> dict[str, float | None]:
+    """The IF gain each run was recorded at, resolved with its provenance.
+
+    This used to read `sites.gain` and nothing else. That column is one
+    mutable row per site profile which `upsert_site` rewrites on every run,
+    so a campaign whose stops all share one profile saw the *current* gain
+    attributed to every past stop -- the drift check compared each run with
+    a value none of them may have been taken at, and a run that really did
+    differ was invisible whenever it happened to be the last one written.
+
+    Every run now answers from its own `hardware_json` through the single
+    resolver in `survey/provenance.py`: applied, else requested, else the
+    declaration snapshotted into the run. `sites.gain` is still offered, but
+    only to a run whose blob is empty -- a row written before runs carried
+    their own declaration -- and `_campaign_gain_sources` reports when that
+    happened, so a number resting on the mutable row is never mistaken for
+    one the run recorded.
+    """
+    return {
+        run_id: (None if reading.value is None else float(reading.value))
+        for run_id, reading in _campaign_gain_readings(connection, run_ids).items()
+    }
+
+
+def _campaign_gain_readings(connection: Any, run_ids: Sequence[str]) -> dict[str, Reading]:
     rows = connection.execute(
         """
-        SELECT r.survey_run_id, s.gain
+        SELECT r.survey_run_id, r.hardware_json, s.gain, s.lna_state
         FROM survey_runs r LEFT JOIN sites s ON s.site_id = r.site_id
         """
     ).fetchall()
     wanted = set(run_ids)
-    return {
-        str(row["survey_run_id"]): (None if row["gain"] is None else float(row["gain"]))
-        for row in rows
-        if str(row["survey_run_id"]) in wanted
-    }
+    readings: dict[str, Reading] = {}
+    for row in rows:
+        run_id = str(row["survey_run_id"])
+        if run_id not in wanted:
+            continue
+        readings[run_id] = receiver_settings(row).if_gain_reduction
+    return readings
+
+
+def _campaign_gain_sources(readings: dict[str, Reading]) -> dict[str, int]:
+    """How many runs each tier of evidence accounted for.
+
+    Reported so a reference gain built mostly out of the legacy `sites` row
+    is visible as such rather than reading like measured fact.
+    """
+    counts: dict[str, int] = {}
+    for reading in readings.values():
+        counts[reading.source] = counts.get(reading.source, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _modal_gain(gains: dict[str, float | None]) -> float | None:
@@ -529,7 +593,9 @@ def _build_plan(
     return plan
 
 
-def runs_with_stale_exclusions(connection: Any) -> list[str]:
+def runs_with_stale_exclusions(
+    connection: Any, *, scope: CampaignScope = WHOLE_DATABASE
+) -> list[str]:
     """Runs whose stored measurements no longer agree with their exclusion.
 
     A measurement row carries the verdict that was true when it was built.
@@ -539,23 +605,40 @@ def runs_with_stale_exclusions(connection: Any) -> list[str]:
     reads the row. Left alone, a superseded bin kept counting beside its
     replacement: exactly the double evidence the supersede exists to prevent.
     The reverse holds for an exclusion that was lifted.
+
+    Scoped, this returns only stale runs inside the campaign. That matters
+    more than it looks: the caller feeds the result straight back into a
+    rebuild, so an unscoped answer would pull another round's runs into a
+    campaign-scoped solve through the back door.
     """
+    predicate, parameters = scope.where("r")
+    join = " JOIN survey_runs r ON r.survey_run_id = e.survey_run_id" if predicate else ""
     exclusions = {
         str(row["survey_run_id"]): str(row["scope"])
-        for row in connection.execute("SELECT survey_run_id, scope FROM geo_run_exclusions")
+        for row in connection.execute(
+            f"SELECT e.survey_run_id, e.scope FROM geo_run_exclusions e{join}"
+            + (f" WHERE {predicate}" if predicate else ""),
+            parameters,
+        )
     }
+    measurement_join = (
+        " JOIN survey_runs r ON r.survey_run_id = m.survey_run_id" if predicate else ""
+    )
     stale: set[str] = set()
     for row in connection.execute(
-        "SELECT DISTINCT survey_run_id, usability, detected FROM geo_measurements "
-        "WHERE usability IN ('usable', 'run_excluded')"
+        "SELECT DISTINCT m.survey_run_id, m.usability, m.detected FROM geo_measurements m"
+        + measurement_join
+        + " WHERE m.usability IN ('usable', 'run_excluded')"
+        + (f" AND {predicate}" if predicate else ""),
+        parameters,
     ):
         run_id = str(row["survey_run_id"])
-        scope = exclusions.get(run_id)
+        exclusion_scope = exclusions.get(run_id)
         counts = str(row["usability"]) == "usable"
         detected = bool(row["detected"])
-        if scope is None:
+        if exclusion_scope is None:
             should_count = True
-        elif scope == "non_detections":
+        elif exclusion_scope == "non_detections":
             should_count = detected
         else:
             should_count = False
@@ -574,6 +657,7 @@ def solve_all_sites(
     level_metric: str = "snr_db",
     common_mode: CommonModeSettings | None = None,
     plan_settings: PlanSettings | None = None,
+    scope: CampaignScope = WHOLE_DATABASE,
     on_progress: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Solve every registry site that has usable measurements.
@@ -602,12 +686,14 @@ def solve_all_sites(
     # measurements does nothing here.
     connection = connect_geo_database(_database(database_path))
     try:
-        stale = runs_with_stale_exclusions(connection)
+        stale = runs_with_stale_exclusions(connection, scope=scope)
     finally:
         connection.close()
     refreshed: dict[str, Any] | None = None
     if stale:
-        refreshed = materialise_measurements(database_path=database_path, run_ids=stale)
+        refreshed = materialise_measurements(
+            database_path=database_path, run_ids=stale, scope=scope
+        )
 
     connection = connect_geo_database(_database(database_path))
     try:
@@ -620,8 +706,12 @@ def solve_all_sites(
         excluded_by_site: dict[str, int] = {}
         for site in sites:
             site_id = int(site["p25_site_id"])
-            usable = fetch_site_measurements(connection, site_id, usable_only=True)
-            everything = fetch_site_measurements(connection, site_id, usable_only=False)
+            usable = fetch_site_measurements(
+                connection, site_id, usable_only=True, scope=scope
+            )
+            everything = fetch_site_measurements(
+                connection, site_id, usable_only=False, scope=scope
+            )
             usable_by_site[site["site_key"]] = usable
             excluded_by_site[site["site_key"]] = len(everything) - len(usable)
 
@@ -678,6 +768,11 @@ def solve_all_sites(
                     results[site["site_key"]] = result
 
         for row in rows:
+            # Stamped with the campaign this solve was scoped to, so reading
+            # the result back can tell a campaign's own conclusion from one
+            # drawn across every round in the file. NULL for an unscoped
+            # solve, which is what it is: a whole-database answer.
+            row["campaign_id"] = scope.campaign_id
             store_solution(connection, solve_batch_id=batch, row=row)
 
         plan = _build_plan(
@@ -687,8 +782,14 @@ def solve_all_sites(
             settings=resolved,
             plan_settings=planning,
         )
-        store_plan(connection, solve_batch_id=batch, plan=plan, geojson=plan_to_geojson(plan))
-        measurement_summary = summarise(fetch_all_measurements(connection))
+        store_plan(
+            connection,
+            solve_batch_id=batch,
+            plan=plan,
+            geojson=plan_to_geojson(plan),
+            campaign_id=scope.campaign_id,
+        )
+        measurement_summary = summarise(fetch_all_measurements(connection, scope=scope))
     finally:
         connection.close()
 
@@ -697,6 +798,7 @@ def solve_all_sites(
         "tool": "dmr-iq-surveyor",
         "tool_version": __version__,
         "solve_batch_id": batch,
+        "campaign_id": scope.campaign_id,
         "method": METHOD,
         "source_model": SOURCE_MODEL,
         "geolocation_maturity": GEOLOCATION_MATURITY,
@@ -736,13 +838,15 @@ def solve_all_sites(
         )
         write_json(
             destination / "reports" / f"geolocation_{batch}.geojson",
-            build_map_geojson(database_path=database_path),
+            build_map_geojson(database_path=database_path, scope=scope),
         )
         report["output_dir"] = str(destination)
     return report
 
 
-def build_map_geojson(*, database_path: str | Path | None = None) -> dict[str, Any]:
+def build_map_geojson(
+    *, database_path: str | Path | None = None, scope: CampaignScope = WHOLE_DATABASE
+) -> dict[str, Any]:
     """One FeatureCollection carrying everything the map needs.
 
     Measurement points, solved modes and credible regions travel together so
@@ -750,8 +854,8 @@ def build_map_geojson(*, database_path: str | Path | None = None) -> dict[str, A
     """
     connection = connect_geo_database(_database(database_path))
     try:
-        measurements = fetch_all_measurements(connection)
-        solutions = latest_solutions(connection)
+        measurements = fetch_all_measurements(connection, scope=scope)
+        solutions = latest_solutions(connection, scope=scope)
     finally:
         connection.close()
 
@@ -816,25 +920,39 @@ def build_map_geojson(*, database_path: str | Path | None = None) -> dict[str, A
     return {"type": "FeatureCollection", "features": features}
 
 
-def site_overview(*, database_path: str | Path | None = None) -> list[dict[str, Any]]:
+def site_overview(
+    *, database_path: str | Path | None = None, scope: CampaignScope = WHOLE_DATABASE
+) -> list[dict[str, Any]]:
     """Registry sites joined with their measurement counts and latest status."""
     connection = connect_geo_database(_database(database_path))
     try:
         sites = list_sites(connection)
-        solutions = {row["p25_site_id"]: row for row in latest_solutions(connection)}
+        solutions = {
+            row["p25_site_id"]: row for row in latest_solutions(connection, scope=scope)
+        }
+        # The site registry itself is campaign-independent -- a P25 site
+        # exists whether or not this round drove past it -- so the sites are
+        # listed unscoped and only the evidence counted against them is
+        # narrowed. A site nobody in this campaign heard reads as zero
+        # measurements, which is true, rather than disappearing.
+        predicate, parameters = scope.where("r")
         counts = {
             int(row["p25_site_id"]): dict(row)
             for row in connection.execute(
                 """
-                SELECT p25_site_id,
+                SELECT m.p25_site_id AS p25_site_id,
                        COUNT(*) AS total,
-                       SUM(CASE WHEN usability = 'usable' AND detected = 1 THEN 1 ELSE 0 END)
-                           AS detections,
-                       SUM(CASE WHEN usability = 'usable' AND detected = 0 THEN 1 ELSE 0 END)
-                           AS non_detections,
-                       SUM(CASE WHEN usability != 'usable' THEN 1 ELSE 0 END) AS excluded
-                FROM geo_measurements GROUP BY p25_site_id
+                       SUM(CASE WHEN m.usability = 'usable' AND m.detected = 1
+                                THEN 1 ELSE 0 END) AS detections,
+                       SUM(CASE WHEN m.usability = 'usable' AND m.detected = 0
+                                THEN 1 ELSE 0 END) AS non_detections,
+                       SUM(CASE WHEN m.usability != 'usable' THEN 1 ELSE 0 END) AS excluded
+                FROM geo_measurements m
+                JOIN survey_runs r ON r.survey_run_id = m.survey_run_id
                 """
+                + (f" WHERE {predicate}" if predicate else "")
+                + " GROUP BY m.p25_site_id",
+                parameters,
             )
         }
     finally:
