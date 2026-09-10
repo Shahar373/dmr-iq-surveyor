@@ -29,7 +29,10 @@ from dmr_iq_surveyor.capture.gps import resolve_gps
 from dmr_iq_surveyor.capture.wav_writer import WaveIQWriter, WaveIQWriterSettings
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, run_survey
 from dmr_iq_surveyor.survey.profiles import BandProfile, SiteProfile
-from dmr_iq_surveyor.survey.provenance import hardware_from_capture_manifest
+from dmr_iq_surveyor.survey.provenance import (
+    hardware_from_capture_manifest,
+    normalise_campaign_id,
+)
 
 _DEFAULT_CHUNK_FRAMES = 262_144
 
@@ -301,6 +304,12 @@ def run_capture_and_survey(
     `gps_source` recording exactly why coordinates are absent rather than
     silently omitting them.
     """
+    # Before the GPS is fetched and long before the radio is opened. The
+    # CLI checks this too, but a caller reaching this function directly --
+    # a script, the field app, a future command -- would otherwise pay for
+    # a whole capture and be told afterwards that its id was a typo.
+    campaign_id = normalise_campaign_id(campaign_id)
+
     # Fetched before the capture starts, so the coordinates describe where
     # the recording was made rather than where it happened to finish.
     gps_info = resolve_gps(

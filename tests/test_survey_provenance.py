@@ -617,3 +617,64 @@ def test_a_rejected_reimport_does_not_take_the_stored_run_with_it(
         assert len(get_run_observations(connection, "r1")) == 2
     finally:
         connection.close()
+
+
+def test_a_report_with_a_read_back_but_unreadable_settings_is_not_evidence(
+    tmp_path: Path,
+) -> None:
+    """Half a report is not half the evidence, it is none of it.
+
+    `device_settings_applied` alone would be filed as `applied` while the
+    request it should be compared against is unreadable -- a reading with
+    nothing to check it, presented as the strongest tier there is.
+    """
+    wav = tmp_path / "stop.wav"
+    wav.write_bytes(b"RIFF")
+    (tmp_path / "stop_capture_report.json").write_text(
+        json.dumps(
+            {
+                "wav_path": str(wav),
+                "settings": "IFGR 40",
+                "device_settings_applied": {"gains": {"IFGR": 25.0, "RFGR": 2.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    hardware = hardware_from_recording(wav)
+    assert hardware["source"] == SOURCE_NOT_RECORDED
+    assert hardware["applied"] == {}
+    assert hardware["requested"] == {}
+
+
+@pytest.mark.parametrize(
+    "junk",
+    [
+        {"gains": {"IFGR": []}},
+        {"gains": {"IFGR": {"nested": 1}}},
+        {"gains": "IFGR=25"},
+        {"center_frequency_hz": [868e6]},
+    ],
+)
+def test_a_bucket_value_of_a_shape_no_reading_has_is_refused(junk: dict) -> None:
+    """Structure alone lets a list through where a gain belongs, and the
+    failure then lands inside whatever tries to count or format it."""
+    blob = hardware_provenance(requested=requested_bucket(lna_state=2))
+    blob["applied"] = junk
+    blob["source"] = SOURCE_APPLIED
+
+    with pytest.raises(ProvenanceError):
+        normalise_hardware(blob)
+    assert load_hardware(json.dumps(blob)) == {}
+
+
+def test_the_builders_drop_junk_rather_than_carrying_it_forward() -> None:
+    """A device that reports something unusable costs that one reading, not
+    the capture."""
+    hardware = hardware_provenance(applied={"gains": {"IFGR": [], "RFGR": 2.0}})
+
+    assert hardware["applied"]["gains"] == {"RFGR": 2.0}
+    assert lna_state_reading(hardware).value == 2
+    assert if_gain_reading(hardware).source == SOURCE_NOT_RECORDED
+    # And what it built is storable, which is the point of dropping it here.
+    assert normalise_hardware(hardware)["source"] == SOURCE_APPLIED

@@ -118,17 +118,53 @@ def normalise_campaign_id(value: str | None) -> str | None:
 # -- building a blob ---------------------------------------------------------
 
 
-def _known(values: Any) -> dict[str, Any]:
-    """Keep only the values that are actually known.
+# A receiver setting is a number, a name, or a flag. Nothing this module
+# records is a list or a nested object, with one exception: the radio
+# reports its gains as a mapping of element name to value. Anything else
+# arriving in a bucket is not a reading, and a report that tried to count
+# or render it would raise rather than print.
+_SCALARS = (str, int, float, bool)
 
-    A key that is absent says nothing was observed. A key holding `None` would
-    say the same thing while looking like a recorded reading, so it never
-    reaches the database. A bucket that is not a mapping at all contributes
-    nothing rather than propagating its shape.
+
+def _is_scalar(value: Any) -> bool:
+    return isinstance(value, _SCALARS)
+
+
+def _scalar_mapping(values: Any) -> dict[str, Any]:
+    """A flat mapping of names to scalars, with everything else dropped."""
+    if not isinstance(values, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in values.items()
+        if isinstance(key, str) and _is_scalar(value)
+    }
+
+
+def _known(values: Any) -> dict[str, Any]:
+    """Keep only the values that are actually known, and usable.
+
+    A key that is absent says nothing was observed. A key holding `None`
+    would say the same thing while looking like a recorded reading, so it
+    never reaches the database. Neither does a value of a shape no reading
+    has -- a list where a gain belongs is not a gain, and carrying it
+    forward only moves the failure into whatever tries to print it.
+    `gains` is the one nested mapping, and it is flattened to its scalars.
     """
     if not isinstance(values, dict):
         return {}
-    return {str(key): value for key, value in values.items() if value is not None}
+    kept: dict[str, Any] = {}
+    for key, value in values.items():
+        if value is None:
+            continue
+        name = str(key)
+        if name == 'gains':
+            gains = _scalar_mapping(value)
+            if gains:
+                kept[name] = gains
+        elif _is_scalar(value):
+            kept[name] = value
+    return kept
 
 
 def _derive_source(applied: dict, requested: dict, declared: dict) -> str:
@@ -251,12 +287,14 @@ def hardware_from_capture_manifest(manifest: Any) -> dict[str, Any]:
     `device_settings_applied` is the radio's own read-back, so it is the only
     thing filed as `applied`. A manifest that is malformed, or whose settings
     are not a mapping, yields an empty blob rather than a half-read one: a
-    report nobody can parse is not evidence about a radio.
+    report nobody can parse is not evidence about a radio, and reading half
+    of one would file a read-back under a request nobody can see.
     """
     if not isinstance(manifest, dict):
         return hardware_provenance()
     settings = manifest.get("settings")
-    settings = settings if isinstance(settings, dict) else {}
+    if not isinstance(settings, dict):
+        return hardware_provenance()
     return hardware_provenance(
         identity={"driver": settings.get("driver"), "serial": settings.get("serial")},
         applied=applied_bucket(manifest.get("device_settings_applied")),
@@ -321,6 +359,37 @@ def hardware_from_recording(recording: str | Path) -> dict[str, Any]:
 # -- validating and reading a blob ------------------------------------------
 
 
+def _validate_bucket(bucket: str, held: dict[Any, Any]) -> None:
+    """Every value a report will read has to be one it can read.
+
+    Structure alone is not enough. A blob whose `IFGR` is a list validates
+    as a mapping of mappings and then raises inside whatever counts or
+    formats it, which is a crash in a report rather than a rejected row.
+    """
+    for key, item in held.items():
+        if not isinstance(key, str):
+            raise ProvenanceError(
+                f"hardware provenance bucket {bucket!r} has a non-string key {key!r}"
+            )
+        if bucket == "applied" and key == "gains":
+            if not isinstance(item, dict):
+                raise ProvenanceError(
+                    f"hardware provenance gains must be a dict, got {type(item).__name__}"
+                )
+            for element, reading in item.items():
+                if not isinstance(element, str) or not _is_scalar(reading):
+                    raise ProvenanceError(
+                        f"hardware provenance gain {element!r} must be a number or a name, "
+                        f"got {type(reading).__name__}"
+                    )
+            continue
+        if not _is_scalar(item):
+            raise ProvenanceError(
+                f"hardware provenance {bucket}.{key} must be a number, a name or a flag, "
+                f"got {type(item).__name__}"
+            )
+
+
 def normalise_hardware(value: Any) -> dict[str, Any]:
     """Validate a provenance blob, structure and all, on its way into the
     database.
@@ -351,6 +420,7 @@ def normalise_hardware(value: Any) -> dict[str, Any]:
                 f"hardware provenance bucket {bucket!r} must be a dict, "
                 f"got {type(held).__name__}"
             )
+        _validate_bucket(bucket, held)
     source = value.get("source")
     if source not in STORED_SOURCES:
         raise ProvenanceError(
@@ -363,11 +433,16 @@ def normalise_hardware(value: Any) -> dict[str, Any]:
         raise ProvenanceError(
             f"hardware provenance claims source {source!r} but its buckets say {expected!r}"
         )
-    return {
+    canonical: dict[str, Any] = {
         "schema_version": HARDWARE_SCHEMA_VERSION,
         "source": source,
-        **{bucket: dict(value.get(bucket) or {}) for bucket in BUCKETS},
     }
+    for bucket in BUCKETS:
+        held = dict(value.get(bucket) or {})
+        if "gains" in held:
+            held["gains"] = dict(held["gains"])
+        canonical[bucket] = held
+    return canonical
 
 
 def load_hardware(raw: Any) -> dict[str, Any]:

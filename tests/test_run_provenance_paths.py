@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
+from fixtures.device_probe import StubProbeRunner, present
 from fixtures.synthetic import SyntheticTone, write_synthetic_iq_wav
 
 from dmr_iq_surveyor.capture.core import CaptureSettings, run_capture_and_survey
@@ -29,7 +31,9 @@ from dmr_iq_surveyor.survey.provenance import (
     SOURCE_APPLIED,
     SOURCE_DECLARED,
     SOURCE_REQUESTED,
+    ProvenanceError,
     if_gain_reading,
+    lna_state_reading,
     load_hardware,
 )
 from dmr_iq_surveyor.survey.store import connect_survey_database, get_run
@@ -602,3 +606,139 @@ def test_the_cli_and_the_field_app_agree_about_one_recording(tmp_path: Path) -> 
     assert from_cli["requested"] == from_web["requested"]
     assert from_cli["identity"] == from_web["identity"]
     assert _stored_campaign(database, "via_web") == "day1"
+
+
+# -- the field app's three claims are three different numbers ----------------
+
+
+def test_a_field_app_stop_keeps_declaration_request_and_reading_apart(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The app overwrites the profile's gain fields with what it asked the
+    radio for, so that `sites` records the setting in force. That copy must
+    not become the declaration too, or the operator's own number disappears
+    behind the request and the run carries the same figure twice.
+    """
+    _write_profiles(tmp_path)  # the profile declares 40 dB IFGR, LNA state 2
+    database = tmp_path / "db.sqlite3"
+    recordings = tmp_path / "field" / "recordings"
+    recordings.mkdir(parents=True)
+
+    def fake_capture(destination, *, settings, on_progress=None, filename=None, device=None):
+        wav = Path(destination) / (filename or "stop.wav")
+        write_synthetic_iq_wav(
+            wav,
+            sample_rate_hz=int(settings.sample_rate_hz),
+            center_frequency_hz=int(settings.center_frequency_hz),
+            duration_seconds=settings.duration_seconds,
+            tones=[SyntheticTone(offset_hz=TONE_OFFSET_HZ, amplitude=0.3)],
+        )
+        return {
+            "wav_path": str(wav),
+            "settings": settings.to_dict(),
+            # What the radio came back with, different again from the request.
+            "device_settings_applied": {
+                "sample_rate_hz": settings.sample_rate_hz,
+                "center_frequency_hz": settings.center_frequency_hz,
+                "agc": False,
+                "gains": {"IFGR": 25.0, "RFGR": 3.0},
+            },
+            "actual_duration_seconds": settings.duration_seconds,
+            "time_coverage": 1.0,
+            "gap_seconds": 0.0,
+            "overflow_count": 0,
+            "timed_out": False,
+            "complete": True,
+        }
+
+    monkeypatch.setattr("dmr_iq_surveyor.web.service.run_capture", fake_capture)
+    service = FieldService(
+        FieldSettings(
+            database_path=database,
+            output_root=tmp_path / "field",
+            recordings_dir=recordings,
+            profile_base_dir=tmp_path,
+            band="test_band",
+            site_profile="mobile",
+            campaign_id="day1",
+            solve_after_capture=False,
+            drive_view_for_stops=False,
+            keep_recordings=1,
+        ),
+        probe_runner=StubProbeRunner(present()),
+    )
+    service.set_position({"latitude": 32.05, "longitude": 34.79, "label": "here"})
+    job = service.start_capture(
+        {
+            "label": "stop one",
+            "center_frequency_hz": CENTER,
+            "sample_rate_hz": RATE,
+            "duration_seconds": 3.0,
+            # Asked for, and neither declared nor measured.
+            "if_gain_reduction_db": 30.0,
+            "lna_state": 3,
+            "solve": False,
+        }
+    )
+    _await(job)
+    assert job.snapshot()["status"] == "succeeded", job.snapshot()
+
+    connection = connect_survey_database(database)
+    try:
+        rows = [dict(row) for row in connection.execute(
+            "SELECT survey_run_id, hardware_json FROM survey_runs"
+        )]
+    finally:
+        connection.close()
+    assert len(rows) == 1, rows
+    hardware = load_hardware(rows[0]["hardware_json"])
+
+    # Three claims, three numbers, none standing in for another.
+    assert hardware["declared"]["gain"] == 40.0
+    assert hardware["declared"]["lna_state"] == 2
+    assert hardware["requested"]["if_gain_reduction_db"] == 30.0
+    assert hardware["requested"]["lna_state"] == 3
+    assert hardware["applied"]["gains"] == {"IFGR": 25.0, "RFGR": 3.0}
+    assert hardware["source"] == SOURCE_APPLIED
+    assert if_gain_reading(hardware).value == 25.0
+    assert lna_state_reading(hardware).value == 3
+
+
+def test_capture_and_survey_checks_the_campaign_before_it_opens_anything(
+    tmp_path: Path,
+) -> None:
+    """The CLI guards this too, but a caller reaching the function directly
+    would otherwise pay for a whole capture before being told its id was a
+    typo."""
+    device = _ReadBackDevice(applied_if_gain_db=25.0)
+    opened: list[str] = []
+    original_open = device.open
+
+    def recording_open(settings: DeviceSettings) -> None:
+        opened.append("opened")
+        original_open(settings)
+
+    device.open = recording_open  # type: ignore[method-assign]
+
+    with pytest.raises(ProvenanceError):
+        run_capture_and_survey(
+            tmp_path / "recordings",
+            tmp_path / "surveys",
+            capture=CaptureSettings(
+                center_frequency_hz=CENTER,
+                sample_rate_hz=RATE,
+                duration_seconds=3.0,
+                if_gain_reduction_db=40.0,
+                lna_state=2,
+                agc=False,
+            ),
+            band=_band(),
+            site=SITE,
+            device=device,
+            run_id="never",
+            database_path=tmp_path / "db.sqlite3",
+            campaign_id="Day One",
+        )
+
+    assert opened == [], "the device must not be opened for a bad campaign id"
+    assert not (tmp_path / "recordings").exists()

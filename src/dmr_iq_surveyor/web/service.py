@@ -832,6 +832,13 @@ class FieldService:
                 # profile's placeholder. Cross-stop comparability is the
                 # method's foundation, so the number it depends on has to be
                 # stored per stop to be checkable.
+                #
+                # The untouched profile is kept and handed to `run_survey`
+                # separately: these overwritten fields hold what the radio
+                # was ASKED for, and filing them as the operator's
+                # declaration would make the declaration a second copy of
+                # the request rather than an independent claim.
+                declared_profile = site_profile
                 site_profile = replace(
                     site_profile,
                     gain=capture.if_gain_reduction_db,
@@ -851,6 +858,7 @@ class FieldService:
                         label=label,
                         position=position,
                         solve=solve,
+                        declared_profile=declared_profile,
                     )
 
                 return self.jobs.submit(
@@ -874,6 +882,7 @@ class FieldService:
         label: str,
         position: dict[str, Any],
         solve: bool,
+        declared_profile: SiteProfile | None = None,
     ) -> dict[str, Any]:
         # start_capture() already ran a fresh, bounded readiness check
         # immediately before submitting this job (JobRegistry claims the job
@@ -945,6 +954,7 @@ class FieldService:
             # `upsert_site` rewrites it. The capture report can, and it
             # carries the radio's read-back rather than the request.
             hardware=hardware_from_capture_manifest(manifest),
+            declared_site=declared_profile,
             drive_view=(
                 DriveViewSettings(
                     fft_size=self.settings.live_fft_size,

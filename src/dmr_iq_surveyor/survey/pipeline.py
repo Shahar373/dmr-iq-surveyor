@@ -147,6 +147,7 @@ def run_survey(
     drive_view: DriveViewSettings | None = None,
     campaign_id: str | None = None,
     hardware: dict[str, Any] | None = None,
+    declared_site: SiteProfile | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     log = SurveyLog()
@@ -173,6 +174,12 @@ def run_survey(
     # distinct site, which matters because `survey compare` treats runs from
     # one site_id as the same place and would otherwise report every signal
     # that differs between two locations as NEW or MISSING_THIS_RUN.
+    # What the operator declared, which is not always the profile that is
+    # about to be written to `sites`. A caller that overwrites the gain
+    # fields to record what it asked the radio for -- the field app does --
+    # must still be able to say what the profile itself held, or the
+    # declaration is a second copy of the request wearing another name.
+    declaration = declared_site if declared_site is not None else site_profile
     if site_id_override or site_label_override:
         site_profile = replace(
             site_profile,
@@ -180,6 +187,11 @@ def run_survey(
             label=site_label_override or (site_id_override or site_profile.label),
         )
         site_profile.validate()
+        declaration = replace(
+            declaration,
+            site_id=site_id_override or declaration.site_id,
+            label=site_label_override or (site_id_override or declaration.label),
+        )
     log.info(f"resolved band profile {band_profile.name!r}, site profile {site_profile.site_id!r}")
     # A recording this software captured carries its own report beside it.
     # Looking for it HERE rather than in each caller is what makes one
@@ -188,7 +200,7 @@ def run_survey(
     # measured, so editing that profile later cannot rewrite what this run
     # appears to have been taken with.
     measured = hardware if hardware is not None else hardware_from_recording(source)
-    resolved_hardware = with_declared(measured, declared_bucket(site_profile))
+    resolved_hardware = with_declared(measured, declared_bucket(declaration))
     log.info(
         f"campaign {resolved_campaign_id!r}; receiver state "
         f"{hardware_source_label(resolved_hardware)}"

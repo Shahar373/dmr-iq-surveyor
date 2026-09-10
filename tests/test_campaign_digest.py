@@ -9,6 +9,8 @@ exists to make impossible.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -187,3 +189,50 @@ def test_without_a_campaign_the_whole_file_is_reported_as_before(tmp_path: Path)
     assert "WHAT COUNTED AS EVIDENCE" in output
     assert "WHAT THE SOLVER CONCLUDED" in output
     assert "NOT SHOWN FOR A SINGLE CAMPAIGN" not in output
+
+
+def test_a_row_with_junk_inside_a_valid_blob_does_not_bring_the_digest_down(
+    tmp_path: Path,
+) -> None:
+    """Structure alone is not enough.
+
+    A blob can be valid JSON, carry every bucket as a mapping, and still hold
+    a list where a gain belongs. Counting or formatting that raises, so the
+    whole page dies over one row. It has to read as not recorded instead --
+    a report about a campaign must never be the thing that fails.
+    """
+    database = _database(tmp_path)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "UPDATE survey_runs SET hardware_json = ? WHERE survey_run_id = 'applied_stop'",
+            (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "source": "applied",
+                        "identity": {},
+                        # Valid JSON, valid buckets, and unusable: a list is not
+                        # a gain, and `Counter` cannot even hold one.
+                        "applied": {"gains": {"IFGR": [], "RFGR": {"nested": 1}}},
+                        "requested": {"lna_state": [1, 2]},
+                        "declared": {},
+                    }
+                ),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    output = _digest(database)
+
+    assert "WHAT WAS COLLECTED" in output
+    assert "stops total          4" in output
+    # The unusable blob reads as though the run recorded nothing, so the run
+    # falls back to the shared row and says that is where the number came
+    # from. It is not passed off as the read-back the blob claimed to hold.
+    assert "(declared, from the site row): 2 stop(s)" in output
+    assert "25.0 dB IFGR (applied)" not in output
+    # The rows that are fine still read normally.
+    assert "26.0 dB IFGR (requested)" in output
