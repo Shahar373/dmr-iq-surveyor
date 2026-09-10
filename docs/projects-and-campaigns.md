@@ -84,8 +84,8 @@ defaults:
 has used since PR1, not a second dialect. `defaults.capture` accepts exactly
 the three keys above, each a positive number: they are what has to stay
 identical across stops for their levels to be comparable. Gain is deliberately
-absent; it belongs to the hardware profile, which is not written yet, so the
-site profile remains its only declaration source.
+absent; it belongs to the hardware profile named by `defaults.hardware`, and
+that profile is what a round's stops are declared against.
 
 In both files an unknown key is an error rather than a silent no-op. A
 misspelled default is a default that would not apply, and failing is the only
@@ -301,12 +301,106 @@ slightly different campaign, it produces measurements that cannot be compared
 with the ones already in the database. Everything else changes where bytes
 land, not what they mean.
 
+## A campaign is an analysis boundary
+
+`campaign_id` is not only a label on a run. Pass `--campaign` to `geo
+measurements`, `geo solve`, `geo sites`, `geo history`, `geo plan`, `geo
+export` or `scripts/campaign_digest.py`, and **every derived value** is
+computed from that round's runs alone:
+
+- the reference gain and the noise-floor median — the two numbers that decide
+  whether levels are comparable at all;
+- the common-mode offsets, which fall out of the solve's own residuals;
+- the measurements the solver reads, joined through `survey_runs`;
+- the solutions, the next-stop plan, the site overview's counts, and the
+  GeoJSON, KML and GPX exports.
+
+Two rules hold everywhere:
+
+**No campaign means the whole database.** An unscoped command runs the same
+SQL it always did. That is what keeps every existing invocation and every
+stored report true.
+
+**A campaign never includes the unassigned.** A run written before campaigns
+existed carries `campaign_id IS NULL`. It was not taken under the round being
+asked about — nobody declared that it was — so it is excluded rather than
+swept in. A run you name explicitly that is outside the campaign is *refused*,
+not silently dropped: a rebuild that skipped a stop you asked for would report
+success over work it never did.
+
+`geo_solutions` and `geo_plans` carry the campaign their solve was scoped to.
+A solve run without `--campaign` stores `NULL` there and is never offered as
+one campaign's conclusion — it read every run in the file. Those columns are
+not backfilled from older batches for the same reason: labelling a solve
+afterwards would claim a boundary that was never applied.
+
+Reference imports stay whole-database on purpose. A corrected snapshot
+invalidates measurements for every round, and scoping that rebuild would leave
+the others quietly stale.
+
+`survey compare` reports `campaign_differs` and names both rounds, but never
+blocks: comparing two rounds is the point of running a second one. What it
+tells you is that a level difference may be the rounds rather than the RF,
+since each round establishes its own reference gain and noise floor.
+
+## The hardware profile
+
+`config/hardware/*.yaml` says what the receiver **is**, and what it is meant
+to be set to. A campaign names one:
+
+```yaml
+defaults:
+  hardware: field_rsp1a     # or an absolute path
+```
+
+It is separate from a site profile because the two answer different questions
+on different clocks. A site profile is *where* — one place, its antenna, its
+coordinates — and there is one per stop. A hardware profile is *what with*,
+changed once for every stop at every site when a round swaps a radio or
+settles on a gain.
+
+Splitting them fixes a real ambiguity. `sites` is one mutable row per profile
+that every run rewrites, so gain recorded there describes the profile as it
+stands *now*, not as it stood for the run being read. A hardware profile is a
+file, snapshotted into each run's own provenance when the run is recorded, and
+unable to rewrite history afterwards.
+
+**Nothing in it is ever `applied`.** However precise the file is, it declares
+what the operator intends; only the radio's own read-back may claim to be what
+the receiver was actually set to.
+
+### Precedence, both ways
+
+*Reading* what a run was recorded at:
+
+**applied → requested → declared → the legacy `sites` row**
+
+The last tier is offered only to a run whose own provenance is empty — a row
+written before runs carried their own declaration — and is labelled apart
+(`declared, from the site row`), so a number resting on the mutable row is
+never mistaken for one the run recorded. `geo measurements` reports how many
+runs rested on each tier.
+
+*Requesting* a capture:
+
+**command line → hardware profile → site profile → built-in fallback**
+
+The hardware profile outranks the site profile because gain belongs to the
+radio, not to the place; the site profile still answers whatever the hardware
+profile leaves unset, so naming one never takes information away from a run.
+An explicit `--if-gain-reduction` or `--lna-state` still wins — the operator is
+at the radio — but says so when it contradicts the profile, because a round
+whose stops were not all taken at one gain is exactly what the drift check
+hunts for afterwards. The startup banner always names the origin of each half.
+
+`--hardware` on `survey run` and `survey capture` names a profile directly for
+an offline or single-stop analysis.
+
 ## What this does not do
 
 - It does not move, rewrite or reinterpret any existing row.
-- It does not assign a historical run to a campaign.
-- It does not add a hardware profile — `config/hardware/*.yaml` is the next
-  step, and until then `SiteProfile` remains the only declaration source for
-  gain and LNA state.
+- It does not assign a historical run to a campaign, and there is no backfill.
+- It does not change the estimator. Campaign scoping decides *which* evidence
+  is read; the mathematics that reads it is untouched.
 - It does not add an analyzer. There is still exactly one, and site attribution
   is still by frequency alone.
