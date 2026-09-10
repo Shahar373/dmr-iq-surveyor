@@ -19,6 +19,7 @@ worked this way since Phase 6A:
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -489,6 +490,7 @@ def resolve_setting(
     campaign: Any = None,
     project: Any = None,
     default: Any = None,
+    equivalent: Callable[[Any, Any], bool] | None = None,
 ) -> Resolution:
     """Combine one setting from flag, campaign, project and CLI default.
 
@@ -500,15 +502,24 @@ def resolve_setting(
     For the keys in `REFUSE_ON_CONFLICT` an explicit flag that disagrees with a
     manifest is an error rather than an override, and the message names both
     values and where each came from.
+
+    `equivalent` decides what "disagrees" means. Without it two values are
+    compared as they were written, which is wrong for anything that has more
+    than one spelling: `--band central_800_narrow` and a manifest naming
+    `config/bands/central_800_narrow.yaml` are the same band, and refusing
+    that pair would be a false alarm on a conflict that does not exist. A
+    caller that knows how to resolve a key to its canonical identity passes a
+    predicate that does so.
     """
     manifest_value = campaign if campaign is not None else project
     manifest_origin = ORIGIN_CAMPAIGN if campaign is not None else ORIGIN_PROJECT
+    same = equivalent or (lambda left, right: left == right)
 
     if flag_explicit:
         if (
             key in REFUSE_ON_CONFLICT
             and manifest_value is not None
-            and manifest_value != flag
+            and not same(flag, manifest_value)
         ):
             raise ProjectError(
                 f"--{key} was given as {flag!r} but the {manifest_origin} manifest says "

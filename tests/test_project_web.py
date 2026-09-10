@@ -286,6 +286,74 @@ def test_passing_the_manifests_own_band_explicitly_is_not_a_conflict(
     assert started.settings[0].band == "web_band"
 
 
+def test_a_band_named_and_the_same_band_pathed_are_not_a_conflict(
+    workspace: Path, started: Started
+) -> None:
+    """A profile has more than one spelling. `--band web_band` and a manifest
+    holding `config/bands/web_band.yaml` are the same band, and refusing that
+    pair would be a false alarm on a conflict that does not exist."""
+    manifest = _manifest_pointing_at(
+        workspace,
+        workspace / "db.sqlite3",
+        band=str(workspace / "config" / "bands" / "web_band.yaml"),
+    )
+    _claim(workspace / "db.sqlite3", PROJECT_ID)
+
+    result = _serve(manifest, "--band", "web_band")
+
+    assert result.exit_code == 0, result.output
+    assert started.settings[0].band == "web_band"
+
+
+def test_a_copy_of_a_profile_agrees_with_its_original(
+    workspace: Path, started: Started
+) -> None:
+    """Compared by content, so the same band under two paths agrees."""
+    copy = workspace / "elsewhere" / "web_band.yaml"
+    copy.parent.mkdir(parents=True)
+    copy.write_text(BAND_YAML, encoding="utf-8")
+    manifest = _manifest_pointing_at(workspace, workspace / "db.sqlite3", band=str(copy))
+    _claim(workspace / "db.sqlite3", PROJECT_ID)
+
+    result = _serve(manifest, "--band", "web_band")
+
+    assert result.exit_code == 0, result.output
+
+
+def test_two_genuinely_different_profiles_still_conflict_when_pathed(
+    workspace: Path, started: Started
+) -> None:
+    """The point of canonical comparison is not to stop refusing."""
+    manifest = _manifest_pointing_at(
+        workspace,
+        workspace / "db.sqlite3",
+        band=str(workspace / "config" / "bands" / "other_band.yaml"),
+    )
+    _claim(workspace / "db.sqlite3", PROJECT_ID)
+
+    result = _serve(manifest, "--band", "web_band")
+
+    assert result.exit_code == 1
+    # Rich wraps the message, so the path is compared without its line breaks.
+    unwrapped = result.output.replace("\n", "")
+    assert "other_band.yaml" in unwrapped and "web_band" in unwrapped
+    assert not started.settings
+
+
+def test_a_band_that_cannot_be_resolved_is_not_equivalent_to_anything(
+    workspace: Path, started: Started
+) -> None:
+    """The conservative answer is the safe one: an unresolvable side is a
+    refusal, not a silent win for the manifest."""
+    manifest = _manifest_pointing_at(workspace, workspace / "db.sqlite3", band="no_such_band")
+    _claim(workspace / "db.sqlite3", PROJECT_ID)
+
+    result = _serve(manifest, "--band", "web_band")
+
+    assert result.exit_code == 1
+    assert not started.settings
+
+
 # -- no creation on a project-aware path -------------------------------------
 
 

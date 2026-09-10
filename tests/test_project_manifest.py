@@ -392,3 +392,25 @@ def test_a_campaign_filename_with_no_stem_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ProjectError):
         load_campaign_manifest(path)
+
+
+def test_resolve_setting_uses_the_callers_notion_of_equivalence() -> None:
+    """`resolve_setting` compares values as written unless told how to compare
+    them properly; a key with more than one spelling needs the latter."""
+    resolved = resolve_setting(
+        "band",
+        flag="central_800_narrow",
+        flag_explicit=True,
+        project="/config/bands/central_800_narrow.yaml",
+        equivalent=lambda left, right: str(right).endswith(f"/{left}.yaml"),
+    )
+    assert resolved.origin == ORIGIN_FLAG
+
+    with pytest.raises(ProjectError, match="not comparable"):
+        resolve_setting(
+            "band",
+            flag="central_800",
+            flag_explicit=True,
+            project="/config/bands/central_800_narrow.yaml",
+            equivalent=lambda left, right: str(right).endswith(f"/{left}.yaml"),
+        )

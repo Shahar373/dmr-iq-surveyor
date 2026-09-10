@@ -13,7 +13,7 @@ import stat
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -260,6 +260,32 @@ def _flag_was_typed(ctx: typer.Context | None, name: str) -> bool:
     return getattr(source, "name", "") == "COMMANDLINE"
 
 
+def _same_band(flag: Any, manifest: Any) -> bool:
+    """Whether two spellings name the same band profile.
+
+    A band may be given as a name or as a path to the YAML that name resolves
+    to, so comparing the strings would refuse `--band central_800_narrow`
+    against a manifest holding `config/bands/central_800_narrow.yaml` -- a
+    conflict that does not exist. Both sides are resolved and compared by
+    content, which also makes a copied profile agree with its original while
+    two genuinely different profiles still disagree.
+
+    A side that will not resolve is not equivalent to anything. It fails a
+    moment later in profile resolution with a better message than this one
+    could give, and the conservative answer here is the safe one: a conflict
+    is refused rather than silently resolved in the manifest's favour.
+    """
+    if str(flag) == str(manifest):
+        return True
+    try:
+        return (
+            resolve_band_profile(str(flag)).to_dict()
+            == resolve_band_profile(str(manifest)).to_dict()
+        )
+    except (ProfileError, FileNotFoundError, OSError):
+        return False
+
+
 def _resolve_project_context(
     ctx: typer.Context | None,
     *,
@@ -285,6 +311,7 @@ def _resolve_project_context(
         flag_explicit=_flag_was_typed(ctx, "band"),
         campaign=campaign_defaults.band if campaign_defaults else None,
         project=manifest.defaults.band,
+        equivalent=_same_band,
     )
     site_choice = resolve_setting(
         "site",
