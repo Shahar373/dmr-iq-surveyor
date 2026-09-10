@@ -111,6 +111,130 @@ def require_existing_database(path: str | Path) -> Path:
     return found.path
 
 
+# The tables every dmr-iq-surveyor database has carried since Phase 5, and the
+# columns that make each of them this project's rather than something else's.
+# Adoption checks these because "it is a valid SQLite file" is not a reason to
+# claim something: a browser cache, a package index and a phone backup are all
+# valid SQLite files, and claiming one writes a row into somebody else's data.
+#
+# Deliberately the *oldest* layer, not the current one. A database written
+# before Phase 6A has only these, and it is still this project's database --
+# the later tables arrive by additive migration once it is opened normally.
+# Requiring today's full schema would refuse exactly the databases adoption
+# exists for.
+REQUIRED_TABLES: dict[str, tuple[str, ...]] = {
+    "runs": ("run_id", "source_dir", "imported_at"),
+    "attempts": ("attempt_key", "run_id", "candidate_id", "frequency_hz", "status"),
+    "events": ("event_key", "attempt_key", "event_type", "raw_line"),
+    "sessions": ("session_key", "attempt_key", "session_type", "timing_confidence"),
+    "channels": ("frequency_hz", "attempt_count", "color_code_consistency"),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class DatabaseContents:
+    """What a read-only look at a database says about it.
+
+    Everything adoption needs to decide, gathered in one pass through a
+    connection that structurally cannot write.
+    """
+
+    integrity: str
+    tables: frozenset[str]
+    missing_tables: tuple[str, ...]
+    missing_columns: tuple[str, ...]
+    counts: dict[str, int]
+
+    @property
+    def intact(self) -> bool:
+        return self.integrity == "ok"
+
+    @property
+    def recognised(self) -> bool:
+        return not self.missing_tables and not self.missing_columns
+
+    @property
+    def refusal(self) -> str:
+        """Why this database must not be adopted, or "" if it may be."""
+        if not self.intact:
+            return (
+                f"this database fails SQLite's own integrity check: {self.integrity}. "
+                "Adoption is refused rather than claiming a file that cannot be trusted to "
+                "read back what it holds"
+            )
+        if self.missing_tables:
+            return (
+                f"this is a SQLite database, but not a dmr-iq-surveyor one: it has no "
+                f"{', '.join(self.missing_tables)}. Being valid SQLite is not a reason to "
+                "claim a file"
+            )
+        if self.missing_columns:
+            return (
+                f"this database has dmr-iq-surveyor table names but not its columns "
+                f"({', '.join(self.missing_columns)}); it is refused rather than claimed"
+            )
+        return ""
+
+
+def check_integrity(connection: sqlite3.Connection) -> str:
+    """`PRAGMA quick_check`, or the first problem it reports.
+
+    `quick_check` rather than `integrity_check`: it does everything the latter
+    does except the index cross-reference, and the target deployment is a
+    Raspberry Pi holding a database that grows with every drive. A check so
+    slow that an operator skips it protects nothing.
+    """
+    try:
+        rows = connection.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.DatabaseError as exc:
+        return str(exc)
+    if not rows:
+        return "quick_check returned nothing"
+    return str(tuple(rows[0])[0])
+
+
+def read_contents(connection: sqlite3.Connection) -> DatabaseContents:
+    """Everything a read-only look can establish, in one pass."""
+    integrity = check_integrity(connection)
+    try:
+        tables = frozenset(
+            str(tuple(row)[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        )
+    except sqlite3.DatabaseError:
+        tables = frozenset()
+
+    missing_tables = tuple(name for name in REQUIRED_TABLES if name not in tables)
+    missing_columns: list[str] = []
+    for table, required in REQUIRED_TABLES.items():
+        if table in missing_tables:
+            continue
+        try:
+            present = {str(tuple(row)[1]) for row in connection.execute(
+                f"PRAGMA table_info({table})"
+            )}
+        except sqlite3.DatabaseError:
+            present = set()
+        missing_columns.extend(
+            f"{table}.{column}" for column in required if column not in present
+        )
+
+    # Counted only when the file is both intact and recognised. Counting rows
+    # in a malformed image raises rather than answering, and a count from a
+    # database that is not this project's would be a number about somebody
+    # else's data printed under our table names.
+    countable = integrity == "ok" and not missing_tables and not missing_columns
+    return DatabaseContents(
+        integrity=integrity,
+        tables=tables,
+        missing_tables=missing_tables,
+        missing_columns=tuple(missing_columns),
+        counts=summarise_contents(connection) if countable else {},
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Claim:
     project_id: str
@@ -154,7 +278,12 @@ def summarise_contents(connection: sqlite3.Connection) -> dict[str, int]:
             counts[table] = int(
                 connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             )
-        except sqlite3.OperationalError:
+        except sqlite3.DatabaseError:
+            # `OperationalError` is the absent table; the wider
+            # `DatabaseError` also covers "database disk image is malformed",
+            # which a corrupt file raises here. A summary is a report, and a
+            # report must not be the thing that crashes on the file it is
+            # describing.
             continue
     return counts
 
@@ -172,7 +301,10 @@ def read_claim(connection: sqlite3.Connection) -> Claim | None:
             "SELECT project_id, analyzer, manifest_schema_version, claimed_at, claimed_by_version "
             f"FROM {CLAIM_TABLE} WHERE id = 1"
         ).fetchone()
-    except sqlite3.OperationalError:
+    except sqlite3.DatabaseError:
+        # Widened past `OperationalError` -- the absent table -- to cover a
+        # malformed image too. A database that cannot be read carries no claim
+        # that can be trusted, and every caller treats "no claim" as a refusal.
         return None
     if row is None:
         return None
@@ -289,9 +421,13 @@ def write_manifest_atomically(path: str | Path, text: str) -> Path:
 __all__ = [
     "CLAIM_SCHEMA",
     "CLAIM_TABLE",
+    "REQUIRED_TABLES",
     "SQLITE_HEADER",
     "Claim",
+    "DatabaseContents",
     "DatabaseFile",
+    "check_integrity",
+    "read_contents",
     "assert_claim",
     "open_read_only",
     "summarise_contents",

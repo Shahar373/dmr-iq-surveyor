@@ -322,3 +322,142 @@ def test_campaign_new_writes_once_and_refuses_to_clobber(tmp_path: Path) -> None
     third = runner.invoke(app, args)
     assert third.exit_code == 1
     assert written.read_text(encoding="utf-8") == "edited by hand\n"
+
+
+# -- adoption verifies what it is adopting -----------------------------------
+
+
+def _foreign_database(path: Path) -> Path:
+    """A perfectly valid SQLite file that is somebody else's.
+
+    The shape of the real risk: a browser cache, a package index, a phone
+    backup. Being valid SQLite is not a reason to write a row into it.
+    """
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE bookmarks (id INTEGER PRIMARY KEY, url TEXT)")
+        connection.execute("INSERT INTO bookmarks(url) VALUES ('https://example.invalid')")
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
+def _fingerprint(path: Path) -> tuple[bytes, int]:
+    return path.read_bytes(), path.stat().st_size
+
+
+def test_adoption_refuses_a_foreign_sqlite_file(tmp_path: Path) -> None:
+    foreign = _foreign_database(tmp_path / "db.sqlite3")
+    before = _fingerprint(foreign)
+
+    result = _init(tmp_path, "--adopt")
+
+    assert result.exit_code == 1
+    assert "not a dmr-iq-surveyor one" in result.output.replace("\n", "")
+    assert _fingerprint(foreign) == before, "a refused file was modified"
+    assert not (tmp_path / "p" / "project.yaml").exists()
+
+
+def test_a_foreign_file_is_untouched_even_with_write(tmp_path: Path) -> None:
+    """`--write` is not a way past the check; the check comes first."""
+    foreign = _foreign_database(tmp_path / "db.sqlite3")
+    before = _fingerprint(foreign)
+
+    result = _init(tmp_path, "--adopt", "--write")
+
+    assert result.exit_code == 1
+    assert _fingerprint(foreign) == before
+    assert _claim_of(foreign) is None
+    assert not (tmp_path / "p" / "project.yaml").exists()
+    assert not list(tmp_path.glob("**/*.tmp"))
+
+
+def test_adoption_refuses_a_database_with_the_names_but_not_the_columns(
+    tmp_path: Path,
+) -> None:
+    """Table names alone are cheap to collide with; the columns are the
+    signature."""
+    impostor = tmp_path / "db.sqlite3"
+    connection = sqlite3.connect(impostor)
+    try:
+        for table in ("runs", "attempts", "events", "sessions", "channels"):
+            connection.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+    before = _fingerprint(impostor)
+
+    result = _init(tmp_path, "--adopt", "--write")
+
+    assert result.exit_code == 1
+    assert "not its columns" in result.output.replace("\n", "")
+    assert _fingerprint(impostor) == before
+
+
+def test_adoption_refuses_a_corrupt_database(tmp_path: Path) -> None:
+    """Claiming a file that cannot be trusted to read back what it holds is
+    worse than refusing it."""
+    database = _seeded(tmp_path / "db.sqlite3")
+    raw = bytearray(database.read_bytes())
+    # Scribble over the middle of the file, past the header, so it still
+    # sniffs as SQLite and still opens.
+    for offset in range(4096, min(len(raw), 20480)):
+        raw[offset] = 0x5A
+    database.write_bytes(bytes(raw))
+    before = _fingerprint(database)
+
+    result = _init(tmp_path, "--adopt", "--write")
+
+    assert result.exit_code == 1
+    # A clean `typer.Exit`, not a traceback out of the report: `CliRunner`
+    # surfaces the former as SystemExit.
+    assert isinstance(result.exception, SystemExit)
+    assert "integrity check" in result.output.replace("\n", "")
+    assert _fingerprint(database) == before
+    assert not (tmp_path / "p" / "project.yaml").exists()
+
+
+def test_adoption_still_accepts_a_real_database(tmp_path: Path) -> None:
+    """The check must not refuse what adoption exists for."""
+    database = _seeded(tmp_path / "db.sqlite3")
+
+    result = _init(tmp_path, "--adopt", "--write")
+
+    assert result.exit_code == 0, result.output
+    assert _claim_of(database).project_id == "p25_central_il"
+
+
+def test_adoption_accepts_a_pre_phase6_database(tmp_path: Path) -> None:
+    """A database written before the survey tables existed is still this
+    project's. The signature is the Phase 5 layer for exactly this reason;
+    the later tables arrive by additive migration once it is opened."""
+    from dmr_iq_surveyor.inventory.store import SCHEMA
+
+    old = tmp_path / "db.sqlite3"
+    connection = sqlite3.connect(old)
+    try:
+        connection.executescript(SCHEMA)
+        connection.execute(
+            "INSERT INTO runs(run_id, source_dir, imported_at)"
+            " VALUES ('legacy', '/tmp/old', '2025-01-01T00:00:00+00:00')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = _init(tmp_path, "--adopt", "--write")
+
+    assert result.exit_code == 0, result.output
+    assert _claim_of(old).project_id == "p25_central_il"
+
+
+def test_the_dry_run_reports_integrity_and_schema(tmp_path: Path) -> None:
+    _seeded(tmp_path / "db.sqlite3")
+
+    result = _init(tmp_path, "--adopt")
+
+    assert result.exit_code == 0, result.output
+    flat = result.output.replace("\n", "")
+    assert "integrity" in flat and "ok" in flat
+    assert "dmr-iq-surveyor" in flat

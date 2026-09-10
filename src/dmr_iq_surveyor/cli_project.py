@@ -24,6 +24,7 @@ from dmr_iq_surveyor.project.claim import (
     inspect_database,
     open_read_only,
     read_claim,
+    read_contents,
     summarise_contents,
     write_claim,
     write_manifest_atomically,
@@ -284,17 +285,28 @@ def _adopt(
         _fail(found.reason)
         return
 
+    # A read-only connection, so everything below -- the integrity check, the
+    # schema signature, the row counts, the existing claim -- is established
+    # without the file being writable at all. `mode=ro` refuses every write,
+    # which is what lets a foreign file be examined and then left exactly as
+    # it was found.
     connection = open_read_only(database_path)
     try:
         existing = read_claim(connection)
-        counts = summarise_contents(connection)
+        contents = read_contents(connection)
     finally:
         connection.close()
+    counts = contents.counts
 
     table = Table(title=f"Adopting {database_path}")
     table.add_column("what")
     table.add_column("value")
     table.add_row("size", f"{found.size_bytes / 1024:.0f} KiB")
+    table.add_row("integrity", contents.integrity)
+    table.add_row(
+        "schema",
+        "dmr-iq-surveyor" if contents.recognised else "[red]not recognised[/red]",
+    )
     for name, count in counts.items():
         table.add_row(f"rows in {name}", str(count))
     table.add_row(
@@ -304,6 +316,13 @@ def _adopt(
     table.add_row("would claim as", f"{project_id} ({analyzer})")
     table.add_row("would write manifest", str(manifest_path))
     console.print(table)
+
+    # Before anything is said about what would be written. A file that is not
+    # this project's database is not adoptable in a dry run either, and saying
+    # "nothing was written" about it would read as "so far, so good".
+    if contents.refusal:
+        _fail(contents.refusal)
+
     console.print(
         "[bold]Adoption assigns this whole database to the project[/bold], every table and every "
         "historical run. It assigns no run to a campaign: `campaign_id` stays NULL until a run is "
