@@ -1,0 +1,33 @@
+# Example campaign manifest. One collection round: the stops taken in it are
+# meant to be comparable with each other, so it pins what has to stay
+# identical across them.
+#
+# The filename stem, the `campaign_id` here, and the `--campaign` that selects
+# it must all agree. A campaign is never invented: asking for one with no
+# manifest is an error, because a run tagged with a round nobody declared has
+# no settings pinned to it.
+schema_version: 1
+
+campaign_id: 2026-09_day1
+
+# Must match the project this file sits under. A campaign copied between
+# projects, or renamed without its contents following, is refused.
+project_id: example_p25
+
+label: "Day 1, coastal road"
+
+defaults:
+  # A band that disagrees with the project's is fine -- a campaign may narrow
+  # it. What is refused is an explicit --band on the command line that
+  # disagrees with whichever of the two applies: levels recorded under
+  # different bands are not comparable.
+  band: central_800_narrow
+  site: home
+  # Only these three keys, all positive numbers. They are the capture settings
+  # that must not drift between stops for their levels to mean anything
+  # together. Gain is deliberately absent: it belongs to the hardware profile,
+  # which is not written yet, so the site profile remains its only source.
+  capture:
+    center_frequency_hz: 867406250
+    sample_rate_hz: 5000000
+    duration_seconds: 90
