@@ -15,6 +15,8 @@ working unchanged.
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +60,32 @@ def bind_project(*, project_id: str, analyzer: str, database: str | Path) -> Pro
         return wanted
 
 
+@contextmanager
+def project_binding(
+    *, project_id: str, analyzer: str, database: str | Path
+) -> Iterator[ProjectBinding]:
+    """Hold a binding for the length of a block, and drop it on every exit.
+
+    A binding is process-wide, so leaving one behind after the work it was
+    made for has ended is not a tidiness problem: the next thing this process
+    does would be silently judged against a project it is no longer serving.
+    That is why every entry point takes the binding through here rather than
+    calling `bind_project` and hoping to reach a matching `clear_binding` --
+    normal return, an exception, `typer.Exit` from a failure three steps
+    later, all leave through the `finally`.
+
+    Nested identical bindings are safe: only the block that actually made the
+    binding drops it, so an inner scope cannot unbind an outer one.
+    """
+    already = active_binding()
+    binding = bind_project(project_id=project_id, analyzer=analyzer, database=database)
+    try:
+        yield binding
+    finally:
+        if already is None:
+            clear_binding()
+
+
 def active_binding() -> ProjectBinding | None:
     """The binding in force, or `None` when the process is project-agnostic."""
     with _lock:
@@ -71,4 +99,10 @@ def clear_binding() -> None:
         _binding = None
 
 
-__all__ = ["ProjectBinding", "active_binding", "bind_project", "clear_binding"]
+__all__ = [
+    "ProjectBinding",
+    "active_binding",
+    "bind_project",
+    "clear_binding",
+    "project_binding",
+]

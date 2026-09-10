@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +24,14 @@ from typer.testing import CliRunner
 
 from dmr_iq_surveyor.cli_app import app
 from dmr_iq_surveyor.geo.store import connect_geo_database
+from dmr_iq_surveyor.inventory.store import connect_database
 from dmr_iq_surveyor.project.binding import active_binding, clear_binding
 from dmr_iq_surveyor.project.claim import write_claim
-from dmr_iq_surveyor.project.manifest import ProjectDefaults, render_project_manifest
+from dmr_iq_surveyor.project.manifest import (
+    ProjectDefaults,
+    ProjectError,
+    render_project_manifest,
+)
 from dmr_iq_surveyor.web.service import FieldSettings
 
 runner = CliRunner()
@@ -82,19 +88,40 @@ def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-@pytest.fixture()
-def started(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
-    """Captures the settings `serve_forever` would have been handed.
+@dataclass
+class Started:
+    """What `serve_forever` was handed, and what was in force when it was.
 
-    The server is never actually started: what is under test is everything
-    that happens before it, and a test that binds a socket tests the socket.
+    The binding is recorded *inside* the call rather than after it, because
+    after it there must not be one: it is scoped to the serving, not to the
+    process. Only a stand-in for the server can see the difference.
     """
-    seen: list[Any] = []
-    monkeypatch.setattr(
-        "dmr_iq_surveyor.cli_web.serve_forever",
-        lambda settings, **kwargs: seen.append(settings),
-    )
-    return seen
+
+    settings: list[Any] = field(default_factory=list)
+    binding: list[Any] = field(default_factory=list)
+
+
+@pytest.fixture()
+def started(monkeypatch: pytest.MonkeyPatch) -> Started:
+    """Stands in for the server. It is never really started: what is under
+    test is everything that happens before it, and a test that binds a socket
+    tests the socket."""
+    record = Started()
+
+    def _serve_forever(settings: Any, **kwargs: Any) -> None:
+        record.settings.append(settings)
+        record.binding.append(active_binding())
+
+    monkeypatch.setattr("dmr_iq_surveyor.cli_web.serve_forever", _serve_forever)
+    return record
+
+
+def _claim(database: Path, project_id: str) -> None:
+    connection = connect_geo_database(database)
+    try:
+        write_claim(connection, project_id=project_id, analyzer=ANALYZER)
+    finally:
+        connection.close()
 
 
 def _project(
@@ -139,7 +166,9 @@ def _manifest_pointing_at(workspace: Path, database: Path, **defaults: str) -> P
             label="P25 central Israel",
             analyzer=ANALYZER,
             database=database,
-            defaults=ProjectDefaults(band="web_band", site="mobile", **defaults),
+            defaults=ProjectDefaults(
+                **{"band": "web_band", "site": "mobile", **defaults}
+            ),
         ),
         encoding="utf-8",
     )
@@ -156,14 +185,14 @@ def _serve(manifest: Path | None, *extra: str) -> Any:
 # -- the project reaches the running app -------------------------------------
 
 
-def test_project_reaches_the_field_settings(workspace: Path, started: list[Any]) -> None:
+def test_project_reaches_the_field_settings(workspace: Path, started: Started) -> None:
     manifest = _project(workspace)
 
     result = _serve(manifest)
 
     assert result.exit_code == 0, result.output
-    assert started, "the server was never started"
-    settings = started[0]
+    assert started.settings, "the server was never started"
+    settings = started.settings[0]
     assert settings.project_id == PROJECT_ID
     assert settings.project_root == manifest.parent
     assert settings.database_path == (workspace / "db.sqlite3").resolve()
@@ -171,23 +200,25 @@ def test_project_reaches_the_field_settings(workspace: Path, started: list[Any])
     assert settings.site_profile == "mobile"
 
 
-def test_serving_a_project_binds_the_process_to_its_database(
-    workspace: Path, started: list[Any]
+def test_the_binding_is_held_while_serving_and_dropped_afterwards(
+    workspace: Path, started: Started
 ) -> None:
-    """The binding is the enforcement; the settings only record it."""
+    """The binding is the enforcement; the settings only record it. It is
+    scoped to the serving, so it must exist during it and not survive it."""
     manifest = _project(workspace)
 
     assert _serve(manifest).exit_code == 0
 
-    binding = active_binding()
-    assert binding is not None
-    assert binding.project_id == PROJECT_ID
-    assert binding.analyzer == ANALYZER
-    assert binding.database == (workspace / "db.sqlite3").resolve()
+    held = started.binding[0]
+    assert held is not None
+    assert held.project_id == PROJECT_ID
+    assert held.analyzer == ANALYZER
+    assert held.database == (workspace / "db.sqlite3").resolve()
+    assert active_binding() is None, "a binding outlived the server it was made for"
 
 
 def test_without_a_project_nothing_is_bound_and_no_database_is_opened(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     """Every invocation that predates projects, unchanged."""
     database = workspace / "untouched" / "db.sqlite3"
@@ -207,29 +238,29 @@ def test_without_a_project_nothing_is_bound_and_no_database_is_opened(
 
 
 def test_manifest_defaults_apply_when_no_flag_was_typed(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     manifest = _project(workspace, extra=("--output", str(workspace / "from_manifest")))
 
     assert _serve(manifest).exit_code == 0
 
-    assert started[0].output_root == workspace / "from_manifest"
-    assert started[0].recordings_dir == workspace / "from_manifest" / "recordings"
+    assert started.settings[0].output_root == workspace / "from_manifest"
+    assert started.settings[0].recordings_dir == workspace / "from_manifest" / "recordings"
 
 
 def test_an_explicit_output_wins_over_the_manifest_silently(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     manifest = _project(workspace, extra=("--output", str(workspace / "from_manifest")))
 
     result = _serve(manifest, "--output", str(workspace / "typed"))
 
     assert result.exit_code == 0, result.output
-    assert started[0].output_root == workspace / "typed"
+    assert started.settings[0].output_root == workspace / "typed"
 
 
 def test_a_contradicting_band_is_refused_naming_both_sides(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     """Levels recorded under different bands are not comparable, so this is
     the one conflict that is an error rather than an override."""
@@ -239,11 +270,11 @@ def test_a_contradicting_band_is_refused_naming_both_sides(
 
     assert result.exit_code == 1
     assert "other_band" in result.output and "web_band" in result.output
-    assert not started, "the server must not start on a band conflict"
+    assert not started.settings, "the server must not start on a band conflict"
 
 
 def test_passing_the_manifests_own_band_explicitly_is_not_a_conflict(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     """An identical value is agreement, not disagreement -- and a plain
     default must not be mistaken for a typed flag either way."""
@@ -252,14 +283,14 @@ def test_passing_the_manifests_own_band_explicitly_is_not_a_conflict(
     result = _serve(manifest, "--band", "web_band")
 
     assert result.exit_code == 0, result.output
-    assert started[0].band == "web_band"
+    assert started.settings[0].band == "web_band"
 
 
 # -- no creation on a project-aware path -------------------------------------
 
 
 def test_a_missing_database_fails_startup_and_creates_nothing(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     missing = workspace / "nowhere" / "db.sqlite3"
     manifest = _manifest_pointing_at(workspace, missing)
@@ -269,11 +300,11 @@ def test_a_missing_database_fails_startup_and_creates_nothing(
     assert result.exit_code == 1
     assert not missing.exists()
     assert not missing.parent.exists(), "a directory was created for a database that is not there"
-    assert not started
+    assert not started.settings
 
 
 def test_a_zero_byte_file_is_not_silently_schemad(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     """The trap this whole guard exists for: an empty file opens cleanly and
     comes back a full 18-table database."""
@@ -285,11 +316,11 @@ def test_a_zero_byte_file_is_not_silently_schemad(
 
     assert result.exit_code == 1
     assert empty.read_bytes() == b""
-    assert not started
+    assert not started.settings
 
 
 def test_a_file_that_is_not_a_database_is_refused_unchanged(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     notes = workspace / "notes.txt"
     notes.write_text("these are not a database\n", encoding="utf-8")
@@ -299,11 +330,11 @@ def test_a_file_that_is_not_a_database_is_refused_unchanged(
 
     assert result.exit_code == 1
     assert notes.read_text(encoding="utf-8") == "these are not a database\n"
-    assert not started
+    assert not started.settings
 
 
 def test_an_unclaimed_database_is_refused_and_nothing_is_written(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     """A real database, full of real runs, that no project has taken on."""
     unclaimed = workspace / "unclaimed.sqlite3"
@@ -316,11 +347,11 @@ def test_an_unclaimed_database_is_refused_and_nothing_is_written(
     assert result.exit_code == 1
     assert "adopt" in result.output
     assert unclaimed.read_bytes() == before
-    assert not started
+    assert not started.settings
 
 
 def test_a_database_claimed_by_another_project_is_refused(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     foreign = workspace / "foreign.sqlite3"
     connection = connect_geo_database(foreign)
@@ -334,11 +365,11 @@ def test_a_database_claimed_by_another_project_is_refused(
 
     assert result.exit_code == 1
     assert "vor_north" in result.output
-    assert not started
+    assert not started.settings
 
 
 def test_a_directory_where_the_database_should_be_is_refused(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     directory = workspace / "db_dir"
     directory.mkdir()
@@ -347,14 +378,14 @@ def test_a_directory_where_the_database_should_be_is_refused(
     result = _serve(manifest)
 
     assert result.exit_code == 1
-    assert not started
+    assert not started.settings
 
 
 # -- an explicit --database inside a project ---------------------------------
 
 
 def test_an_explicit_database_of_the_same_project_is_accepted(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     """Allowed on purpose: a second database of the same project is a
     legitimate thing to serve. It is not exempt from the guard."""
@@ -369,12 +400,12 @@ def test_an_explicit_database_of_the_same_project_is_accepted(
     result = _serve(manifest, "--database", str(second))
 
     assert result.exit_code == 0, result.output
-    assert started[0].database_path == second.resolve()
-    assert active_binding().database == second.resolve()
+    assert started.settings[0].database_path == second.resolve()
+    assert started.binding[0].database == second.resolve()
 
 
 def test_an_explicit_database_of_another_project_is_refused(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     manifest = _project(workspace)
     other = workspace / "other.sqlite3"
@@ -388,11 +419,11 @@ def test_an_explicit_database_of_another_project_is_refused(
 
     assert result.exit_code == 1
     assert "atis_lod" in result.output
-    assert not started
+    assert not started.settings
 
 
 def test_an_explicit_database_with_the_right_project_but_another_analyzer_is_refused(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     """The guard compares both. A database read by a different analyzer holds
     different things under the same table names."""
@@ -408,7 +439,7 @@ def test_an_explicit_database_with_the_right_project_but_another_analyzer_is_ref
 
     assert result.exit_code == 1
     assert "vor_bearing" in result.output
-    assert not started
+    assert not started.settings
 
 
 # -- campaigns ---------------------------------------------------------------
@@ -423,7 +454,7 @@ def _campaign(manifest: Path, campaign_id: str, body: str) -> Path:
 
 
 def test_a_campaign_without_a_manifest_is_refused_never_invented(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     manifest = _project(workspace)
 
@@ -431,11 +462,11 @@ def test_a_campaign_without_a_manifest_is_refused_never_invented(
 
     assert result.exit_code == 1
     assert "campaign" in result.output.lower()
-    assert not started
+    assert not started.settings
 
 
 def test_a_campaign_manifest_belonging_to_another_project_is_refused(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     manifest = _project(workspace)
     _campaign(
@@ -448,11 +479,11 @@ def test_a_campaign_manifest_belonging_to_another_project_is_refused(
 
     assert result.exit_code == 1
     assert "vor_north" in result.output
-    assert not started
+    assert not started.settings
 
 
 def test_a_campaign_whose_id_disagrees_with_its_filename_is_refused(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     manifest = _project(workspace)
     _campaign(
@@ -464,23 +495,23 @@ def test_a_campaign_whose_id_disagrees_with_its_filename_is_refused(
     result = _serve(manifest, "--campaign", "day1")
 
     assert result.exit_code == 1
-    assert not started
+    assert not started.settings
 
 
 def test_a_project_without_a_campaign_leaves_stops_unassigned(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     manifest = _project(workspace)
 
     result = _serve(manifest)
 
     assert result.exit_code == 0, result.output
-    assert started[0].campaign_id is None
+    assert started.settings[0].campaign_id is None
     assert "unassigned" in result.output
 
 
 def test_a_campaign_pins_the_capture_settings_it_declares(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     manifest = _project(workspace)
     _campaign(
@@ -494,14 +525,14 @@ def test_a_campaign_pins_the_capture_settings_it_declares(
     result = _serve(manifest, "--campaign", "day1")
 
     assert result.exit_code == 0, result.output
-    assert started[0].campaign_id == "day1"
-    assert started[0].center_frequency_hz == 866_500_000.0
-    assert started[0].sample_rate_hz == 2_000_000.0
-    assert started[0].duration_seconds == 60.0
+    assert started.settings[0].campaign_id == "day1"
+    assert started.settings[0].center_frequency_hz == 866_500_000.0
+    assert started.settings[0].sample_rate_hz == 2_000_000.0
+    assert started.settings[0].duration_seconds == 60.0
 
 
 def test_a_typed_capture_flag_wins_over_the_campaign(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     manifest = _project(workspace)
     _campaign(
@@ -514,11 +545,11 @@ def test_a_typed_capture_flag_wins_over_the_campaign(
     result = _serve(manifest, "--campaign", "day1", "--sample-rate", "3000000")
 
     assert result.exit_code == 0, result.output
-    assert started[0].sample_rate_hz == 3_000_000.0
+    assert started.settings[0].sample_rate_hz == 3_000_000.0
 
 
 def test_a_campaign_band_beats_the_project_band(
-    workspace: Path, started: list[Any]
+    workspace: Path, started: Started
 ) -> None:
     manifest = _project(workspace)
     _campaign(
@@ -531,7 +562,7 @@ def test_a_campaign_band_beats_the_project_band(
     result = _serve(manifest, "--campaign", "day1")
 
     assert result.exit_code == 0, result.output
-    assert started[0].band == "other_band"
+    assert started.settings[0].band == "other_band"
 
 
 # -- the state the app hands the phone ---------------------------------------
@@ -557,24 +588,160 @@ def test_api_state_settings_still_serialise_with_the_new_fields() -> None:
 
 
 def test_the_guard_covers_opens_the_startup_check_never_sees(
-    workspace: Path, started: list[Any]
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The binding is not a one-off startup check. Once serving, any open of
-    another database -- a survey, a solve, /api/state -- is refused too."""
-    from dmr_iq_surveyor.inventory.store import connect_database
-    from dmr_iq_surveyor.project.manifest import ProjectError
+    """The binding is not a one-off startup check. While serving, any open of
+    another database -- a survey, a solve, /api/state -- is refused too.
 
+    Asserted from inside the stand-in for the server, because that is the only
+    place the binding is in force: after `web serve` returns there is
+    deliberately no binding left to test.
+    """
     manifest = _project(workspace)
-    assert _serve(manifest).exit_code == 0
-
     elsewhere = workspace / "elsewhere.sqlite3"
-    with pytest.raises(ProjectError):
-        connect_database(elsewhere)
-    assert not elsewhere.exists()
+    checked: list[str] = []
 
-    # And the bound one still opens.
-    opened = connect_database(workspace / "db.sqlite3")
-    try:
-        assert isinstance(opened, sqlite3.Connection)
-    finally:
-        opened.close()
+    def _while_serving(settings: Any, **kwargs: Any) -> None:
+        with pytest.raises(ProjectError):
+            connect_database(elsewhere)
+        assert not elsewhere.exists()
+        # And the bound one still opens.
+        opened = connect_database(workspace / "db.sqlite3")
+        try:
+            assert isinstance(opened, sqlite3.Connection)
+        finally:
+            opened.close()
+        checked.append("ok")
+
+    monkeypatch.setattr("dmr_iq_surveyor.cli_web.serve_forever", _while_serving)
+
+    result = _serve(manifest)
+
+    assert result.exit_code == 0, result.output
+    assert checked == ["ok"], "the assertions inside the server never ran"
+
+
+# -- the binding does not outlive the serving --------------------------------
+
+
+def test_no_binding_survives_a_profile_that_will_not_resolve(
+    workspace: Path, started: Started
+) -> None:
+    """The manifest resolves and the process binds; the band it names does
+    not exist, and the failure is three steps later."""
+    manifest = _manifest_pointing_at(
+        workspace, workspace / "db.sqlite3", band="no_such_band"
+    )
+    _claim(workspace / "db.sqlite3", PROJECT_ID)
+
+    result = _serve(manifest)
+
+    assert result.exit_code == 1
+    assert "Profile could not be resolved" in result.output
+    assert not started.settings
+    assert active_binding() is None
+
+
+def test_no_binding_survives_a_token_that_will_not_resolve(
+    workspace: Path, started: Started
+) -> None:
+    manifest = _project(workspace)
+
+    result = _serve(manifest, "--token-file", str(workspace / "absent.token"))
+
+    assert result.exit_code == 1
+    assert not started.settings
+    assert active_binding() is None
+
+
+def test_no_binding_survives_a_tls_setup_that_fails(
+    workspace: Path, started: Started
+) -> None:
+    manifest = _project(workspace)
+
+    result = _serve(manifest, "--tls-cert", str(workspace / "cert.pem"))
+
+    assert result.exit_code == 1
+    assert not started.settings
+    assert active_binding() is None
+
+
+def test_no_binding_survives_a_bad_campaign_id(
+    workspace: Path, started: Started
+) -> None:
+    """`--campaign` is validated after the binding is made, so this is a real
+    exit path through the scope and not a hypothetical one."""
+    manifest = _project(workspace)
+    _campaign(
+        manifest,
+        "day1",
+        f"schema_version: 1\ncampaign_id: day1\nproject_id: {PROJECT_ID}\nlabel: Day 1\n",
+    )
+
+    result = _serve(manifest, "--campaign", "day1", "--band", "other_band")
+
+    assert result.exit_code == 1
+    assert active_binding() is None
+
+
+def test_no_binding_survives_an_exception_from_the_server(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash is the path a `finally` exists for."""
+    manifest = _project(workspace)
+
+    def _explode(settings: Any, **kwargs: Any) -> None:
+        raise RuntimeError("the socket went away")
+
+    monkeypatch.setattr("dmr_iq_surveyor.cli_web.serve_forever", _explode)
+
+    result = _serve(manifest)
+
+    assert isinstance(result.exception, RuntimeError)
+    assert active_binding() is None
+
+
+def test_no_binding_survives_a_refused_database(
+    workspace: Path, started: Started
+) -> None:
+    """The binding is made before the verifying open, so the refusal itself
+    has to leave through the scope."""
+    unclaimed = workspace / "unclaimed.sqlite3"
+    connect_geo_database(unclaimed).close()
+    manifest = _manifest_pointing_at(workspace, unclaimed)
+
+    result = _serve(manifest)
+
+    assert result.exit_code == 1
+    assert active_binding() is None
+
+
+def test_a_second_serve_in_the_same_process_can_bind_another_project(
+    workspace: Path, started: Started
+) -> None:
+    """What a leaked binding would break: `bind_project` refuses to rebind, so
+    one leftover binding would make every later project unservable."""
+    first = _project(workspace)
+    assert _serve(first).exit_code == 0
+
+    second_db = workspace / "second.sqlite3"
+    connect_geo_database(second_db).close()
+    _claim(second_db, "vor_north")
+    second = workspace / "projects" / "vor" / "project.yaml"
+    second.parent.mkdir(parents=True, exist_ok=True)
+    second.write_text(
+        render_project_manifest(
+            project_id="vor_north",
+            label="A second project",
+            analyzer=ANALYZER,
+            database=second_db,
+            defaults=ProjectDefaults(band="web_band", site="mobile"),
+        ),
+        encoding="utf-8",
+    )
+
+    result = _serve(second)
+
+    assert result.exit_code == 0, result.output
+    assert started.binding[1].project_id == "vor_north"
+    assert active_binding() is None
