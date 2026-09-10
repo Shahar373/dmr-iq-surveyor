@@ -225,6 +225,8 @@ codebase, so the check there covers every open, direct or indirect —
 `/api/state`, `run_survey`, `materialise_measurements`, `solve_all_sites`, a
 live drive. In order, before anything is written:
 
+0. a binding exists at all — it is held for the length of the work it was made
+   for and dropped in a `finally`, never left behind on a failure;
 1. the path must equal the bound path — a stray `--database` inside the process
    is refused;
 2. the file must exist, be non-empty, and begin with `SQLite format 3\0`,
@@ -257,6 +259,19 @@ exist and must agree with the project id and with its own filename. Without it,
 project defaults apply and stops recorded stay unassigned — which is what every
 run recorded before campaigns existed is.
 
+The filename is checked unconditionally, including when it is not a valid
+slug. A campaign is *found* by its filename, so `Day One.yaml` is not a
+cosmetic problem: it is a file that can be read by path and never by name, a
+campaign that exists when listed and is missing when asked for.
+
+**The binding lasts exactly as long as the serving.** It is made before the
+verifying open and dropped on every way out — a profile that will not resolve,
+a token file with the wrong mode, TLS that cannot be configured, an exception,
+or the server returning normally. That matters because the binding is
+process-wide and cannot be replaced once set: one left behind would judge
+whatever the process did next against a project it was no longer serving, and
+would make a second `web serve` in the same process impossible.
+
 ### Precedence
 
 Highest first: **explicit flag → campaign manifest → project manifest → the
@@ -268,7 +283,7 @@ decides whether a manifest is overridden or a conflict is refused.
 
 | key | behaviour |
 |---|---|
-| `band` | a contradicting explicit flag is **refused**, naming both values and both origins |
+| `band` | a contradicting explicit flag is **refused**, naming both values and both origins. Compared by resolved content, not by spelling, so a name and a path to the same profile agree — and so does a copy of it |
 | `database` | an explicit flag is allowed, but the alternative must exist and carry the same project's claim for the same analyzer |
 | `output`, `recordings`, `tls-dir`, `token-file` | the flag wins, silently |
 | `capture` settings | a campaign pins them; an explicit flag wins |
