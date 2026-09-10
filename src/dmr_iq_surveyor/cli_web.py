@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 import secrets
 import socket
+import sqlite3
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,16 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
+from dmr_iq_surveyor.inventory.store import connect_database
+from dmr_iq_surveyor.project.binding import bind_project, clear_binding
+from dmr_iq_surveyor.project.manifest import (
+    CampaignManifest,
+    ProjectError,
+    ProjectManifest,
+    resolve_campaign,
+    resolve_project,
+    resolve_setting,
+)
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
 from dmr_iq_surveyor.survey.profiles import (
     ProfileError,
@@ -213,8 +224,123 @@ def token_query_suffix(resolved: ResolvedToken) -> str:
     return f"?token={resolved.value}"
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectContext:
+    """Everything a resolved `--project` decides, before anything is opened."""
+
+    manifest: ProjectManifest
+    campaign: CampaignManifest | None
+    band: str
+    site: str
+    output: Path
+    database: Path
+    capture: dict[str, float]
+    notices: list[str]
+
+
+def _flag_was_typed(ctx: typer.Context | None, name: str) -> bool:
+    """Whether the operator actually passed this flag, or it is the default.
+
+    `--band` has a non-None default, so its value alone cannot say whether it
+    was chosen or merely inherited -- and the difference decides whether a
+    manifest is overridden or a conflict is refused. Click records the source
+    of every parameter, which is the only honest answer.
+    """
+    if ctx is None:
+        return False
+    # Click answers `None` for a name it does not know, which would quietly
+    # read as "not typed" and turn a misspelled parameter name here into a
+    # manifest that silently wins over an explicit flag. The names are
+    # Python identifiers, not the `--dashed` spellings.
+    known = {parameter.name for parameter in getattr(ctx.command, "params", ())}
+    if known and name not in known:
+        raise KeyError(f"{name!r} is not a parameter of this command; known: {sorted(known)}")
+    source = ctx.get_parameter_source(name)
+    return getattr(source, "name", "") == "COMMANDLINE"
+
+
+def _resolve_project_context(
+    ctx: typer.Context | None,
+    *,
+    project: str,
+    campaign: str | None,
+    band: str,
+    site: str,
+    output: Path,
+    database: Path | None,
+) -> ProjectContext:
+    """Resolve the project, its campaign and the settings they decide.
+
+    Reads files only. No database is opened here and none is bound, so a
+    manifest that turns out to be wrong costs nothing.
+    """
+    manifest = resolve_project(project)
+    resolved_campaign = resolve_campaign(manifest, campaign) if campaign else None
+
+    campaign_defaults = resolved_campaign.defaults if resolved_campaign else None
+    band_choice = resolve_setting(
+        "band",
+        flag=band,
+        flag_explicit=_flag_was_typed(ctx, "band"),
+        campaign=campaign_defaults.band if campaign_defaults else None,
+        project=manifest.defaults.band,
+    )
+    site_choice = resolve_setting(
+        "site",
+        flag=site,
+        flag_explicit=_flag_was_typed(ctx, "site"),
+        campaign=campaign_defaults.site if campaign_defaults else None,
+        project=manifest.defaults.site,
+    )
+    output_choice = resolve_setting(
+        "output",
+        flag=output,
+        flag_explicit=_flag_was_typed(ctx, "output"),
+        project=Path(manifest.defaults.output) if manifest.defaults.output else None,
+    )
+
+    # An explicit `--database` may point somewhere else -- at a second
+    # database of the same project, say -- but it is not exempt from the
+    # guard: the binding below is made against whatever wins here, and
+    # opening it then requires it to exist and to carry this project's
+    # claim.
+    if _flag_was_typed(ctx, "database") and database is not None:
+        database_choice = database
+    else:
+        database_choice = manifest.database
+
+    notices = [
+        f"Project {manifest.project_id!r} ({manifest.label}) from {manifest.path}",
+        f"Analyzer {manifest.analyzer}, database {database_choice}",
+    ]
+    if resolved_campaign is not None:
+        notices.append(
+            f"Campaign {resolved_campaign.campaign_id!r} ({resolved_campaign.label}) "
+            f"from {resolved_campaign.path}"
+        )
+    else:
+        notices.append(
+            "No campaign given: project defaults apply and stops recorded here stay unassigned"
+        )
+    for key, choice in (("band", band_choice), ("site", site_choice), ("output", output_choice)):
+        if choice.from_manifest:
+            notices.append(f"{key} {choice.value!s} from the {choice.origin} manifest")
+
+    return ProjectContext(
+        manifest=manifest,
+        campaign=resolved_campaign,
+        band=str(band_choice.value),
+        site=str(site_choice.value),
+        output=Path(output_choice.value),
+        database=Path(database_choice).expanduser().resolve(),
+        capture=dict(campaign_defaults.capture) if campaign_defaults else {},
+        notices=notices,
+    )
+
+
 @web_app.command("serve")
 def web_serve(
+    ctx: typer.Context,
     host: Annotated[
         str,
         typer.Option(
@@ -241,6 +367,19 @@ def web_serve(
     site: Annotated[
         str, typer.Option(help="Site profile name or path, providing the fixed equipment context")
     ] = "home",
+    project: Annotated[
+        str | None,
+        typer.Option(
+            "--project",
+            help=(
+                "Project manifest path, or a name looked up as "
+                "projects/<name>/project.yaml. Serves that project: its database must "
+                "already exist and already carry its claim, and this process will open "
+                "no other. Left unset nothing binds and the app behaves exactly as it "
+                "always has"
+            ),
+        ),
+    ] = None,
     campaign: Annotated[
         str | None,
         typer.Option(
@@ -248,7 +387,8 @@ def web_serve(
             help=(
                 "Collection round this run belongs to, e.g. 2026-09_day1. Lower case, "
                 "digits, '.', '_' and '-'. Left unset the run is unassigned, which is "
-                "what every run recorded before campaigns existed is"
+                "what every run recorded before campaigns existed is. With --project it "
+                "also selects campaigns/<id>.yaml, which must already exist"
             ),
         ),
     ] = None,
@@ -409,6 +549,66 @@ def web_serve(
     unless `--host` says otherwise. On an open network, pass `--token auto`
     and use the printed URL.
     """
+    # Before profile resolution, because the manifest may be what supplies
+    # the band, the site, the output root and the database those steps and
+    # everything after them consume. Manifests are read here; nothing is
+    # opened and nothing is bound yet, so a wrong one costs nothing.
+    project_context: ProjectContext | None = None
+    if project is not None:
+        try:
+            project_context = _resolve_project_context(
+                ctx,
+                project=project,
+                campaign=campaign,
+                band=band,
+                site=site,
+                output=output,
+                database=database,
+            )
+        except (ProjectError, ProvenanceError, FileNotFoundError, OSError) as exc:
+            console.print(f"[bold red]Project could not be resolved:[/bold red] {exc}")
+            raise typer.Exit(code=1) from exc
+        for notice in project_context.notices:
+            console.print(f"[green]Project:[/green] {notice}")
+        band = project_context.band
+        site = project_context.site
+        output = project_context.output
+        database = project_context.database
+        if not _flag_was_typed(ctx, "center_frequency"):
+            center_frequency = project_context.capture.get(
+                "center_frequency_hz", center_frequency
+            )
+        if not _flag_was_typed(ctx, "sample_rate"):
+            sample_rate = project_context.capture.get("sample_rate_hz", sample_rate)
+        if not _flag_was_typed(ctx, "duration"):
+            duration = project_context.capture.get("duration_seconds", duration)
+
+        # Bind, then open once. From here on this process may open exactly
+        # one path, and only if it already exists and already carries this
+        # project's claim -- so a missing, empty, non-SQLite or foreign
+        # database fails startup right here, with no file and no directory
+        # left behind. The binding is not a startup check that is then
+        # forgotten: it sits on the single `sqlite3.connect` in the
+        # codebase, so every later open -- /api/state, a survey, a solve, a
+        # live drive -- is checked too.
+        bind_project(
+            project_id=project_context.manifest.project_id,
+            analyzer=project_context.manifest.analyzer,
+            database=project_context.database,
+        )
+        try:
+            connect_database(project_context.database).close()
+        except (ProjectError, sqlite3.Error) as exc:
+            # This process is not serving that project after all, so it must
+            # not go on carrying its binding.
+            clear_binding()
+            console.print(f"[bold red]Project database refused:[/bold red] {exc}")
+            console.print(
+                "Create one with `dmr-surveyor project init --create`, or adopt an "
+                "existing database with `dmr-surveyor project init --adopt --write`."
+            )
+            raise typer.Exit(code=1) from exc
+
     # Resolved BEFORE FieldSettings, and before anything is paid for: a typo
     # here must fail now, not after the operator has driven somewhere and
     # recorded a 90 s stop against a profile that doesn't exist. The
@@ -458,6 +658,8 @@ def web_serve(
         output_root=output,
         band=band,
         campaign_id=campaign,
+        project_id=project_context.manifest.project_id if project_context else None,
+        project_root=project_context.manifest.root if project_context else None,
         site_profile=site,
         center_frequency_hz=center_frequency,
         sample_rate_hz=sample_rate,

@@ -138,6 +138,15 @@ class FieldSettings:
     # unassigned, which is what every stop recorded before campaigns
     # existed is, and it stays that way rather than being backfilled.
     campaign_id: str | None = None
+    # Which project this server was started for, when it was started with
+    # one. `None` is every invocation that predates projects: nothing is
+    # bound, the database is whatever `--database` named, and the app
+    # behaves exactly as it did. Set, they are a record of the manifest the
+    # settings above were resolved from -- reported to the client, never
+    # consulted to decide anything, because the binding made in `cli_web`
+    # is what actually enforces which database this process may open.
+    project_id: str | None = None
+    project_root: Path | None = None
     center_frequency_hz: float = 867_406_250.0
     sample_rate_hz: float = 5_000_000.0
     # 90 s at 5 MS/s is 1.68 GiB. With one recording kept that peaks at
@@ -271,6 +280,11 @@ class FieldSettings:
         payload.pop("token", None)
         for key in ("database_path", "recordings_dir", "output_root", "profile_base_dir"):
             payload[key] = str(payload[key])
+        # Optional, so it cannot join the loop above: `str(None)` would put
+        # the string "None" on the wire as if it were a path.
+        payload["project_root"] = (
+            str(self.project_root) if self.project_root is not None else None
+        )
         payload["map_center"] = list(self.map_center)
         payload["live_anchor"] = list(self.live_anchor) if self.live_anchor else None
         payload["tool_version"] = __version__

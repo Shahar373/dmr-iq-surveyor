@@ -179,6 +179,11 @@ _PROJECT_KEYS = {"schema_version", "project_id", "label", "analyzer", "database"
 _PROJECT_DEFAULT_KEYS = {"band", "site", "output"}
 _CAMPAIGN_KEYS = {"schema_version", "campaign_id", "project_id", "label", "defaults"}
 _CAMPAIGN_DEFAULT_KEYS = {"band", "site", "capture"}
+# The three capture settings a collection round may pin. Restricted on
+# purpose: a campaign fixes what has to stay identical across stops for
+# their levels to be comparable, and a key nothing reads would be a
+# setting an operator believes is in force when it is not.
+_CAMPAIGN_CAPTURE_KEYS = {"center_frequency_hz", "sample_rate_hz", "duration_seconds"}
 
 
 def load_project_manifest(path: str | Path) -> ProjectManifest:
@@ -350,9 +355,23 @@ def load_campaign_manifest(
     if not isinstance(defaults_raw, dict):
         raise ProjectError(f"{resolved}: defaults must be a mapping")
     _reject_unknown_keys(defaults_raw, _CAMPAIGN_DEFAULT_KEYS, f"{resolved} defaults")
-    capture = defaults_raw.get("capture") or {}
-    if not isinstance(capture, dict):
+    capture_raw = defaults_raw.get("capture") or {}
+    if not isinstance(capture_raw, dict):
         raise ProjectError(f"{resolved}: defaults.capture must be a mapping")
+    _reject_unknown_keys(capture_raw, _CAMPAIGN_CAPTURE_KEYS, f"{resolved} defaults.capture")
+    capture: dict[str, Any] = {}
+    for key, value in capture_raw.items():
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ProjectError(
+                f"{resolved}: defaults.capture.{key} must be a number, got {value!r}"
+            ) from exc
+        if number <= 0:
+            raise ProjectError(f"{resolved}: defaults.capture.{key} must be positive")
+        capture[key] = number
 
     return CampaignManifest(
         schema_version=version,
