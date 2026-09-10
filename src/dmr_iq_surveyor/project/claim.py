@@ -120,6 +120,45 @@ class Claim:
     claimed_by_version: str
 
 
+def open_read_only(path: str | Path) -> sqlite3.Connection:
+    """Open an existing database for reading and nothing else.
+
+    SQLite's `mode=ro` refuses a file that does not exist and refuses every
+    write, so this cannot create a database however wrong the path is --
+    which is what the reporting half of adoption needs. Verified: opening a
+    missing path raises and leaves nothing behind, and an INSERT through
+    the result raises `attempt to write a readonly database`.
+    """
+    resolved = require_existing_database(path)
+    connection = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def summarise_contents(connection: sqlite3.Connection) -> dict[str, int]:
+    """Row counts for the tables an operator would recognise.
+
+    What adoption prints so the operator can tell the database they meant
+    from one they did not. A table that is absent is reported as absent
+    rather than as zero: those are different facts.
+    """
+    counts: dict[str, int] = {}
+    for table in (
+        "runs",
+        "survey_runs",
+        "rf_observations",
+        "geo_measurements",
+        "p25_sites",
+    ):
+        try:
+            counts[table] = int(
+                connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            )
+        except sqlite3.OperationalError:
+            continue
+    return counts
+
+
 def read_claim(connection: sqlite3.Connection) -> Claim | None:
     """The claim this database carries, or `None` if it carries none.
 
@@ -254,6 +293,8 @@ __all__ = [
     "Claim",
     "DatabaseFile",
     "assert_claim",
+    "open_read_only",
+    "summarise_contents",
     "inspect_database",
     "read_claim",
     "require_existing_database",

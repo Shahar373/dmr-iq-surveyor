@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dmr_iq_surveyor.cli_geo import geo_app
 from dmr_iq_surveyor.cli_live import live_app
+from dmr_iq_surveyor.cli_project import project_app
 from dmr_iq_surveyor.cli_survey import survey_app
 from dmr_iq_surveyor.cli_v4 import app, console
 from dmr_iq_surveyor.cli_web import web_app
@@ -18,6 +19,7 @@ app.add_typer(survey_app, name="survey")
 app.add_typer(geo_app, name="geo")
 app.add_typer(web_app, name="web")
 app.add_typer(live_app, name="live")
+app.add_typer(project_app, name="project")
 
 __all__ = ["app", "console"]
 

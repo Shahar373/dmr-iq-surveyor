@@ -184,7 +184,17 @@ _CAMPAIGN_DEFAULT_KEYS = {"band", "site", "capture"}
 def load_project_manifest(path: str | Path) -> ProjectManifest:
     """Parse and fully validate one `project.yaml`. Opens no database."""
     resolved = Path(path).expanduser().resolve()
-    raw = _load_mapping(resolved)
+    return project_from_mapping(_load_mapping(resolved), resolved)
+
+
+def project_from_mapping(raw: dict[str, Any], resolved: Path) -> ProjectManifest:
+    """Validate an already-parsed project mapping.
+
+    Split out so a manifest can be checked while it is still a string in
+    memory. Adoption renders one, validates it here, and only then goes
+    near a database -- an invalid manifest must never be the reason a
+    database was touched.
+    """
     _reject_unknown_keys(raw, _PROJECT_KEYS, str(resolved))
     version = _check_schema_version(raw, str(resolved))
     _require(raw, ("project_id", "label", "analyzer", "database"), str(resolved))
@@ -225,6 +235,71 @@ def load_project_manifest(path: str | Path) -> ProjectManifest:
         ),
         path=resolved,
     )
+
+
+RENDER_HEADER = (
+    "# Written by `dmr-surveyor project`. Edit by hand freely; every key is\n"
+    "# validated on load, and an unknown one is an error rather than ignored.\n"
+)
+
+
+def render_project_manifest(
+    *,
+    project_id: str,
+    label: str,
+    analyzer: str,
+    database: str | Path,
+    defaults: ProjectDefaults | None = None,
+) -> str:
+    """The text of a project manifest, ready to validate and write."""
+    body: dict[str, Any] = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "project_id": project_id,
+        "label": label,
+        "analyzer": analyzer,
+        "database": str(database),
+    }
+    declared = {
+        key: value
+        for key, value in (defaults or ProjectDefaults()).to_dict().items()
+        if value is not None
+    }
+    if declared:
+        body["defaults"] = declared
+    return RENDER_HEADER + yaml.safe_dump(body, sort_keys=False, allow_unicode=True)
+
+
+def render_campaign_manifest(
+    *,
+    campaign_id: str,
+    project_id: str,
+    label: str,
+    defaults: CampaignDefaults | None = None,
+) -> str:
+    """The text of a campaign manifest, ready to validate and write."""
+    body: dict[str, Any] = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "campaign_id": campaign_id,
+        "project_id": project_id,
+        "label": label,
+    }
+    resolved = defaults or CampaignDefaults()
+    declared = {
+        key: value
+        for key, value in resolved.to_dict().items()
+        if value not in (None, {})
+    }
+    if declared:
+        body["defaults"] = declared
+    return RENDER_HEADER + yaml.safe_dump(body, sort_keys=False, allow_unicode=True)
+
+
+def validate_project_text(text: str, source: str | Path) -> ProjectManifest:
+    """Check a manifest that has not been written anywhere yet."""
+    raw = yaml.safe_load(text)
+    if not isinstance(raw, dict):
+        raise ProjectError(f"{source} must contain a mapping")
+    return project_from_mapping(raw, Path(source).expanduser().resolve())
 
 
 def load_campaign_manifest(
