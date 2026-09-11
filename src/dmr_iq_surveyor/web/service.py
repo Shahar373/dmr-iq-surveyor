@@ -67,6 +67,14 @@ from dmr_iq_surveyor.web.devices import STATE_CHECKING as DEVICE_STATE_CHECKING
 from dmr_iq_surveyor.web.devices import DeviceMonitor
 from dmr_iq_surveyor.web.jobs import Job, JobRegistry
 from dmr_iq_surveyor.web.recordings import disk_status, enforce_retention, purge_recordings
+from dmr_iq_surveyor.web.viewscope import (
+    CAMPAIGN_PREFIX,
+    CURRENT_VIEW,
+    LEGACY_VIEW,
+    ViewScope,
+    parse_view_scope,
+    refuse_if_read_only,
+)
 
 _SLUG = re.compile(r"[^a-z0-9]+")
 
@@ -140,6 +148,13 @@ class FieldSettings:
     # Which collection round the stops taken here belong to. Unset means
     # unassigned, which is what every stop recorded before campaigns
     # existed is, and it stays that way rather than being backfilled.
+    #
+    # Read it through `capture_campaign_id` below wherever the value is
+    # about *writing*. The field keeps its name because it is on the wire in
+    # `/api/state` and named by `--campaign`, but it is no longer also the
+    # answer to "what is the operator looking at" -- that is a per-request
+    # `ViewScope`, and confusing the two is what hid 51 rounds of earlier
+    # work the moment a campaign was named.
     campaign_id: str | None = None
     # Which project this server was started for, when it was started with
     # one. `None` is every invocation that predates projects: nothing is
@@ -281,6 +296,16 @@ class FieldSettings:
     map_center: tuple[float, float] = (32.0853, 34.7818)
     map_zoom: int = 11
     token: str | None = None
+
+    @property
+    def capture_campaign_id(self) -> str | None:
+        """The one campaign new evidence is written into.
+
+        A view can be anything; this cannot. Every `run_survey` call and
+        every drive bin takes its campaign from here, so a change of view
+        can never move where the next stop lands.
+        """
+        return self.campaign_id
 
     def to_public_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -527,8 +552,28 @@ class FieldService:
 
         Unset -- the deployment that names no campaign -- is
         `WHOLE_DATABASE`, which is exactly what the app did before.
+
+        This is the *capture* campaign's scope, and it stays that: every job,
+        every rebuild and both mutation guards below are about the round
+        being recorded, whatever the page happens to be showing. Reads go
+        through `_read_scope` instead.
         """
-        return CampaignScope(self.settings.campaign_id)
+        return CampaignScope(self.settings.capture_campaign_id)
+
+    def resolve_view(self, raw: str | None) -> ViewScope:
+        """Turn a `?scope=` value into a view, or refuse it in words."""
+        return parse_view_scope(
+            raw, capture_campaign_id=self.settings.capture_campaign_id
+        )
+
+    def _read_scope(self, view: ViewScope) -> CampaignScope:
+        """The boundary one read looks through.
+
+        `CURRENT_VIEW` -- the default everywhere, and what a client that has
+        never heard of view scopes sends -- reduces to `_scope()` exactly, so
+        an unscoped request produces byte-identical SQL to before.
+        """
+        return view.read_scope(self.settings.capture_campaign_id)
 
     def _hardware_profile(self) -> HardwareProfile | None:
         """The campaign's hardware profile, or `None` when none is named.
@@ -552,11 +597,11 @@ class FieldService:
         except (ProfileError, FileNotFoundError, OSError):
             return None
 
-    def sites_overview(self) -> list[dict[str, Any]]:
+    def sites_overview(self, view: ViewScope = CURRENT_VIEW) -> list[dict[str, Any]]:
         """Just the sites. `/api/sites` used to build the whole state
         payload -- SDR probe included -- and throw all but this away."""
         return site_overview(
-            database_path=self.settings.database_path, scope=self._scope()
+            database_path=self.settings.database_path, scope=self._read_scope(view)
         )
 
     def require_device_ready(self) -> None:
@@ -593,13 +638,16 @@ class FieldService:
         """Release background workers. Called when the server shuts down."""
         self.devices.close()
 
-    def survey_runs(self, limit: int = 25) -> list[dict[str, Any]]:
-        predicate, parameters = self._scope().where("r")
+    def survey_runs(
+        self, limit: int = 25, view: ViewScope = CURRENT_VIEW
+    ) -> list[dict[str, Any]]:
+        predicate, parameters = self._read_scope(view).where("r")
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
             rows = connection.execute(
                 """
                 SELECT survey_run_id, site_id, capture_start_utc, coverage_status,
+                       campaign_id,
                        gps_latitude, gps_longitude, gps_source, analyzed_seconds,
                        (SELECT COUNT(*) FROM rf_observations o
                         WHERE o.survey_run_id = r.survey_run_id) AS observation_count
@@ -624,7 +672,8 @@ class FieldService:
             keep_recordings=self.settings.keep_recordings,
         ).to_dict()
 
-    def purge(self) -> dict[str, Any]:
+    def purge(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
+        refuse_if_read_only(view, "purging recordings", self.settings.capture_campaign_id)
         return purge_recordings(self.settings.recordings_dir)
 
     def position_age_seconds(self) -> float | None:
@@ -638,38 +687,106 @@ class FieldService:
             return None
         return max(0.0, (datetime.now(UTC) - marked).total_seconds())
 
-    def state(self) -> dict[str, Any]:
+    def campaign_census(self) -> list[dict[str, Any]]:
+        """How many runs each campaign holds, unassigned included.
+
+        One grouped scan of `survey_runs` and nothing else: it is what lets
+        the page say "nothing in this campaign yet, but 51 rounds are filed
+        under Legacy" instead of an empty map that reads as a broken app.
+        Cheap enough to run on every `/api/state` -- the group is over a
+        table with one row per stop, which is hundreds, not millions.
+
+        Ordered unassigned-first, then by id, so the list reads the way the
+        selector offers it.
+        """
+        connection = connect_geo_database(Path(self.settings.database_path))
+        try:
+            rows = connection.execute(
+                """
+                SELECT campaign_id, COUNT(*) AS runs
+                FROM survey_runs
+                GROUP BY campaign_id
+                ORDER BY campaign_id IS NOT NULL, campaign_id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        return [
+            {
+                "campaign_id": row["campaign_id"],
+                "view": LEGACY_VIEW.token if row["campaign_id"] is None
+                else f"{CAMPAIGN_PREFIX}{row['campaign_id']}",
+                "runs": int(row["runs"]),
+            }
+            for row in rows
+        ]
+
+    def scope_state(self, view: ViewScope, *, counts: dict[str, int]) -> dict[str, Any]:
+        """Everything the page needs to say where it is and what it may do.
+
+        Additive: `settings.campaign_id` keeps meaning exactly what it meant,
+        for any client that already reads it. This block is the one that
+        distinguishes the two roles the single value used to play.
+        """
+        capture = self.settings.capture_campaign_id
+        census = self.campaign_census()
+        return {
+            "project_id": self.settings.project_id,
+            "capture_campaign_id": capture,
+            "hardware_profile": self.settings.hardware_profile,
+            "view": view.token,
+            "view_label": view.label(capture),
+            "read_only": view.is_read_only,
+            # Whether there is anything to go and look at, so the page can
+            # offer Legacy honestly rather than advertising an empty view.
+            "has_legacy": any(entry["campaign_id"] is None for entry in census),
+            "campaigns": census,
+            "counts": counts,
+        }
+
+    def state(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
+        sites = self.sites_overview(view)
+        runs = self.survey_runs(view=view)
+        stops = self.stops(view)
         return {
             "settings": self.settings.to_public_dict(),
             "position": self.get_position(),
             "position_age_seconds": self.position_age_seconds(),
             "device": self.device_probe(),
             "disk": self.disk(),
-            "sites": self.sites_overview(),
-            "runs": self.survey_runs(),
-            "stops": self.stops(),
-            "plan": self.plan(),
+            "sites": sites,
+            "runs": runs,
+            "stops": stops,
+            "plan": self.plan(view),
             "jobs": self.jobs.list(),
             "live": self.live_status(),
+            "scope": self.scope_state(
+                view,
+                counts={
+                    "sites": len(sites),
+                    "runs": len(runs),
+                    "stops": len(stops),
+                },
+            ),
             "geolocation": {
                 "maturity": GEOLOCATION_MATURITY,
                 "validation_note": VALIDATION_NOTE,
             },
         }
 
-    def geojson(self) -> dict[str, Any]:
+    def geojson(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
         collection = build_map_geojson(
-            database_path=self.settings.database_path, scope=self._scope()
+            database_path=self.settings.database_path, scope=self._read_scope(view)
         )
-        plan = self.plan()
+        plan = self.plan(view)
         collection["features"].extend(plan.get("geojson", {}).get("features", []))
         return collection
 
-    def plan(self) -> dict[str, Any]:
+    def plan(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
         """The latest next-stop plan, or an explicit note that there is none."""
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
-            stored = latest_plan(connection, scope=self._scope())
+            stored = latest_plan(connection, scope=self._read_scope(view))
         finally:
             connection.close()
         if stored is None:
@@ -687,7 +804,7 @@ class FieldService:
             "geojson": json.loads(stored["geojson"] or "{}"),
         }
 
-    def site_history(self, site_key: str) -> dict[str, Any]:
+    def site_history(self, site_key: str, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
         """How one site's region changed as sessions accumulated."""
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
@@ -697,26 +814,30 @@ class FieldService:
             if row is None:
                 raise ValueError(f"unknown site key: {site_key}")
             history = solution_history(
-                connection, int(row["p25_site_id"]), scope=self._scope()
+                connection, int(row["p25_site_id"]), scope=self._read_scope(view)
             )
         finally:
             connection.close()
         return {"site_key": site_key, "history": history}
 
-    def stops(self) -> list[dict[str, Any]]:
-        """Every stop in this app's campaign, with whether it is contributing
-        and why not.
+    def stops(self, view: ViewScope = CURRENT_VIEW) -> list[dict[str, Any]]:
+        """Every stop the current view covers, with whether it is
+        contributing and why not.
 
-        Scoped like every other read here: a session serving one campaign
-        must not list -- and, through `set_stop_excluded`/`delete_stop`,
-        must not be able to touch -- another campaign's stops.
+        Two different scopes meet here, and they are deliberately not the
+        same one. What is *listed* follows the view, so an operator can read
+        back a round recorded before campaigns existed. What may be
+        *changed* follows the capture campaign -- `set_stop_excluded` and
+        `delete_stop` narrow against `_scope()`, never against the view --
+        so widening what is visible never widens what is destroyable.
         """
-        predicate, parameters = self._scope().where("r")
+        predicate, parameters = self._read_scope(view).where("r")
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
             rows = connection.execute(
                 """
                 SELECT r.survey_run_id, r.site_id, r.capture_start_utc, r.coverage_status,
+                       r.campaign_id,
                        r.gps_latitude, r.gps_longitude, r.analyzed_seconds, s.gain,
                        (SELECT COUNT(*) FROM rf_observations o
                         WHERE o.survey_run_id = r.survey_run_id) AS observation_count,
@@ -741,14 +862,30 @@ class FieldService:
         return [dict(row) for row in rows]
 
     def set_stop_excluded(
-        self, run_id: str, *, excluded: bool, reason: str = ""
+        self,
+        run_id: str,
+        *,
+        excluded: bool,
+        reason: str = "",
+        view: ViewScope = CURRENT_VIEW,
     ) -> dict[str, Any]:
         """Take a stop out of the geolocation, or put it back.
 
         Excluding keeps the recording's observations and says why they do not
         count; it is the reversible option, and the right one when a stop is
         merely suspect.
+
+        Refused outright from a historical view, before the database is even
+        opened. The campaign narrowing below would already refuse most of
+        these, but not all: under `all` the stop being looked at may well be
+        in the capture campaign, and an operator reading last month's map has
+        no reason to expect a tap to land on this morning's evidence.
         """
+        refuse_if_read_only(
+            view,
+            "changing whether a stop counts",
+            self.settings.capture_campaign_id,
+        )
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
             if connection.execute(
@@ -775,13 +912,17 @@ class FieldService:
         )
         return {"survey_run_id": run_id, "excluded": current is not None, "reason": current or ""}
 
-    def delete_stop(self, run_id: str) -> dict[str, Any]:
+    def delete_stop(self, run_id: str, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
         """Remove a stop entirely, including its observations.
 
         `delete_survey_run` itself has no notion of a campaign, so the check
         has to happen here: a session serving one campaign must not be able
-        to delete another campaign's evidence through this endpoint.
+        to delete another campaign's evidence through this endpoint. The
+        view check is the outer one, and it is the stricter of the two --
+        the only screen from which evidence may be destroyed is the one
+        showing the round that is being recorded.
         """
+        refuse_if_read_only(view, "deleting a stop", self.settings.capture_campaign_id)
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
             if connection.execute(
@@ -796,21 +937,23 @@ class FieldService:
             raise ValueError(f"unknown stop: {run_id}")
         return result
 
-    def export(self, export_format: str) -> tuple[str, str, str]:
+    def export(
+        self, export_format: str, view: ViewScope = CURRENT_VIEW
+    ) -> tuple[str, str, str]:
         """(body, content type, filename) for a downloadable export."""
         chosen = (export_format or "geojson").lower()
-        collection = self.geojson()
+        collection = self.geojson(view)
         if chosen == "kml":
             return to_kml(collection), "application/vnd.google-earth.kml+xml", "p25_survey.kml"
         if chosen == "gpx":
-            plan = self.plan().get("plan", {})
+            plan = self.plan(view).get("plan", {})
             visited = [
                 {
                     "survey_run_id": stop["survey_run_id"],
                     "latitude": stop["gps_latitude"],
                     "longitude": stop["gps_longitude"],
                 }
-                for stop in self.stops()
+                for stop in self.stops(view)
             ]
             return to_gpx(plan, visited=visited), "application/gpx+xml", "p25_survey.gpx"
         if chosen in ("geojson", "json"):
@@ -819,7 +962,10 @@ class FieldService:
 
     # -- jobs --------------------------------------------------------------
 
-    def start_capture(self, payload: dict[str, Any]) -> Job:
+    def start_capture(
+        self, payload: dict[str, Any], view: ViewScope = CURRENT_VIEW
+    ) -> Job:
+        refuse_if_read_only(view, "recording a stop", self.settings.capture_campaign_id)
         if not self.settings.allow_capture:
             raise RuntimeError("captures are disabled on this server (--no-capture)")
 
@@ -1046,7 +1192,7 @@ class FieldService:
             gps_fetched_at_utc=position.get("set_at"),
             site_id_override=stop_id,
             site_label_override=label or stop_id,
-            campaign_id=self.settings.campaign_id,
+            campaign_id=self.settings.capture_campaign_id,
             # Every stop through this app shares one site profile, so the
             # `sites` row cannot hold what each stop was recorded at --
             # `upsert_site` rewrites it. The capture report can, and it
@@ -1190,13 +1336,16 @@ class FieldService:
             "elapsed_seconds": time.time() - started,
         }
 
-    def start_analysis(self, payload: dict[str, Any]) -> Job:
+    def start_analysis(
+        self, payload: dict[str, Any], view: ViewScope = CURRENT_VIEW
+    ) -> Job:
         """Run the survey and geolocation chain on a recording already on disk.
 
         Also the way the whole chain can be exercised without an SDR
         attached, which matters because the field app must be verifiable
         before anyone drives anywhere with it.
         """
+        refuse_if_read_only(view, "analysing a recording", self.settings.capture_campaign_id)
         recording = Path(str(payload.get("recording", ""))).expanduser()
         if not recording.is_file():
             raise ValueError(f"no such recording: {recording}")
@@ -1227,7 +1376,7 @@ class FieldService:
                 gps_fetched_at_utc=position.get("set_at"),
                 site_id_override=stop_id,
                 site_label_override=label or stop_id,
-                campaign_id=self.settings.campaign_id,
+                campaign_id=self.settings.capture_campaign_id,
                 # `hardware` is left unset on purpose: `run_survey` looks
                 # for this recording's own capture report itself, so a
                 # file analysed here and the same file analysed by
@@ -1329,7 +1478,7 @@ class FieldService:
         settings = LiveSettings(
             band=str(given.get("band") or self.settings.band),
             site_id=self.settings.site_profile,
-            campaign_id=self.settings.campaign_id,
+            campaign_id=self.settings.capture_campaign_id,
             center_frequency_hz=float(
                 given.get("center_frequency_hz", self.settings.center_frequency_hz)
             ),
@@ -1465,10 +1614,13 @@ class FieldService:
             wanted, self._live_hold_request = self._live_hold_request, None
         return wanted
 
-    def start_live(self, payload: dict[str, Any]) -> Job:
+    def start_live(
+        self, payload: dict[str, Any], view: ViewScope = CURRENT_VIEW
+    ) -> Job:
         """Begin a moving survey. Nothing is recorded; bins are written as
         they complete, so an interrupted drive has already contributed
         everything it measured."""
+        refuse_if_read_only(view, "starting a drive", self.settings.capture_campaign_id)
         if not self.settings.allow_capture:
             raise RuntimeError("captures are disabled on this server (--no-capture)")
         running = self.jobs.active_job()
@@ -1671,13 +1823,14 @@ class FieldService:
             pending, self._live_pending_runs = self._live_pending_runs, []
         return pending
 
-    def request_live_solve(self) -> dict[str, Any]:
+    def request_live_solve(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
         """Solve now, on the operator's word, while the drive keeps running.
 
         The counterpart to `live_solve_every_bins = 0`: bins are written
         continuously whatever happens here, and this only decides when the
         map catches up with them.
         """
+        refuse_if_read_only(view, "solving", self.settings.capture_campaign_id)
         job = self.jobs.active_job()
         if job is None or job.kind != "live":
             raise ValueError(
@@ -1762,7 +1915,10 @@ class FieldService:
             target_fine_cells=max(self.settings.solve_max_cells // 3, 2_000),
         )
 
-    def start_solve(self, payload: dict[str, Any]) -> Job:
+    def start_solve(
+        self, payload: dict[str, Any], view: ViewScope = CURRENT_VIEW
+    ) -> Job:
+        refuse_if_read_only(view, "solving", self.settings.capture_campaign_id)
         rebuild = bool(payload.get("rebuild_measurements", False))
         # Read defaults off an instance, not the class: this dataclass uses
         # slots, so the class attributes are slot descriptors rather than
