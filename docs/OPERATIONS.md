@@ -257,6 +257,41 @@ it is **only read alongside `FIELD_PROJECT`** -- set on its own it does
 nothing and every stop comes back unassigned. `fieldctl status` says so
 rather than leaving it to be discovered after a day of driving.
 
+### Older analyses are browsed, not lost
+
+Setting `FIELD_CAMPAIGN` narrows what the field app *records into*. Until PR4
+it also narrowed what the app *showed*, so the first restart after setting it
+emptied the map and the stop list of every round recorded before campaigns
+existed, and the page said "No stops recorded yet." over work that was still
+in the file, untouched.
+
+Those two are separate now. The status bar names the project, the campaign
+being recorded into, and which rounds are on screen; the selector beside it
+switches between:
+
+| | |
+|---|---|
+| **Current campaign** | what `FIELD_CAMPAIGN` names. The default, and the only one you can record, solve or edit from |
+| **Legacy / unassigned** | the rounds recorded before campaigns existed (`campaign_id IS NULL`) |
+| **Campaign `<id>`** | one earlier round |
+| **All campaigns** | an overview, grouped and labelled by round |
+
+Everything but Current is read-only and says so: recording, solving, Free
+disk and the per-stop Set aside and Delete buttons are switched off, and the
+server refuses them with a message naming the campaign new work actually goes
+to. **New captures always belong to `FIELD_CAMPAIGN`, whatever is on screen.**
+
+The choice is not remembered anywhere. Reload the page and you are back on
+the campaign being recorded -- which is the point: nobody should discover
+mid-drive that they have been reading last month.
+
+Nothing here moves, relabels or backfills a run. Assigning historical runs to
+a campaign is a separate, explicit operation that does not exist yet.
+
+If you want the same data from the command line, an unscoped `geo sites`,
+`geo plan`, `geo export` or `scripts/campaign_digest.py` reads the whole file
+and always has -- that is the `All campaigns` view by another route.
+
 ### A contradicting band stops the service, on purpose
 
 `fieldctl` passes `--band`, `--site`, `--database` and `--output` explicitly

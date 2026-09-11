@@ -396,11 +396,148 @@ hunts for afterwards. The startup banner always names the origin of each half.
 `--hardware` on `survey run` and `survey capture` names a profile directly for
 an offline or single-stop analysis.
 
+## Capture campaign, view scope, and browsing safely
+
+A campaign answered two different questions with one value, and that was a
+bug. It said *where new evidence is written*, and it also said *what the
+operator is looking at*. Setting `FIELD_CAMPAIGN` on the Pi therefore did two
+things, and only one of them had been asked for: 51 rounds recorded before
+campaigns existed vanished from the field app behind an empty map and the
+words "No stops recorded yet."
+
+**Nothing had been deleted.** `campaign_id = 'g4'` is never true for a row
+holding `NULL`, so those runs were filtered out of one screen and nowhere
+else -- an unscoped `geo sites`, `geo plan`, `geo export` or
+`scripts/campaign_digest.py` read them the whole time. Every `DELETE` in the
+tree is keyed by run id, batch or site id; no statement anywhere assigns or
+clears a `campaign_id`; the connect path only adds columns.
+
+So the two questions now have two answers:
+
+| | what it is | where it lives |
+|---|---|---|
+| **capture campaign** | the one and only place new evidence is written | `FieldSettings.capture_campaign_id`, from `--campaign` |
+| **view scope** | which rounds are on screen right now | the `?scope=` query parameter, per request |
+
+### The four views
+
+| scope | reads | writable |
+|---|---|---|
+| `current` *(default)* | the capture campaign -- or the whole database, when none is named | yes |
+| `legacy` | `campaign_id IS NULL` | no |
+| `all` | every round, grouped and labelled by campaign | no |
+| `campaign:<id>` | one other named round | no |
+
+`legacy` is spelled out rather than expressed as an absent value, because
+`None` was already spoken for: in `CampaignScope` it means *the whole
+database*. A third concept needed a third name, not a second meaning for a
+value that already had one. `CampaignScope` therefore carries an
+`unassigned_only` flag alongside `campaign_id`, and its predicate is
+`IS NULL` -- never `= NULL`, which is never true for any row and would report
+an empty database rather than the rows it was asked for.
+
+Naming the campaign you are already recording into (`campaign:<the capture
+campaign>`) *is* the current view, not a read-only copy of it. Spelling out
+your own round must not take Record away from you.
+
+### What a read-only view means
+
+Everything but `current` is read-only. Not because browsing is dangerous, but
+because the alternative is an operator who excludes a stop, or taps Record,
+while looking at a screen full of last month's work and believing it is this
+morning's.
+
+Refused from a historical view, with a 409 that names the campaign new work
+actually goes to: capture, analyse, solve, drive start, live solve, purge,
+and stop exclude / include / delete. Not refused: marking a position, live
+position fixes, a pull-over request, a device rescan and job cancel. None of
+those writes evidence or carries a campaign, and refusing the middle three
+would break a drive that is already running because the operator glanced at
+history.
+
+The view check is the **outer** one, and it is the stricter of the two. The
+campaign narrowing that already guarded exclude and delete does not cover the
+case that matters most here: under `all`, the stop being looked at may well be
+in the capture campaign, so the narrowing lets it through -- correctly, it is
+in the campaign -- and the row is destroyed. Widening what may be *seen* must
+never widen what may be *changed*.
+
+A solve scoped to the unassigned runs refuses to store itself.
+`geo_solutions.campaign_id IS NULL` already means "this solve read the whole
+file", so such a solve has no honest value to stamp: `NULL` would claim a
+breadth it never had, and any id would claim a campaign nobody declared. The
+refusal happens before the grid search, not after.
+
+### What the operator sees
+
+A permanent status bar names the project, the campaign being recorded into,
+the receiver profile when one is named, and which rounds are on screen. The
+selector offers Current, Legacy when there are unassigned runs, each other
+campaign that actually holds something, and All -- built from a census of
+`survey_runs`, so a campaign that holds nothing is not offered. Choosing one
+refreshes the map, the tables and the summaries **together**: a map still
+showing one scope's measurements under another scope's stop list is the
+confusion this exists to remove.
+
+A historical view says so in a banner that follows the operator across tabs
+and names where new captures actually go, and every mutating control goes
+with it -- Record, Free disk, Resolve, the position controls, the whole Drive
+row, and the per-stop Set aside and Delete buttons.
+
+The view lives in a plain variable in the page: not `localStorage`, not the
+URL, nothing the server remembers. **A reload is back on the campaign being
+recorded.** A request that names no scope at all is `current`, which is what
+keeps every client that predates the parameter -- and every hand-typed URL --
+behaving exactly as it did.
+
+An empty view says which it is. "No stops recorded yet" is only the truth when
+the file is empty; when it is not, the page counts what is filed elsewhere and
+names where, because saying "no data" over 51 rounds of work is what started
+this.
+
+## Where this is going
+
+Done:
+
+1. **PR1** -- run provenance and campaign tagging.
+2. **PR2** -- project and campaign manifests, `project_meta`, the database guard.
+3. **PR3** -- campaign-scoped analysis, hardware profiles, ops integration.
+4. **PR3 acceptance on a real Pi** -- reboot, a full capture, provenance,
+   isolation, and no token leak.
+5. **PR4** -- capture campaign separated from view scope; legacy analyses
+   readable again; Current / Legacy / All selector; no write or delete through
+   a historical view. *This section.*
+
+Planned, in order, and none of it started here:
+
+6. **PR5 -- campaign lifecycle and ops hardening.** `fieldctl campaign
+   list/current/new/use/close`; an atomic `field.env` edit that checks for a
+   running job, restarts and can roll back; the `field.env.local` parity fix;
+   the receiver serial completed in observed hardware identity; the PR3 Pi
+   acceptance written up formally.
+7. **PR6 -- historical campaign curation.** An explicit assignment command
+   with a dry run, selecting by run id or by time range. No automatic
+   backfill, ever. Derived analysis is **recomputed**, never given a blind
+   label -- a run moved into a campaign changes that campaign's reference
+   gain and noise floor, so its conclusions have to be drawn again.
+8. **PR7 -- rich analysis UI.** A campaign dashboard, full provenance per run,
+   campaign comparison, and detection / geometry / solution-confidence
+   measures.
+9. **Field validation.** A new campaign, not the acceptance one: 6-10 stops on
+   live, continuous P25, checking detection, the solver, and accuracy against
+   ground truth.
+10. **Later only.** An analyzer abstraction for P25, VOR, ATIS, DMR and other
+    signal types. Not before the above.
+
 ## What this does not do
 
 - It does not move, rewrite or reinterpret any existing row.
 - It does not assign a historical run to a campaign, and there is no backfill.
+  That is PR6's subject, and it is deliberately not solved by a migration.
 - It does not change the estimator. Campaign scoping decides *which* evidence
   is read; the mathematics that reads it is untouched.
 - It does not add an analyzer. There is still exactly one, and site attribution
   is still by frequency alone.
+- A view does not change what a campaign *is*. `survey_runs.campaign_id` keeps
+  the meaning it has always had; the view is a question asked of it, never an
+  edit to it.
