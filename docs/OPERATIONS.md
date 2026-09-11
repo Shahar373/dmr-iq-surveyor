@@ -276,10 +276,20 @@ switches between:
 | **Campaign `<id>`** | one earlier round |
 | **All campaigns** | an overview, grouped and labelled by round |
 
-Everything but Current is read-only and says so: recording, solving, Free
-disk and the per-stop Set aside and Delete buttons are switched off, and the
-server refuses them with a message naming the campaign new work actually goes
-to. **New captures always belong to `FIELD_CAMPAIGN`, whatever is on screen.**
+Everything but Current is read-only and says so: recording, solving, marking
+a position, a pull-over hold, Free disk and the per-stop Set aside and Delete
+buttons are switched off, and the server refuses them with a message naming
+the campaign new work actually goes to. **New captures always belong to
+`FIELD_CAMPAIGN`, whatever is on screen.** A drive already under way keeps
+running and keeps posting its fixes -- glancing at history does not interrupt
+it, and Stop drive still works.
+
+Legacy and All also say where their *conclusions* came from. A plan or region
+stored without a campaign was computed from every round in the database at the
+time, not from the stops listed beside it, and the banner says so. That is
+worth knowing whenever `dmr-surveyor geo solve` has been run without
+`--campaign`, because the newest unscoped plan is then one drawn across
+every round in the file.
 
 The choice is not remembered anywhere. Reload the page and you are back on
 the campaign being recorded -- which is the point: nobody should discover

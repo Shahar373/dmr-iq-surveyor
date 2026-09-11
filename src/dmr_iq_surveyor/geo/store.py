@@ -173,10 +173,21 @@ def latest_plan(
 ) -> dict[str, Any] | None:
     """The most recent plan, by insertion order rather than by clock.
 
-    Scoped, this is the most recent plan *this campaign* produced. A plan
-    written by an unscoped solve carries no campaign and is not offered as
-    one campaign's next stop, because it was computed from every run in the
-    file -- including rounds this one is meant to be separate from.
+    Scoped to a campaign, this is the most recent plan *that campaign*
+    produced. A plan written by an unscoped solve carries no campaign and is
+    not offered as one campaign's next stop, because it was computed from
+    every run in the file -- including rounds this one is meant to be
+    separate from.
+
+    The unassigned scope is the one case where a `NULL` plan *is* returned,
+    and it is not the same claim. `geo_plans.campaign_id IS NULL` means "this
+    solve read the whole database", not "this solve read the unassigned
+    runs", so what comes back is the answer that was standing before
+    campaigns existed -- which is exactly what a reader of the unassigned
+    runs is asking for, and exactly what it must be told it is getting. The
+    row carries `campaign_id`, and `FieldService.plan()` passes it on as
+    `unscoped_solve` so the page can say so rather than implying the plan was
+    drawn from the stops beside it.
     """
     predicate, parameters = scope.where("geo_plans")
     row = connection.execute(

@@ -85,6 +85,8 @@ html, body {
   background: color-mix(in srgb, var(--warn) 10%, var(--panel));
 }
 #scope-notice { flex: none; margin: 0 14px 10px; }
+.scope-line { margin: 0 0 6px; }
+.scope-line:last-child { margin-bottom: 0; }
 .group-head {
   font-size: 12px;
   font-weight: 650;

@@ -945,6 +945,7 @@ def build_map_geojson(
                         "area_km2_90": solution["area_km2_90"],
                         "path_loss_exponent": solution["path_loss_exponent"],
                         "azimuth_span_deg": solution["azimuth_span_deg"],
+                        "campaign_id": solution["campaign_id"],
                         "warnings": json.loads(solution["warnings_json"] or "[]"),
                     },
                     "geometry": {
@@ -1023,6 +1024,12 @@ def site_overview(
                 "area_km2_50": (solution or {}).get("area_km2_50"),
                 "area_km2_90": (solution or {}).get("area_km2_90"),
                 "solved_at": (solution or {}).get("solved_at"),
+                # Which round drew this conclusion. `None` is a solve that
+                # read the whole file, not a solve of the unassigned runs --
+                # a reader showing several rounds at once needs to be able to
+                # say which one it is looking at rather than implying they
+                # are one answer.
+                "solution_campaign_id": (solution or {}).get("campaign_id"),
                 "warnings": json.loads((solution or {}).get("warnings_json") or "[]"),
             }
         )

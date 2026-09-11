@@ -278,6 +278,23 @@ def test_the_solutions_and_plan_a_view_reads_are_its_own(service: FieldService) 
 
     assert solved(CURRENT_VIEW) and solved(LEGACY_VIEW)
 
+    # Each answer names the round that drew it. The legacy solve was run
+    # unscoped, before campaigns existed, so it carries `None` -- which means
+    # "read the whole file", not "solved the unassigned runs", and the reader
+    # has to be able to tell those apart.
+    campaigns = {
+        site["site_key"]: site["solution_campaign_id"]
+        for site in service.sites_overview(CURRENT_VIEW)
+        if site.get("solved_at")
+    }
+    assert set(campaigns.values()) == {CAMPAIGN}
+    legacy_campaigns = {
+        site["solution_campaign_id"]
+        for site in service.sites_overview(LEGACY_VIEW)
+        if site.get("solved_at")
+    }
+    assert legacy_campaigns == {None}
+
 
 # -- 4. `all` is an overview, never a mixed analysis ------------------------
 
@@ -389,6 +406,95 @@ def test_deleting_a_stop_that_is_in_the_campaign_is_still_refused_from_all(
     assert status == 409, payload
     assert _row_snapshot(database) == before
     assert run_id in _run_ids(client.get("/api/stops", "current")[1]["stops"])
+
+
+def test_a_hold_is_a_write_and_is_refused_like_one(service: FieldService) -> None:
+    """A pull-over hold is not a pause. It routes through the same close path
+    a drive bin does and writes a `survey_runs` row, its observations and its
+    levels, under the campaign the drive is recording into -- so it is guarded
+    like every other write, not waved through as drive continuity."""
+    for view in (LEGACY_VIEW, ALL_VIEW):
+        with pytest.raises(ReadOnlyViewError):
+            service.request_live_hold({"seconds": 60}, view)
+    # Live position fixes genuinely write nothing and stay allowed, so a drive
+    # already under way is not broken by a glance at history.
+    assert service.push_live_position(
+        {"latitude": 32.05, "longitude": 34.79, "accuracy_m": 8.0}
+    )["accepted"]
+
+
+def test_marking_a_position_is_refused_from_a_historical_view(
+    service: FieldService, tmp_path: Path
+) -> None:
+    """It writes no database row, but it is the coordinate the next recording
+    is filed under, and the page disables the controls -- so the server has to
+    agree rather than leave a second way in."""
+    marked = {"latitude": 32.0, "longitude": 34.8, "accuracy_m": 5.0, "source": "manual"}
+    service.set_position(marked, CURRENT_VIEW)
+    before = service.get_position()
+    for view in (LEGACY_VIEW, ALL_VIEW):
+        with pytest.raises(ReadOnlyViewError):
+            service.set_position({**marked, "latitude": 31.0}, view)
+    assert service.get_position()["latitude"] == before["latitude"]
+
+
+def test_every_write_route_over_http_is_refused_from_a_historical_view(
+    client: Client, database: Path
+) -> None:
+    """The whole POST surface, enumerated, so a route added later that writes
+    evidence has to be added here or to the documented exception list."""
+    before = _row_snapshot(database)
+    for path, body in (
+        ("/api/position", {"latitude": 32.0, "longitude": 34.8, "source": "manual"}),
+        ("/api/capture", {"label": "x"}),
+        ("/api/analyse", {"recording": "/nonexistent.wav"}),
+        ("/api/solve", {}),
+        ("/api/live/start", {}),
+        ("/api/live/solve", {}),
+        ("/api/live/hold", {"seconds": 60}),
+        ("/api/recordings/purge", {}),
+    ):
+        for scope in ("legacy", "all"):
+            status, payload = client.post(path, body, scope)
+            assert status == 409, (path, scope, status, payload)
+            assert "read-only" in payload["error"]
+    assert _row_snapshot(database) == before
+
+
+# -- a historical view says what it is actually showing ----------------------
+
+
+def test_a_plan_from_an_unscoped_solve_is_labelled_as_one(
+    service: FieldService, database: Path, tmp_path: Path
+) -> None:
+    """`geo_plans.campaign_id IS NULL` means "this solve read the whole
+    database", not "this solve read the unassigned runs". The legacy view is
+    the one place both readings meet, so the answer has to say which it is --
+    otherwise a plan drawn across every round reads as the legacy stops' own.
+    """
+    assert service.plan(LEGACY_VIEW)["unscoped_solve"] is True
+    assert service.plan(CURRENT_VIEW)["unscoped_solve"] is False
+    assert service.plan(CURRENT_VIEW)["campaign_id"] == CAMPAIGN
+
+    # And it stays true of a solve run later, over a file that by then holds
+    # every round -- the case a fixture built in historical order would miss.
+    solve_all_sites(
+        database_path=database,
+        output_root=tmp_path / "late",
+        settings=fast_solve_settings(),
+    )
+    late = service.plan(LEGACY_VIEW)
+    assert late["unscoped_solve"] is True
+    assert late["campaign_id"] is None
+    # The campaign's own plan is untouched by it.
+    assert service.plan(CURRENT_VIEW)["campaign_id"] == CAMPAIGN
+
+
+def test_a_site_solved_without_a_campaign_says_so(service: FieldService) -> None:
+    legacy = [
+        site for site in service.sites_overview(LEGACY_VIEW) if site.get("solved_at")
+    ]
+    assert legacy and all(site["solution_campaign_id"] is None for site in legacy)
 
 
 def test_the_capture_campaign_still_guards_what_the_current_view_may_touch(

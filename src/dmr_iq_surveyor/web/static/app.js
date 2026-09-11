@@ -405,7 +405,9 @@ function initMap() {
   layers.position = L.layerGroup().addTo(map);
 
   map.on("click", (event) => {
-    if (!state.picking) return;
+    // The lock disarms pick mode, but the handler refuses on its own too:
+    // this is the only path that writes a position without a button press.
+    if (!state.picking || viewReadOnly) return;
     state.picking = false;
     $("#pick-on-map").classList.remove("armed");
     savePosition(event.latlng.lat, event.latlng.lng, null, "manual");
@@ -747,9 +749,16 @@ async function showHistory(siteKey, target) {
 
 /* ----------------------------------------------------------- view scope */
 
-/* Every control that adds to, removes from or re-derives what is in the
- * database. Locked as a set rather than one at a time, so a control added
- * later is either on this list or is a deliberate exception. */
+/* Every control that would start work. Locked as a set rather than one at a
+ * time, so a control added later is either on this list or is a deliberate
+ * exception.
+ *
+ * Wider than what the server refuses, on purpose. The position controls only
+ * write a scratch file saying where the operator is standing -- no campaign,
+ * no evidence -- so the server still accepts them, and a drive that is
+ * already running keeps posting fixes while its operator glances at history.
+ * But there is nothing to mark a position *for* on a screen you cannot record
+ * from, so the buttons go quiet with the rest. */
 const MUTATING_CONTROLS = [
   "#record", "#purge", "#resolve",
   "#use-gps", "#save-position", "#pick-on-map",
@@ -796,8 +805,11 @@ function renderScope() {
   // that holds nothing is not offered at all.
   const options = [["current", "Showing: current campaign"]];
   for (const entry of scope.campaigns || []) {
-    if (entry.view === "current") continue;
-    if (entry.campaign_id === scope.capture_campaign_id) continue;
+    // `null === null` when no campaign is configured, which would drop the
+    // Legacy entry in exactly the deployment that has the most legacy runs.
+    if (entry.campaign_id !== null && entry.campaign_id === scope.capture_campaign_id) {
+      continue;
+    }
     options.push([entry.view, "Showing: " + scopeOptionLabel(entry, scope.capture_campaign_id)]);
   }
   options.push(["all", "Showing: all campaigns — overview"]);
@@ -825,18 +837,69 @@ function renderScope() {
   if (viewReadOnly) {
     const target = scope.capture_campaign_id || "no campaign (unassigned)";
     notice.className = "notice";
-    notice.textContent =
-      `Historical view — ${scope.view_label}. Read-only: recording, solving and ` +
-      `editing stops are switched off here. New captures always belong to ` +
-      `${target}, whatever is on screen. Switch back to the current campaign to work.`;
+    const lines = [
+      `Historical view — ${scope.view_label}. Read-only: recording, solving, ` +
+        `marking a position and editing stops are switched off here. New work ` +
+        `always belongs to ${target}, whatever is on screen. Switch back to the ` +
+        `current campaign to work.`,
+    ];
+    // A stored conclusion carries the boundary it was computed under, and
+    // `no campaign` there means it read the whole file -- not that it read
+    // these runs. Saying so is the difference between showing an old answer
+    // and passing someone else's answer off as this view's.
+    if (state.plan && state.plan.unscoped_solve && state.plan.status !== "none") {
+      lines.push(
+        "The plan and regions below come from a solve that was run without a " +
+          "campaign, so it read every round in the database at the time — not " +
+          "only the stops listed here."
+      );
+    }
+    if (viewScope === "all") {
+      lines.push(
+        "Evidence counts on the Sites tab span every round in the file, and " +
+          "the region drawn for a site is whichever round solved it last. " +
+          "Rounds establish their own reference gain and noise floor, so this " +
+          "is an overview, not a combined answer."
+      );
+    }
+    if (live.jobId) {
+      lines.push(
+        `A drive is running. Its live bins and track stay on the map and still ` +
+          `belong to ${target}.`
+      );
+    }
+    notice.replaceChildren();
+    for (const line of lines) notice.append(el("p", "scope-line", line));
   }
   applyViewLock();
 }
 
+/* The lock only ever takes a control away, and gives back only what it took.
+ *
+ * Writing `disabled = viewReadOnly` instead would make this an unconditional
+ * re-enable in the current view, and it runs at the end of every state
+ * refresh -- so it would hand back the Drive buttons that `checkSecureContext`
+ * disabled because the browser will not give GPS over plain HTTP, and the
+ * Record button that a running capture disabled. */
 function applyViewLock() {
   for (const selector of MUTATING_CONTROLS) {
     const control = $(selector);
-    if (control) control.disabled = viewReadOnly;
+    if (!control) continue;
+    if (viewReadOnly) {
+      if (!control.disabled) control.dataset.viewLocked = "1";
+      control.disabled = true;
+    } else if (control.dataset.viewLocked === "1") {
+      delete control.dataset.viewLocked;
+      control.disabled = false;
+    }
+  }
+  // Disabling the button does not disarm the mode: the map's own click
+  // handler tests `state.picking` and nothing else, so an operator who armed
+  // it in the current view could still place a position by tapping the map
+  // after switching to a historical one.
+  if (viewReadOnly && state.picking) {
+    state.picking = false;
+    $("#pick-on-map").classList.remove("armed");
   }
 }
 
@@ -880,6 +943,21 @@ function renderSites() {
       (site.area_km2_90 ? ` · 90% ${formatArea(site.area_km2_90)}` : "")));
 
     if (site.status_reason) card.append(el("div", "meta", site.status_reason));
+    // Outside the current campaign, several rounds' answers can be on screen
+    // at once. Say which one drew each rather than letting them read as a
+    // single conclusion.
+    if (viewReadOnly && site.solved_at) {
+      card.append(
+        el(
+          "div",
+          site.solution_campaign_id === null ? "warn" : "meta",
+          site.solution_campaign_id === null
+            ? "solved without a campaign — this region was computed from every "
+              + "round in the database, not only the stops listed here"
+            : "solved under campaign " + site.solution_campaign_id
+        )
+      );
+    }
     for (const warning of site.warnings || []) card.append(el("div", "warn", warning));
 
     if (site.solved_at) {
@@ -897,7 +975,8 @@ function renderSites() {
     container.append(card);
   }
   $("#site-summary").textContent = state.sites.length
-    ? `${solved} of ${state.sites.length} site(s) have a bounded region`
+    ? `${solved} of ${state.sites.length} site(s) have a bounded region` +
+      (viewScope === "all" ? " — counts span every round in the file" : "")
     : elsewhereHint("sites");
 }
 
@@ -985,7 +1064,7 @@ async function finishJob(jobId) {
 
 async function savePosition(latitude, longitude, accuracy, source) {
   try {
-    state.position = await api("/api/position", {
+    state.position = await api(scoped("/api/position"), {
       method: "POST",
       body: JSON.stringify({
         latitude, longitude, accuracy_m: accuracy,
@@ -1009,12 +1088,12 @@ function useDeviceGps() {
   button.textContent = "locating…";
   navigator.geolocation.getCurrentPosition(
     (fix) => {
-      button.disabled = false;
+      setEnabled("#use-gps", true);
       button.textContent = "Use phone GPS";
       savePosition(fix.coords.latitude, fix.coords.longitude, fix.coords.accuracy, "device");
     },
     (error) => {
-      button.disabled = false;
+      setEnabled("#use-gps", true);
       button.textContent = "Use phone GPS";
       alert(
         "Could not get a GPS fix: " + error.message +
@@ -1051,7 +1130,7 @@ async function startCapture(confirmPosition = false) {
     // the PREVIOUS stop's coordinates is the one mistake that silently
     // corrupts a whole campaign -- so it asks rather than proceeding.
     if (error.needsPositionConfirmation) {
-      button.disabled = false;
+      setEnabled("#record", true);
       if (confirm(error.message + "\n\nRecord this stop at the marked position anyway?")) {
         await startCapture(true);
       }
@@ -1074,7 +1153,7 @@ async function startCapture(confirmPosition = false) {
     } catch (_) {
       /* the server did not answer either; fall through to the real error */
     }
-    button.disabled = false;
+    setEnabled("#record", true);
     alert("Could not start the recording: " + error.message);
   }
 }
@@ -1262,7 +1341,7 @@ async function startDrive() {
     } catch (_) {
       /* the server did not answer either; fall through to the real error */
     }
-    button.disabled = false;
+    setEnabled("#drive-start", true);
     alert("Could not start the drive: " + error.message);
   }
 }
@@ -1271,12 +1350,12 @@ async function solveNow() {
   const button = $("#drive-solve");
   button.disabled = true;
   try {
-    const result = await api("/api/live/solve", { method: "POST", body: "{}" });
+    const result = await api(scoped("/api/live/solve"), { method: "POST", body: "{}" });
     if (!result.started) jobLog("solve not started: " + result.reason);
   } catch (error) {
     alert("Could not solve: " + error.message);
   } finally {
-    button.disabled = false;
+    setEnabled("#drive-solve", true);
   }
 }
 
@@ -1284,13 +1363,13 @@ async function requestHold() {
   const button = $("#drive-hold");
   button.disabled = true;
   try {
-    const result = await api("/api/live/hold", { method: "POST", body: JSON.stringify({ seconds: 60 }) });
+    const result = await api(scoped("/api/live/hold"), { method: "POST", body: JSON.stringify({ seconds: 60 }) });
     if (result.accepted) speak("Stay still. Measuring for sixty seconds.", { urgent: true });
     else jobLog("hold not started: " + result.reason);
   } catch (error) {
     alert("Could not start the measurement: " + error.message);
   } finally {
-    button.disabled = false;
+    setEnabled("#drive-hold", true);
   }
 }
 

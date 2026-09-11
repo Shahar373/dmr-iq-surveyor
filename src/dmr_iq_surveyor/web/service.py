@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -436,7 +437,14 @@ class FieldService:
                 return {"latitude": None, "longitude": None, "source": "unavailable"}
         return {"latitude": None, "longitude": None, "source": "not_set"}
 
-    def set_position(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def set_position(
+        self, payload: dict[str, Any], view: ViewScope = CURRENT_VIEW
+    ) -> dict[str, Any]:
+        # Nothing in the database, but it is the coordinate the next
+        # recording is filed under, and a position marked while reading
+        # last month's map is the one mistake that quietly corrupts a
+        # round. The page disables these controls; this is why it can.
+        refuse_if_read_only(view, "marking a position", self.settings.capture_campaign_id)
         try:
             latitude = float(payload["latitude"])
             longitude = float(payload["longitude"])
@@ -638,13 +646,38 @@ class FieldService:
         """Release background workers. Called when the server shuts down."""
         self.devices.close()
 
+    @contextlib.contextmanager
+    def _reading(self, connection: sqlite3.Connection | None) -> Any:
+        """Read through the caller's connection, or open one for the call.
+
+        `/api/state` answers five questions about the same file, and opening
+        a connection per question cost real time: `connect_geo_database`
+        ensures the schema on every open, and twenty phones refreshing at
+        once turned that into twenty handler threads queueing on SQLite.
+        Sharing one connection across the state payload makes it cheaper than
+        it was before the scope block was added, rather than dearer.
+
+        Each method still opens its own when called on its own, so every
+        existing caller is unchanged.
+        """
+        if connection is not None:
+            yield connection
+            return
+        opened = connect_geo_database(Path(self.settings.database_path))
+        try:
+            yield opened
+        finally:
+            opened.close()
+
     def survey_runs(
-        self, limit: int = 25, view: ViewScope = CURRENT_VIEW
+        self,
+        limit: int = 25,
+        view: ViewScope = CURRENT_VIEW,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         predicate, parameters = self._read_scope(view).where("r")
-        connection = connect_geo_database(Path(self.settings.database_path))
-        try:
-            rows = connection.execute(
+        with self._reading(connection) as reader:
+            rows = reader.execute(
                 """
                 SELECT survey_run_id, site_id, capture_start_utc, coverage_status,
                        campaign_id,
@@ -660,8 +693,6 @@ class FieldService:
                 """,
                 (*parameters, limit),
             ).fetchall()
-        finally:
-            connection.close()
         return [dict(row) for row in rows]
 
     def disk(self) -> dict[str, Any]:
@@ -687,7 +718,9 @@ class FieldService:
             return None
         return max(0.0, (datetime.now(UTC) - marked).total_seconds())
 
-    def campaign_census(self) -> list[dict[str, Any]]:
+    def campaign_census(
+        self, connection: sqlite3.Connection | None = None
+    ) -> list[dict[str, Any]]:
         """How many runs each campaign holds, unassigned included.
 
         One grouped scan of `survey_runs` and nothing else: it is what lets
@@ -699,9 +732,8 @@ class FieldService:
         Ordered unassigned-first, then by id, so the list reads the way the
         selector offers it.
         """
-        connection = connect_geo_database(Path(self.settings.database_path))
-        try:
-            rows = connection.execute(
+        with self._reading(connection) as reader:
+            rows = reader.execute(
                 """
                 SELECT campaign_id, COUNT(*) AS runs
                 FROM survey_runs
@@ -709,8 +741,6 @@ class FieldService:
                 ORDER BY campaign_id IS NOT NULL, campaign_id
                 """
             ).fetchall()
-        finally:
-            connection.close()
         return [
             {
                 "campaign_id": row["campaign_id"],
@@ -721,7 +751,13 @@ class FieldService:
             for row in rows
         ]
 
-    def scope_state(self, view: ViewScope, *, counts: dict[str, int]) -> dict[str, Any]:
+    def scope_state(
+        self,
+        view: ViewScope,
+        *,
+        counts: dict[str, int],
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
         """Everything the page needs to say where it is and what it may do.
 
         Additive: `settings.campaign_id` keeps meaning exactly what it meant,
@@ -729,7 +765,7 @@ class FieldService:
         distinguishes the two roles the single value used to play.
         """
         capture = self.settings.capture_campaign_id
-        census = self.campaign_census()
+        census = self.campaign_census(connection)
         return {
             "project_id": self.settings.project_id,
             "capture_campaign_id": capture,
@@ -745,9 +781,22 @@ class FieldService:
         }
 
     def state(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
+        # One connection for the four questions this asks of the database.
+        # Twenty phones refreshing at once is a real field state -- one
+        # operator reloading while another watches -- and a connection per
+        # question is what turned that into handler threads queueing on
+        # SQLite's schema-ensure path.
+        with self._reading(None) as reader:
+            runs = self.survey_runs(view=view, connection=reader)
+            stops = self.stops(view, reader)
+            plan = self.plan(view, reader)
+            scope = self.scope_state(
+                view,
+                counts={"runs": len(runs), "stops": len(stops)},
+                connection=reader,
+            )
         sites = self.sites_overview(view)
-        runs = self.survey_runs(view=view)
-        stops = self.stops(view)
+        scope["counts"]["sites"] = len(sites)
         return {
             "settings": self.settings.to_public_dict(),
             "position": self.get_position(),
@@ -757,17 +806,10 @@ class FieldService:
             "sites": sites,
             "runs": runs,
             "stops": stops,
-            "plan": self.plan(view),
+            "plan": plan,
             "jobs": self.jobs.list(),
             "live": self.live_status(),
-            "scope": self.scope_state(
-                view,
-                counts={
-                    "sites": len(sites),
-                    "runs": len(runs),
-                    "stops": len(stops),
-                },
-            ),
+            "scope": scope,
             "geolocation": {
                 "maturity": GEOLOCATION_MATURITY,
                 "validation_note": VALIDATION_NOTE,
@@ -782,17 +824,20 @@ class FieldService:
         collection["features"].extend(plan.get("geojson", {}).get("features", []))
         return collection
 
-    def plan(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
+    def plan(
+        self,
+        view: ViewScope = CURRENT_VIEW,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
         """The latest next-stop plan, or an explicit note that there is none."""
-        connection = connect_geo_database(Path(self.settings.database_path))
-        try:
-            stored = latest_plan(connection, scope=self._read_scope(view))
-        finally:
-            connection.close()
+        with self._reading(connection) as reader:
+            stored = latest_plan(reader, scope=self._read_scope(view))
         if stored is None:
             return {
                 "status": "none",
                 "reason": "no solve has run yet",
+                "campaign_id": None,
+                "unscoped_solve": False,
                 "plan": {},
                 "geojson": {"type": "FeatureCollection", "features": []},
             }
@@ -800,6 +845,13 @@ class FieldService:
             "status": stored["status"],
             "reason": stored["reason"],
             "solve_batch_id": stored["solve_batch_id"],
+            # Which boundary the solve behind this plan was computed under.
+            # `NULL` there means it read the WHOLE database -- every round in
+            # the file at the time, not just the runs this view lists. Under
+            # the legacy view that is exactly what the historical solves are,
+            # and the difference has to be sayable rather than implied.
+            "campaign_id": stored["campaign_id"],
+            "unscoped_solve": stored["campaign_id"] is None,
             "plan": json.loads(stored["plan_json"] or "{}"),
             "geojson": json.loads(stored["geojson"] or "{}"),
         }
@@ -820,7 +872,11 @@ class FieldService:
             connection.close()
         return {"site_key": site_key, "history": history}
 
-    def stops(self, view: ViewScope = CURRENT_VIEW) -> list[dict[str, Any]]:
+    def stops(
+        self,
+        view: ViewScope = CURRENT_VIEW,
+        connection: sqlite3.Connection | None = None,
+    ) -> list[dict[str, Any]]:
         """Every stop the current view covers, with whether it is
         contributing and why not.
 
@@ -832,9 +888,8 @@ class FieldService:
         so widening what is visible never widens what is destroyable.
         """
         predicate, parameters = self._read_scope(view).where("r")
-        connection = connect_geo_database(Path(self.settings.database_path))
-        try:
-            rows = connection.execute(
+        with self._reading(connection) as reader:
+            rows = reader.execute(
                 """
                 SELECT r.survey_run_id, r.site_id, r.capture_start_utc, r.coverage_status,
                        r.campaign_id,
@@ -857,8 +912,6 @@ class FieldService:
                 """,
                 parameters,
             ).fetchall()
-        finally:
-            connection.close()
         return [dict(row) for row in rows]
 
     def set_stop_excluded(
@@ -1589,7 +1642,9 @@ class FieldService:
             ),
         }
 
-    def request_live_hold(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def request_live_hold(
+        self, payload: dict[str, Any], view: ViewScope = CURRENT_VIEW
+    ) -> dict[str, Any]:
         """Ask the running drive to stop binning and integrate here.
 
         Bounded to 10-300 s: shorter than ten is no better than the drive bin
@@ -1597,6 +1652,12 @@ class FieldService:
         be recorded as one. Takes effect at the next window boundary, so it is
         never more than a second late.
         """
+        # A hold is not a pause: it routes through the same close path a
+        # drive bin does and writes a `survey_runs` row, its observations
+        # and its levels, under the campaign the drive is recording into.
+        refuse_if_read_only(
+            view, "holding for a stationary measurement", self.settings.capture_campaign_id
+        )
         job = self.jobs.active_job()
         if job is None or job.kind != "live":
             raise ValueError("no drive is running; a hold only makes sense mid-drive")

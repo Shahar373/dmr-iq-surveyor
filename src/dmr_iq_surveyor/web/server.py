@@ -248,7 +248,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             if path == "/api/position":
-                self._send_json(self.service.set_position(payload))
+                self._send_json(self.service.set_position(payload, view))
             elif path == "/api/capture":
                 self._start(lambda: self.service.start_capture(payload, view))
             elif path == "/api/analyse":
@@ -260,7 +260,7 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/api/live/solve":
                 self._send_json(self.service.request_live_solve(view))
             elif path == "/api/live/hold":
-                self._send_json(self.service.request_live_hold(payload))
+                self._send_json(self.service.request_live_hold(payload, view))
             elif path == "/api/live/position":
                 # Posted about once a second for a whole drive, so it stays
                 # the cheapest handler here: validate, store, answer.

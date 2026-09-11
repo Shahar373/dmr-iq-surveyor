@@ -405,7 +405,11 @@ things, and only one of them had been asked for: 51 rounds recorded before
 campaigns existed vanished from the field app behind an empty map and the
 words "No stops recorded yet."
 
-**Nothing had been deleted.** `campaign_id = 'g4'` is never true for a row
+**Nothing had been deleted**, and the evidence said so before a line was
+changed: 51 runs still carrying `campaign_id IS NULL`, 629 `rf_observations`,
+960 `geo_measurements` and 26 `p25_sites` all still present, `PRAGMA
+quick_check` returning `ok`, and a full pre-PR3 backup on the Pi that nothing
+had needed to restore from. `campaign_id = 'g4'` is never true for a row
 holding `NULL`, so those runs were filtered out of one screen and nowhere
 else -- an unscoped `geo sites`, `geo plan`, `geo export` or
 `scripts/campaign_digest.py` read them the whole time. Every `DELETE` in the
@@ -448,12 +452,21 @@ while looking at a screen full of last month's work and believing it is this
 morning's.
 
 Refused from a historical view, with a 409 that names the campaign new work
-actually goes to: capture, analyse, solve, drive start, live solve, purge,
-and stop exclude / include / delete. Not refused: marking a position, live
-position fixes, a pull-over request, a device rescan and job cancel. None of
-those writes evidence or carries a campaign, and refusing the middle three
-would break a drive that is already running because the operator glanced at
-history.
+actually goes to: capture, analyse, solve, drive start, live solve, a
+pull-over hold, purge, marking a position, and stop exclude / include /
+delete.
+
+A **pull-over hold is a write**, not a pause: it routes through the same close
+path a drive bin does and writes a `survey_runs` row, its observations and its
+levels, under the campaign the drive is recording into. **Marking a position**
+writes no database row, but it is the coordinate the next recording is filed
+under, and recording a stop against the previous stop's coordinates is the one
+mistake that silently corrupts a round.
+
+Not refused: live position fixes, a device rescan, and job cancel. Those write
+nothing and carry no campaign, and refusing them would break a drive already
+under way because its operator glanced at history -- or take away the button
+that stops it.
 
 The view check is the **outer** one, and it is the stricter of the two. The
 campaign narrowing that already guarded exclude and delete does not cover the
@@ -461,6 +474,30 @@ case that matters most here: under `all`, the stop being looked at may well be
 in the capture campaign, so the narrowing lets it through -- correctly, it is
 in the campaign -- and the row is destroyed. Widening what may be *seen* must
 never widen what may be *changed*.
+
+### A stored conclusion carries its own boundary, and says so
+
+`geo_solutions.campaign_id IS NULL` and `geo_plans.campaign_id IS NULL` mean
+*this solve read the whole database* -- not *this solve read the unassigned
+runs*. The legacy view is the one place those two readings meet: the answers
+it shows are the ones that were standing before campaigns existed, which is
+exactly what a reader of the unassigned runs is asking for, and exactly what
+must not be passed off as having been drawn from the stops beside it.
+
+So the plan carries `campaign_id` and an `unscoped_solve` flag, the site
+overview carries `solution_campaign_id`, and the page says it out loud: *"the
+plan and regions below come from a solve that was run without a campaign, so
+it read every round in the database at the time -- not only the stops listed
+here."* That matters beyond the historical case, because `dmr-surveyor geo
+solve` with no `--campaign` is a supported thing to run at any time, and from
+then on the newest unscoped plan is one drawn across every round in the file.
+
+`all` is labelled the same way and for the same reason. It runs nothing: no
+joint solve, no shared reference gain, no shared noise floor -- every number
+on it is a row that was already in the file. But evidence counts on a site
+card do span every round, and the region drawn for a site is whichever round
+solved it last, so the view says that rather than letting it read as a
+combined answer.
 
 A solve scoped to the unassigned runs refuses to store itself.
 `geo_solutions.campaign_id IS NULL` already means "this solve read the whole
@@ -482,7 +519,12 @@ confusion this exists to remove.
 A historical view says so in a banner that follows the operator across tabs
 and names where new captures actually go, and every mutating control goes
 with it -- Record, Free disk, Resolve, the position controls, the whole Drive
-row, and the per-stop Set aside and Delete buttons.
+row, and the per-stop Set aside and Delete buttons. The lock only ever takes a
+control away and gives back only what it took, so leaving a historical view
+cannot hand back a button that a running capture, or a browser that will not
+give GPS over plain HTTP, had disabled for its own reasons. Arming "Tap map to
+place" and then switching view disarms it, and the map's own handler refuses
+as well -- it is the one path that writes without a button press.
 
 The view lives in a plain variable in the page: not `localStorage`, not the
 URL, nothing the server remembers. **A reload is back on the campaign being
