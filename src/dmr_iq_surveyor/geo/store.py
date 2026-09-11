@@ -178,15 +178,13 @@ def latest_plan(
     one campaign's next stop, because it was computed from every run in the
     file -- including rounds this one is meant to be separate from.
     """
-    if scope.is_whole_database:
-        row = connection.execute(
-            "SELECT * FROM geo_plans ORDER BY rowid DESC LIMIT 1"
-        ).fetchone()
-    else:
-        row = connection.execute(
-            "SELECT * FROM geo_plans WHERE campaign_id = ? ORDER BY rowid DESC LIMIT 1",
-            (scope.campaign_id,),
-        ).fetchone()
+    predicate, parameters = scope.where("geo_plans")
+    row = connection.execute(
+        "SELECT * FROM geo_plans "
+        + (f"WHERE {predicate} " if predicate else "")
+        + "ORDER BY rowid DESC LIMIT 1",
+        parameters,
+    ).fetchone()
     return dict(row) if row is not None else None
 
 
@@ -426,14 +424,10 @@ def latest_solutions(
     # narrowed. Narrowing only the outer one would rank this campaign's
     # solutions against another campaign's and then find none of them
     # current, reporting a site as unsolved that this campaign had solved.
-    if scope.is_whole_database:
-        condition, parameters = "", ()
-    else:
-        condition, parameters = " AND g.campaign_id = ?", (scope.campaign_id,)
-    inner = (
-        "" if scope.is_whole_database else " AND inner_solution.campaign_id = ?"
-    )
-    inner_parameters = () if scope.is_whole_database else (scope.campaign_id,)
+    outer_predicate, parameters = scope.where("g")
+    condition = f" AND {outer_predicate}" if outer_predicate else ""
+    inner_predicate, inner_parameters = scope.where("inner_solution")
+    inner = f" AND {inner_predicate}" if inner_predicate else ""
     rows = connection.execute(
         f"""
         SELECT g.*, s.site_key, s.rfss, s.site, s.observation_status
@@ -457,10 +451,8 @@ def solution_history(
     *,
     scope: CampaignScope = WHOLE_DATABASE,
 ) -> list[dict[str, Any]]:
-    if scope.is_whole_database:
-        condition, parameters = "", ()
-    else:
-        condition, parameters = " AND campaign_id = ?", (scope.campaign_id,)
+    predicate, parameters = scope.where("geo_solutions")
+    condition = f" AND {predicate}" if predicate else ""
     return [
         dict(row)
         for row in connection.execute(

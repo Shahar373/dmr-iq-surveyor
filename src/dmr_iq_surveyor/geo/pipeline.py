@@ -209,6 +209,11 @@ def materialise_measurements(
         "summary": summarise(total),
         "settings": resolved.to_dict(),
         "campaign_id": scope.campaign_id,
+        # Says which of the three scopes ran, because `campaign_id: null`
+        # alone cannot tell "every run in the file" from "only the runs that
+        # declare no campaign" -- and those rebuild against different
+        # reference gains.
+        "scope": scope.label,
         "reference_gain": reference_gain,
         "reference_gain_sources": gain_sources,
         "gain_drift_runs": drifted,
@@ -703,9 +708,15 @@ def solve_all_sites(
     # a bare timestamp makes them collide within the same second -- the second
     # would replace the first's plan outright, since `geo_plans.solve_batch_id`
     # is the primary key.
+    #
+    # Asked for before any work starts, not after: a solve scoped to the
+    # unassigned runs has no honest boundary to record, and refusing here
+    # costs a second rather than minutes of grid search whose result would
+    # then have nowhere truthful to go.
+    stored_campaign_id = scope.stored_campaign_id()
     batch = solve_batch_id or "_".join(
         part
-        for part in (datetime.now(UTC).strftime("%Y%m%d_%H%M%S"), scope.campaign_id)
+        for part in (datetime.now(UTC).strftime("%Y%m%d_%H%M%S"), stored_campaign_id)
         if part
     )
     # Measurements built before their run's exclusion changed are rebuilt
@@ -800,7 +811,7 @@ def solve_all_sites(
             # the result back can tell a campaign's own conclusion from one
             # drawn across every round in the file. NULL for an unscoped
             # solve, which is what it is: a whole-database answer.
-            row["campaign_id"] = scope.campaign_id
+            row["campaign_id"] = stored_campaign_id
             store_solution(connection, solve_batch_id=batch, row=row)
 
         plan = _build_plan(
@@ -815,7 +826,7 @@ def solve_all_sites(
             solve_batch_id=batch,
             plan=plan,
             geojson=plan_to_geojson(plan),
-            campaign_id=scope.campaign_id,
+            campaign_id=stored_campaign_id,
         )
         measurement_summary = summarise(fetch_all_measurements(connection, scope=scope))
     finally:
@@ -826,7 +837,7 @@ def solve_all_sites(
         "tool": "dmr-iq-surveyor",
         "tool_version": __version__,
         "solve_batch_id": batch,
-        "campaign_id": scope.campaign_id,
+        "campaign_id": stored_campaign_id,
         "method": METHOD,
         "source_model": SOURCE_MODEL,
         "geolocation_maturity": GEOLOCATION_MATURITY,
