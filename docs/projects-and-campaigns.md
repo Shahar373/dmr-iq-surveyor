@@ -396,6 +396,29 @@ hunts for afterwards. The startup banner always names the origin of each half.
 `--hardware` on `survey run` and `survey capture` names a profile directly for
 an offline or single-stop analysis.
 
+### What the radio says it is
+
+A hardware profile is a declaration, however precise. Alongside it, a run
+records what the device itself answered when it was opened -- its serial and
+its label -- in `hardware_json.identity`, which holds observations and nothing
+else. A serial typed as `--serial` selects which radio to open and is recorded
+as that; a serial written into a profile stays in `declared`. Neither is
+allowed to appear as something the radio reported.
+
+The device is asked once, through the handle the capture is already streaming
+from: no second open, no second enumeration, no probe subprocess, because the
+SDRplay API hands the radio to one client at a time. Every question is
+guarded on its own, so a driver that answers none of them simply records
+nothing and the capture is unaffected. A blank answer is left out rather than
+stored, since an empty serial would read as one the radio reported and nobody
+can look up.
+
+This is what lets a campaign say afterwards *which* RSP recorded which stop --
+the question a spare radio swapped in mid-round makes urgent, and the one the
+declaration cannot answer. `scripts/campaign_digest.py` prints the observed
+receiver beside the declared one and says when more than one radio reported
+itself across a round. No existing run is backfilled.
+
 ## Capture campaign, view scope, and browsing safely
 
 A campaign answered two different questions with one value, and that was a
@@ -563,16 +586,21 @@ Done:
    isolation, and no token leak.
 5. **PR4** -- capture campaign separated from view scope; legacy analyses
    readable again, transmitter results included and labelled; Current / Legacy
-   / All selector; no write or delete through a historical view. *This
-   section.*
+   / All selector; no write or delete through a historical view. *The section
+   above.* Accepted on the Pi:
+   [`docs/validation/pr4-capture-campaign-and-view-scope.md`](validation/pr4-capture-campaign-and-view-scope.md).
+
+In progress:
+
+6. **PR5 -- campaign lifecycle and ops hardening.** `fieldctl campaign
+   list/current/new/use/close`; an atomic `field.env.local` edit that checks
+   for a running job, restarts and can roll back; the `field.env.local`
+   parity fix; the receiver serial and label completed in observed hardware
+   identity; the PR4 Pi acceptance written up formally. *The two sections
+   below.*
 
 Planned, in order, and none of it started here:
 
-6. **PR5 -- campaign lifecycle and ops hardening.** `fieldctl campaign
-   list/current/new/use/close`; an atomic `field.env` edit that checks for a
-   running job, restarts and can roll back; the `field.env.local` parity fix;
-   the receiver serial completed in observed hardware identity; the PR3 Pi
-   acceptance written up formally.
 7. **PR6 -- historical campaign curation.** An explicit assignment command
    with a dry run, selecting by run id or by time range. No automatic
    backfill, ever. Derived analysis is **recomputed**, never given a blind
@@ -586,6 +614,139 @@ Planned, in order, and none of it started here:
    ground truth.
 10. **Later only.** An analyzer abstraction for P25, VOR, ATIS, DMR and other
     signal types. Not before the above.
+
+## A campaign is open until it is closed
+
+A campaign manifest carries one optional key:
+
+```yaml
+status: open        # or: closed
+```
+
+Absent means `open`. Every campaign declared before this key existed is
+therefore open, which is what it was, and no manifest has to be rewritten. An
+open campaign's manifest is rendered byte-for-byte as it was before the key
+existed, so a file written by an older build still compares equal and
+`project campaign new` still reports it unchanged rather than as a conflict.
+
+It is `open`/`closed` and deliberately **not** `active`, because those are
+answers to two different questions:
+
+| | the question | where the answer lives |
+|---|---|---|
+| **current campaign** | which campaign is this deployment recording into | `FIELD_CAMPAIGN`, in the environment file the service reads |
+| **open / closed** | does this round still accept evidence | `status`, in the campaign manifest |
+
+The same manifest is read by the laptop doing analysis and by the Pi in the
+car, and only one of them is recording. A campaign that called itself
+"active" would be claiming something about a machine it knows nothing about.
+
+**Closed refuses new acquisition and takes nothing away from reading.** The
+manifest still loads, the campaign still lists, the field app still shows the
+round in Legacy or under its own name, and `geo measurements`, `geo solve`,
+`geo sites`, `geo export` and `scripts/campaign_digest.py` all read it exactly
+as before. What stops is capture, drive, a pull-over hold, and editing that
+round's stops.
+
+The refusal is one function, `require_open_campaign`, called at each of the
+three doors that lead to a recording rather than reimplemented at each:
+
+- `web serve --campaign <closed>` fails while manifests are still just files:
+  before the project binding, before the database is opened, before the
+  recordings directory is made and long before the SDR. A service pointed at
+  a closed campaign leaves nothing behind.
+- `survey capture --project P --campaign <closed>` and `live stop --project P
+  --campaign <closed>` fail before the radio is probed, and `survey run
+  --project P --campaign <closed>` fails before the recording is read.
+  `--project` is optional on all three and does exactly one thing: it checks
+  the round against that project's manifests. It deliberately does **not**
+  resolve band, site or gain from the manifest, because those commands have
+  never read one and making them do so would change what a stop is recorded
+  with. `survey run` is included because it writes a `survey_runs` row under
+  the campaign exactly as the other two do, and filing a day's recordings is
+  the work most likely to happen after the round was closed.
+- A campaign closed **while a service is running** stops taking stops at
+  once. The startup check cannot cover that case -- it ran before the close
+  -- so the doors that write new evidence (a capture, a drive, a pull-over
+  hold, analysing a recording, and editing a stop) re-read the manifest each
+  time they are asked. Without that, the running service kept recording into
+  a finished round until its next restart, and that restart then failed,
+  which on a Pi means at the side of a road. A manifest that cannot be read
+  leaves the service behaving exactly as it did before the check existed:
+  refusing there would take a working deployment down over a path that
+  moved, and startup already proved the campaign was open.
+
+Closing edits the manifest rather than re-rendering it: one line is replaced
+or inserted and every other byte, comments included, is left alone. A campaign
+file is one an operator may have annotated, and closing a round is not an
+occasion to drop their notes. The rewrite keeps the file's mode and owner,
+because closing under `/etc` is done as root and a manifest left root-only is
+one the service user can no longer read at startup.
+
+Nothing about closing touches the database. No row is moved, relabelled or
+deleted, and there is no migration.
+
+## Managing campaigns on the Pi
+
+`fieldctl campaign` is the operations half. Everything that reads or writes a
+*manifest* is delegated to `dmr-surveyor project campaign`, which owns the
+schema, the single campaign-id validator and the atomic write; what lives in
+the shell is the part only the host knows -- which campaign this deployment
+records into, whether a job is running, and how to change that without losing
+a stop.
+
+```
+fieldctl campaign list      every campaign, with status, size and settings
+fieldctl campaign current   what this deployment records into, and from where
+fieldctl campaign new ID    declare a round (reports only, unless --write)
+fieldctl campaign use ID    record into it from now on (ditto)
+fieldctl campaign close ID  finish a round (ditto)
+```
+
+`list` and `current` are read-only and need no privileges. `current` is the
+one that answers the question `status` alone cannot: it prints the effective
+project and campaign, **which of the two environment files each came from**,
+the campaign the assembled argv would pass, and -- when the service is up --
+the campaign the API says it is actually recording into. A file edited without
+a restart is a disagreement nothing else surfaces.
+
+`new`, `use` and `close` report and change nothing unless `--write` is given.
+A write under `/etc` refuses without root and prints the exact `sudo` line;
+`fieldctl` never calls `sudo` for you, because a command that silently
+escalates is one nobody can predict the blast radius of.
+
+`use` is the one that has to be right, and its order is the design:
+
+1. take an exclusive lock, so two operators cannot switch at once;
+2. ask the API whether any job has not finished, and refuse if one has not --
+   *terminal* is the job model's own word, so `succeeded`, `failed` and
+   `cancelled` are finished and a submitted-but-not-started capture is not;
+3. stop the service, so nothing can start a capture between that answer and
+   the switch;
+4. rewrite only `FIELD_PROJECT` and `FIELD_CAMPAIGN` in `field.env.local`,
+   keeping every other line, comment and override, and leaving `field.env`
+   untouched;
+5. start the service, wait for the API, and verify the project and campaign
+   it reports;
+6. check the token is not in the service's argv.
+
+Any failure restores the previous file exactly -- or removes it, if there was
+none -- starts the service again, verifies the previous campaign came back,
+and exits non-zero saying what is in force. `use` refuses a closed campaign, a
+campaign the project does not declare, and a `field.env.local` that is a
+symbolic link (writing through one would replace the link and leave its target
+untouched) -- all of that before the service is stopped.
+
+`close` refuses to close the campaign this deployment is recording into.
+Switch to another one first; otherwise the service would be left pointed at a
+campaign it may no longer write to and would not find out until its next
+start, which is a restart nobody planned, at the side of a road.
+
+`new` copies the current campaign's band, site, hardware and capture settings
+by default, so the second round of a survey is declared by naming what changed
+rather than by retyping what did not. It never overwrites an existing
+manifest, and declaring a campaign does not switch the deployment to it: that
+is `use`, and it is a separate, deliberate step.
 
 ## What this does not do
 

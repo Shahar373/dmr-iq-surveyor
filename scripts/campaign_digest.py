@@ -33,6 +33,7 @@ from dmr_iq_surveyor.survey.pipeline import (
 )
 from dmr_iq_surveyor.survey.provenance import (
     SOURCE_LABELS,
+    identity_value,
     if_gain_reading,
     lna_state_reading,
     load_hardware,
@@ -75,6 +76,31 @@ def _gain_readings(runs: list[sqlite3.Row]) -> list[tuple]:
             )
         )
     return readings
+
+
+def _identity_name(value):
+    """A receiver name worth printing, or None.
+
+    A blank or non-string value is not a name: printed, it renders as an
+    empty receiver that reads like a recorded one, and counted, it splits one
+    radio into two entries.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _receiver_name(hardware):
+    """How this run's receiver is counted, or None when it is not recorded.
+
+    By serial when there is one, because a serial names the unit; by label
+    otherwise, because a label names the model. Joining the two counted one
+    radio as two as soon as one stop got a label and another did not.
+    """
+    serial = _identity_name(identity_value(hardware, "serial"))
+    label = _identity_name(identity_value(hardware, "label"))
+    return serial or label
 
 
 def _report_setting(
@@ -165,6 +191,32 @@ def stops(connection: sqlite3.Connection, campaign: str | None = None) -> None:
         unit="",
         plural="LNA STATE",
     )
+
+    # The receiver each stop was recorded with, kept apart from what the site
+    # or hardware profile DECLARED it to be. The two agree on a well-kept
+    # campaign and differ exactly when it matters: a spare RSP swapped in
+    # mid-round reads as one receiver in the declaration and as two here.
+    #
+    # Not labelled "observed", because the bucket cannot promise that: a
+    # serial reaches it from `--serial` too, and only a driver that answered
+    # replaces it. Calling a requested serial an observation would be the
+    # single confusion this project's three-bucket split exists to prevent.
+    identities = Counter()
+    for row in runs:
+        name = _receiver_name(load_hardware(row["hardware_json"]))
+        identities[name or "not recorded"] += 1
+    if identities:
+        print(
+            "  receiver identity    "
+            + ", ".join(f"{name} x{count}" for name, count in identities.most_common())
+        )
+        # Counted over the receivers that ARE named. A single run carrying no
+        # identity -- a legacy row, or a driver that answered nothing -- used
+        # to silence this warning entirely, which is the one case it exists
+        # for.
+        named = [name for name in identities if name != "not recorded"]
+        if len(named) > 1:
+            print("       more than one receiver across this campaign")
 
     rates = Counter(row["sample_rate_hz"] for row in runs)
     print(

@@ -28,6 +28,11 @@ from rich.table import Table
 
 from dmr_iq_surveyor.geo.store import connect_geo_database
 from dmr_iq_surveyor.live.session import LiveSession, LiveSettings, Position
+from dmr_iq_surveyor.project.manifest import (
+    ProjectError,
+    require_open_campaign,
+    resolve_project,
+)
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
 from dmr_iq_surveyor.survey.profiles import (
     ProfileError,
@@ -99,6 +104,18 @@ def live_stop(
             ),
         ),
     ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option(
+            "--project",
+            help=(
+                "Project manifest, project directory, or a name under projects/<name>/. "
+                "Given with --campaign it checks this round against the project before "
+                "the radio is touched: the campaign manifest must exist, belong to this "
+                "project and be open. It changes no other setting"
+            ),
+        ),
+    ] = None,
     driver: Annotated[str, typer.Option(help="SoapySDR driver name")] = "sdrplay",
     window_seconds: Annotated[
         float, typer.Option("--window-seconds", help="Length of one averaging window")
@@ -127,6 +144,23 @@ def live_stop(
     ] = None,
 ) -> None:
     """Measure at one place, write the result, keep no recording."""
+    # Before the radio is opened and before any of the memory arithmetic
+    # below: a round that may not be recorded into is a refusal that should
+    # cost nothing, and this one is answered by reading two files.
+    if project is not None:
+        if campaign is None:
+            console.print(
+                "[bold red]--project is given without --campaign[/bold red], so there "
+                "is nothing for it to check. Name the round with --campaign, or drop "
+                "--project."
+            )
+            raise typer.Exit(code=1)
+        try:
+            require_open_campaign(resolve_project(project), campaign)
+        except (ProjectError, FileNotFoundError) as exc:
+            console.print(f"[bold red]Campaign refused:[/bold red] {exc}")
+            raise typer.Exit(code=1) from exc
+
     if seconds <= 0 or window_seconds <= 0:
         console.print("[bold red]--seconds and --window-seconds must be positive.[/bold red]")
         raise typer.Exit(code=1)

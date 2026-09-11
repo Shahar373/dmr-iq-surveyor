@@ -10,9 +10,11 @@ side effect of being looked at.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
+from urllib.parse import quote
 
 import typer
 import yaml
@@ -31,15 +33,20 @@ from dmr_iq_surveyor.project.claim import (
 )
 from dmr_iq_surveyor.project.manifest import (
     ANALYZER_P25_SITE_GEOLOCATION,
+    CAMPAIGN_STATUS_CLOSED,
     CampaignDefaults,
+    CampaignManifest,
     ProjectDefaults,
     ProjectError,
+    ProjectManifest,
     load_campaign_manifest,
     load_project_manifest,
     normalise_project_id,
     render_campaign_manifest,
     render_project_manifest,
+    resolve_campaign,
     resolve_project,
+    set_campaign_status_text,
     validate_project_text,
 )
 
@@ -176,7 +183,10 @@ def project_show(project: ProjectOption) -> None:
         except (ProjectError, FileNotFoundError) as exc:
             listing.add_row(path.stem, "-", f"[red]{exc}[/red]")
             continue
-        listing.add_row(campaign.campaign_id, campaign.label, "ok")
+        # The lifecycle, not a bare "ok". A campaign that reads correctly and
+        # a campaign that may still be recorded into are two different facts,
+        # and the second is the one an operator is looking for here.
+        listing.add_row(campaign.campaign_id, campaign.label, campaign.status)
     console.print(listing)
 
 
@@ -556,6 +566,272 @@ def _adopt(
     )
 
 
+def _campaign_files(manifest: ProjectManifest) -> list[Path]:
+    """Every campaign file declared under a project, in name order."""
+    if not manifest.campaign_dir.is_dir():
+        return []
+    return sorted(manifest.campaign_dir.glob("*.yaml"))
+
+
+def _runs_per_campaign(database: Path) -> dict[str | None, int]:
+    """How many survey runs each campaign holds, read without being able to
+    write.
+
+    A database that is missing, unreadable or older than `campaign_id`
+    answers "nothing known" rather than raising: listing campaigns is a
+    reporting command, and it has to keep working on a laptop that has the
+    manifests but not the field database.
+    """
+    if not database.is_file():
+        return {}
+    try:
+        # Quoted, because the path is going into a URI. A `#` in it starts a
+        # fragment: it truncated both the rest of the path AND `?mode=ro`, so
+        # a command documented as writing nothing opened a different file
+        # read-WRITE and created it. `%` was mishandled the same way.
+        connection = sqlite3.connect(
+            f"file:{quote(str(database))}?mode=ro", uri=True
+        )
+    except sqlite3.Error:
+        return {}
+    try:
+        rows = connection.execute(
+            "SELECT campaign_id, COUNT(*) FROM survey_runs GROUP BY campaign_id"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        connection.close()
+    return {row[0]: int(row[1]) for row in rows}
+
+
+def _campaign_summary(
+    manifest: ProjectManifest, path: Path, runs: dict[str | None, int]
+) -> dict[str, Any]:
+    """One campaign as a row of facts, or as the problem that stopped it
+    being read.
+
+    A manifest that does not parse is reported in its own row and never
+    raises. One unreadable file among twenty is exactly when an operator
+    needs the list most, and a traceback would take the other nineteen away.
+    """
+    try:
+        campaign = load_campaign_manifest(path, expect_project_id=manifest.project_id)
+    except (ProjectError, FileNotFoundError, OSError) as exc:
+        return {
+            "campaign_id": path.stem,
+            "manifest": str(path),
+            "problem": str(exc),
+        }
+    defaults = campaign.defaults
+    return {
+        "campaign_id": campaign.campaign_id,
+        "label": campaign.label,
+        "status": campaign.status,
+        "manifest": str(campaign.path),
+        "runs": runs.get(campaign.campaign_id, 0),
+        # The values that actually apply: what the round pins, or what it
+        # inherits from the project when it pins nothing.
+        "band": defaults.band or manifest.defaults.band,
+        "site": defaults.site or manifest.defaults.site,
+        "hardware": defaults.hardware or manifest.defaults.hardware,
+        "capture": dict(defaults.capture),
+        "problem": None,
+    }
+
+
+@campaign_app.command("list")
+def campaign_list(
+    project: ProjectOption,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Machine-readable output, for scripts and fieldctl"),
+    ] = False,
+    current: Annotated[
+        str | None,
+        typer.Option(
+            "--current",
+            help=(
+                "Mark this campaign as the one being recorded into. Passed in by the "
+                "caller, because which campaign a deployment records into is the "
+                "deployment's state and is not written in any manifest"
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Every campaign declared under a project, with its lifecycle and size.
+
+    Reads manifests and, if it is there, the project's database. Opens no
+    SDR, writes nothing, and needs no privileges.
+    """
+    try:
+        manifest = resolve_project(project)
+    except (ProjectError, FileNotFoundError) as exc:
+        _fail(str(exc))
+        return
+
+    runs = _runs_per_campaign(manifest.database)
+    summaries = [
+        _campaign_summary(manifest, path, runs) for path in _campaign_files(manifest)
+    ]
+    for summary in summaries:
+        summary["current"] = current is not None and summary["campaign_id"] == current
+
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "project_id": manifest.project_id,
+                    "manifest": str(manifest.path),
+                    "database": str(manifest.database),
+                    "unassigned_runs": runs.get(None, 0),
+                    "campaigns": summaries,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+
+    if not summaries:
+        console.print(f"No campaigns declared under {manifest.campaign_dir}.")
+        return
+
+    table = Table(title=f"Campaigns in {manifest.project_id}")
+    for column in ("campaign_id", "label", "status", "current", "runs", "band", "site", "hardware"):
+        table.add_column(column)
+    for summary in summaries:
+        if summary["problem"]:
+            table.add_row(
+                summary["campaign_id"],
+                f"[red]unreadable: {summary['problem']}[/red]",
+                "[red]?[/red]",
+                "",
+                "",
+                "",
+                "",
+                "",
+            )
+            continue
+        table.add_row(
+            summary["campaign_id"],
+            summary["label"],
+            summary["status"],
+            "yes" if summary["current"] else "",
+            str(summary["runs"]),
+            summary["band"] or "-",
+            summary["site"] or "-",
+            summary["hardware"] or "-",
+        )
+    console.print(table)
+    unreadable = [summary for summary in summaries if summary["problem"]]
+    if unreadable:
+        console.print(
+            f"[yellow]{len(unreadable)} campaign manifest(s) could not be read.[/yellow] "
+            "They are listed above with the reason; nothing else is affected."
+        )
+    if runs.get(None):
+        console.print(
+            f"{runs[None]} run(s) carry no campaign at all -- the rounds recorded before "
+            "campaigns existed. Nothing here assigns them to one."
+        )
+
+
+@campaign_app.command("close")
+def campaign_close(
+    project: ProjectOption,
+    campaign_id: Annotated[str, typer.Option("--campaign-id", help="The round to close")],
+    write: Annotated[
+        bool,
+        typer.Option("--write", help="Actually write. Without it this only reports"),
+    ] = False,
+) -> None:
+    """Mark a campaign closed: no new stops, everything still readable.
+
+    This is the manifest half of closing a round. It does not know, and
+    cannot know, whether a service is currently recording into this campaign
+    -- that is deployment state -- so on a Pi use `fieldctl campaign close`,
+    which checks that first and then calls this.
+
+    Changes no database row and deletes nothing.
+    """
+    try:
+        manifest = resolve_project(project)
+        campaign = resolve_campaign(manifest, campaign_id)
+    except (ProjectError, FileNotFoundError) as exc:
+        _fail(str(exc))
+        return
+
+    table = Table(title=f"Closing {campaign.campaign_id}")
+    table.add_column("what")
+    table.add_column("value")
+    table.add_row("manifest", str(campaign.path))
+    table.add_row("status now", campaign.status)
+    table.add_row("status after", CAMPAIGN_STATUS_CLOSED)
+    table.add_row("database", "untouched -- no row is changed, moved or deleted")
+    console.print(table)
+
+    if campaign.is_closed:
+        console.print(f"[green]Already closed[/green] {campaign.path}")
+        return
+
+    try:
+        original = campaign.path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        _fail(f"{campaign.path} could not be read: {exc}")
+        return
+    updated = set_campaign_status_text(original, CAMPAIGN_STATUS_CLOSED)
+
+    if not write:
+        console.print(
+            "\n[yellow]Nothing was written.[/yellow] Re-run with --write to close the "
+            "campaign. It stays readable and analysable afterwards; what stops is new "
+            "acquisition."
+        )
+        return
+
+    _refuse_symlink(campaign.path)
+    write_manifest_atomically(campaign.path, updated)
+    # Read back through the real loader rather than trusting the text this
+    # command produced. A file that no longer parses is one the service
+    # would refuse at startup, and the time to find that out is now.
+    try:
+        confirmed = load_campaign_manifest(
+            campaign.path, expect_project_id=manifest.project_id, expect_campaign_id=campaign.campaign_id
+        )
+    except (ProjectError, FileNotFoundError) as exc:
+        write_manifest_atomically(campaign.path, original)
+        _fail(f"the closed manifest did not validate ({exc}); the file was restored")
+        return
+    if not confirmed.is_closed:
+        write_manifest_atomically(campaign.path, original)
+        _fail("the manifest did not read back as closed; the file was restored")
+        return
+    console.print(f"[green]Closed[/green] {campaign.path}")
+
+
+def _refuse_symlink(path: Path) -> None:
+    """A manifest that is a symlink is refused rather than written through.
+
+    `write_manifest_atomically` replaces the path it is given, which for a
+    symlink means replacing the link with a regular file -- so the file the
+    operator believes they are editing is left untouched and the link they
+    set up is gone.
+
+    Checked on the path as given. A path that came back from
+    `load_campaign_manifest` has already been resolved and therefore names
+    the target rather than the link, which is exactly what should be written
+    and is why this passes for one; a path this module assembled itself, as
+    `campaign new` does, has not, and is where the refusal bites.
+    """
+    if path.is_symlink():
+        _fail(
+            f"{path} is a symbolic link. Writing would replace the link with a regular "
+            "file and leave its target unchanged, so this is refused. Edit the target "
+            "directly, or remove the link."
+        )
+
+
 @campaign_app.command("new")
 def campaign_new(
     project: ProjectOption,
@@ -563,8 +839,50 @@ def campaign_new(
     label: Annotated[str | None, typer.Option("--label", help="Human-readable name")] = None,
     band: Annotated[str | None, typer.Option("--band", help="Band profile this round fixes")] = None,
     site: Annotated[str | None, typer.Option("--site", help="Site profile this round fixes")] = None,
+    hardware: Annotated[
+        str | None,
+        typer.Option("--hardware", help="Hardware profile this round is run with"),
+    ] = None,
+    center_frequency_hz: Annotated[
+        float | None,
+        typer.Option("--center-frequency-hz", help="Tuner centre frequency this round pins"),
+    ] = None,
+    sample_rate_hz: Annotated[
+        float | None,
+        typer.Option("--sample-rate-hz", help="Sample rate this round pins"),
+    ] = None,
+    duration_seconds: Annotated[
+        float | None,
+        typer.Option("--duration-seconds", help="Stop duration this round pins"),
+    ] = None,
+    copy_from: Annotated[
+        str | None,
+        typer.Option(
+            "--from",
+            help=(
+                "Copy band, site, hardware and capture settings from this campaign in "
+                "the same project. An explicit flag still wins over what is copied"
+            ),
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Report what would be written and write nothing",
+        ),
+    ] = False,
 ) -> None:
-    """Write a campaign manifest under the project. Opens no database."""
+    """Write a campaign manifest under the project. Opens no database.
+
+    A new round usually continues the last one: same radio, same band, same
+    place, same capture settings, a different day. `--from` copies those from
+    an existing campaign so the second round of a survey is declared by
+    naming what changed rather than by retyping what did not.
+
+    Nothing is ever overwritten. A manifest that already exists and says
+    something else is a refusal, not a merge.
+    """
     from dmr_iq_surveyor.survey.provenance import ProvenanceError, normalise_campaign_id
 
     try:
@@ -577,20 +895,119 @@ def campaign_new(
         _fail("--campaign-id must not be empty")
         return
 
+    source: CampaignManifest | None = None
+    if copy_from is not None:
+        try:
+            source = resolve_campaign(manifest, copy_from)
+        except (ProjectError, FileNotFoundError) as exc:
+            _fail(f"--from {copy_from!r} could not be read: {exc}")
+            return
+
+    inherited = source.defaults if source is not None else CampaignDefaults()
+    capture = dict(inherited.capture)
+    for key, value in (
+        ("center_frequency_hz", center_frequency_hz),
+        ("sample_rate_hz", sample_rate_hz),
+        ("duration_seconds", duration_seconds),
+    ):
+        if value is not None:
+            capture[key] = value
+
+    defaults = CampaignDefaults(
+        band=band if band is not None else inherited.band,
+        site=site if site is not None else inherited.site,
+        hardware=hardware if hardware is not None else inherited.hardware,
+        capture=capture,
+    )
+
+    # The filename is how a campaign is found: `resolve_campaign` asks for
+    # this exact path and reads whatever is there, so the name and the id
+    # inside it have to agree byte for byte. Built from the validated id
+    # rather than from what was typed.
     destination = manifest.campaign_path(resolved_id)
+    # The leaf is checked below; the DIRECTORY is checked here, because
+    # `write_manifest_atomically` resolves the path it is given and a
+    # symlinked `campaigns/` therefore sends the bytes somewhere else while
+    # every message still names the path inside the project.
+    if manifest.campaign_dir.is_symlink():
+        _fail(
+            f"{manifest.campaign_dir} is a symbolic link. A manifest written through it "
+            "would land outside the project while every message here named a path inside "
+            "it, so this is refused. Point the project at the real directory."
+        )
+        return
     text = render_campaign_manifest(
         campaign_id=resolved_id,
         project_id=manifest.project_id,
-        label=label or resolved_id,
-        defaults=CampaignDefaults(band=band, site=site),
+        label=label or (source.label if source is not None else resolved_id),
+        defaults=defaults,
     )
+
+    table = Table(title=f"Campaign {resolved_id}")
+    table.add_column("what")
+    table.add_column("value")
+    table.add_row("manifest", str(destination))
+    table.add_row("project", f"{manifest.project_id} ({manifest.path})")
+    table.add_row("copied from", str(source.path) if source is not None else "nothing")
+    for key, value in defaults.to_dict().items():
+        if key == "capture":
+            continue
+        inherited_from_project = value is None and getattr(manifest.defaults, key, None)
+        table.add_row(
+            key,
+            str(value)
+            if value is not None
+            else (
+                f"{inherited_from_project} (inherited from the project)"
+                if inherited_from_project
+                else "not set"
+            ),
+        )
+    table.add_row(
+        "capture",
+        ", ".join(f"{key}={value:g}" for key, value in sorted(capture.items()))
+        if capture
+        else "not pinned",
+    )
+    console.print(table)
+
     if destination.exists():
-        if destination.read_text(encoding="utf-8") == text:
+        # Read as text and compared, exactly as before: a re-run that would
+        # write the same bytes is a no-op worth saying out loud, and anything
+        # else is refused rather than merged.
+        try:
+            existing = destination.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            _fail(f"{destination} already exists and could not be read to compare: {exc}")
+            return
+        if existing == text:
             console.print(f"[green]Unchanged[/green] {destination}")
             return
         _fail(f"{destination} already exists and differs; it will not be overwritten.")
 
+    if dry_run:
+        console.print(
+            "\n[yellow]Nothing was written.[/yellow] Re-run without --dry-run to write "
+            "the manifest. Writing one changes no deployment: it does not switch the "
+            "campaign being recorded into and does not restart anything."
+        )
+        return
+
+    _refuse_symlink(destination)
     write_manifest_atomically(destination, text)
+    # Read back through the loader every other command uses, so a manifest
+    # this command wrote can never be one the service would refuse at
+    # startup.
+    try:
+        load_campaign_manifest(
+            destination,
+            expect_project_id=manifest.project_id,
+            expect_campaign_id=resolved_id,
+        )
+    except (ProjectError, FileNotFoundError) as exc:
+        destination.unlink(missing_ok=True)
+        _fail(f"the manifest this wrote did not validate ({exc}); it was removed")
+        return
     console.print(f"[green]Wrote[/green] {destination}")
 
 

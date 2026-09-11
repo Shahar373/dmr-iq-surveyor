@@ -24,7 +24,7 @@ from dmr_iq_surveyor.project.manifest import (
     CampaignManifest,
     ProjectError,
     ProjectManifest,
-    resolve_campaign,
+    require_open_campaign,
     resolve_project,
     resolve_setting,
 )
@@ -407,7 +407,14 @@ def _resolve_project_context(
     manifest that turns out to be wrong costs nothing.
     """
     manifest = resolve_project(project)
-    resolved_campaign = resolve_campaign(manifest, campaign) if campaign else None
+    # `require_open_campaign`, not `resolve_campaign`: this is the first of
+    # the three doors into a recording, and it is reached before anything is
+    # bound, opened or created. A service pointed at a closed campaign would
+    # otherwise open the SDR, make its directories and touch the database
+    # before anyone discovered that the first stop of the day had nowhere it
+    # was allowed to go. Refusing here costs nothing and leaves nothing
+    # behind.
+    resolved_campaign = require_open_campaign(manifest, campaign) if campaign else None
 
     campaign_defaults = resolved_campaign.defaults if resolved_campaign else None
     band_choice = resolve_setting(

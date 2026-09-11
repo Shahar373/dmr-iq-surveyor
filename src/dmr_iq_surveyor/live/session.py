@@ -61,6 +61,7 @@ from dmr_iq_surveyor.survey.provenance import (
     hardware_provenance,
     normalise_campaign_id,
     requested_bucket,
+    scalar_identity,
 )
 from dmr_iq_surveyor.survey.store import SurveyRunRecord, import_survey_run, upsert_site
 
@@ -425,7 +426,18 @@ class LiveSession:
         # device what it ended up at, so a drive DOES have a read-back;
         # only a device that exposes none falls back to `requested`.
         self._hardware = hardware_provenance(
-            identity={"driver": requested.driver, "serial": requested.serial},
+            identity={
+                "driver": requested.driver,
+                "serial": requested.serial,
+                # From the device opened just above -- one open, one answer,
+                # carried by every bin this drive writes. Filtered exactly as
+                # the capture path filters the same values: a device that
+                # offered a non-scalar here used to build a blob the store
+                # then rejected, which lost the whole drive rather than one
+                # reading, and a device that offered no mapping at all raised
+                # before the handle could be closed.
+                **scalar_identity(getattr(resolved_device, "observed_identity", None)),
+            },
             applied=applied_bucket(getattr(resolved_device, "applied_settings", None)),
             requested=requested_bucket(
                 center_frequency_hz=requested.center_frequency_hz,

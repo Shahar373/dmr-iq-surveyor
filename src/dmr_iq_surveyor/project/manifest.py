@@ -54,6 +54,20 @@ _DEFAULT_PROJECT_DIRS = ("config/projects", "projects")
 # The hardware profile joins this set in PR3, for the same reason.
 REFUSE_ON_CONFLICT = frozenset({"band"})
 
+# A campaign's lifecycle, which is NOT the same question as "which campaign is
+# this deployment recording into". That one is deployment state, and it lives
+# in the environment file the service reads; it is never written into a
+# manifest, because the same manifest is read by a laptop doing analysis and
+# by the Pi in the car, and only one of them is recording.
+#
+# `open` accepts new acquisition. `closed` says the round is finished: it may
+# still be viewed, reported on and analysed offline -- nothing is hidden and
+# nothing is deleted -- but no new capture, drive or pull-over hold may be
+# recorded into it, and its stops may not be edited.
+CAMPAIGN_STATUS_OPEN = "open"
+CAMPAIGN_STATUS_CLOSED = "closed"
+CAMPAIGN_STATUSES = (CAMPAIGN_STATUS_OPEN, CAMPAIGN_STATUS_CLOSED)
+
 ORIGIN_FLAG = "flag"
 ORIGIN_CAMPAIGN = "campaign"
 ORIGIN_PROJECT = "project"
@@ -92,7 +106,17 @@ def _load_mapping(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(path)
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        # A manifest that exists and cannot be read is a refusal with a
+        # reason, not an uncaught traceback out of `web serve`'s startup.
+        # Permissions are the way this happens: a campaign closed as root
+        # used to leave the file unreadable by the service user.
+        raise ProjectError(f"{path} could not be read: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ProjectError(f"{path} is not valid UTF-8: {exc}") from exc
+    try:
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise ProjectError(f"{path} is not valid YAML: {exc}") from exc
     if raw is None:
@@ -196,11 +220,19 @@ class CampaignManifest:
     label: str
     defaults: CampaignDefaults
     path: Path
+    # Absent in a manifest means `open`. Every campaign declared before this
+    # field existed is therefore open, which is what it was, and no file has
+    # to be rewritten to keep working.
+    status: str = CAMPAIGN_STATUS_OPEN
+
+    @property
+    def is_closed(self) -> bool:
+        return self.status == CAMPAIGN_STATUS_CLOSED
 
 
 _PROJECT_KEYS = {"schema_version", "project_id", "label", "analyzer", "database", "defaults"}
 _PROJECT_DEFAULT_KEYS = {"band", "site", "output", "hardware"}
-_CAMPAIGN_KEYS = {"schema_version", "campaign_id", "project_id", "label", "defaults"}
+_CAMPAIGN_KEYS = {"schema_version", "campaign_id", "project_id", "label", "status", "defaults"}
 _CAMPAIGN_DEFAULT_KEYS = {"band", "site", "capture", "hardware"}
 # The three capture settings a collection round may pin. Restricted on
 # purpose: a campaign fixes what has to stay identical across stops for
@@ -304,14 +336,28 @@ def render_campaign_manifest(
     project_id: str,
     label: str,
     defaults: CampaignDefaults | None = None,
+    status: str = CAMPAIGN_STATUS_OPEN,
 ) -> str:
-    """The text of a campaign manifest, ready to validate and write."""
+    """The text of a campaign manifest, ready to validate and write.
+
+    `status` is written only when it is not `open`, the same way an unset
+    default is left out entirely. An open campaign's manifest is therefore
+    byte-for-byte what it was before this field existed, so re-rendering one
+    written by an older build still compares equal and `campaign new` keeps
+    reporting it as unchanged rather than as a conflict.
+    """
+    if status not in CAMPAIGN_STATUSES:
+        raise ProjectError(
+            f"status {status!r} is not one of {list(CAMPAIGN_STATUSES)}"
+        )
     body: dict[str, Any] = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "campaign_id": campaign_id,
         "project_id": project_id,
         "label": label,
     }
+    if status != CAMPAIGN_STATUS_OPEN:
+        body["status"] = status
     resolved = defaults or CampaignDefaults()
     declared = {
         key: value
@@ -321,6 +367,54 @@ def render_campaign_manifest(
     if declared:
         body["defaults"] = declared
     return RENDER_HEADER + yaml.safe_dump(body, sort_keys=False, allow_unicode=True)
+
+
+_STATUS_LINE_RE = re.compile(r"^status[ \t]*:.*$")
+_DEFAULTS_LINE_RE = re.compile(r"^defaults[ \t]*:")
+
+
+def set_campaign_status_text(text: str, status: str) -> str:
+    """Return `text` with its top-level `status:` set, editing rather than
+    re-rendering.
+
+    A campaign manifest is a file an operator may have annotated -- which
+    stop the round covers, why a band was chosen -- and re-rendering it from
+    the parsed model would silently drop every comment and reorder the keys.
+    Closing a round is not an occasion to rewrite somebody's notes, so this
+    replaces one line, or inserts one, and leaves every other byte alone.
+
+    Only a line starting at column zero is a top-level key, so a `status`
+    inside `defaults:` (which parsing rejects anyway) is not mistaken for
+    this one. The caller re-parses the result before writing it: this
+    function is deliberately textual, so it is not the thing that decides
+    the file is valid.
+    """
+    if status not in CAMPAIGN_STATUSES:
+        raise ProjectError(f"status {status!r} is not one of {list(CAMPAIGN_STATUSES)}")
+
+    # `str.splitlines()` also breaks on \v, \f, \x1c-\x1e, \x85, \u2028
+    # and \u2029; rejoining with "\n" rewrote any label containing one of
+    # them, which is not "leaves every other byte alone". CRLF survives for
+    # the same reason: the \r stays on the line it belongs to.
+    lines = text.split("\n")
+    trailing_newline = bool(lines) and lines[-1] == ""
+    if trailing_newline:
+        lines.pop()
+    replacement = f"status: {status}"
+    for index, line in enumerate(lines):
+        if _STATUS_LINE_RE.match(line):
+            lines[index] = replacement
+            break
+    else:
+        # Before `defaults:`, so the file keeps reading as a header of
+        # identity and lifecycle followed by the settings block. A manifest
+        # with no defaults at all gets it at the end.
+        insert_at = next(
+            (index for index, line in enumerate(lines) if _DEFAULTS_LINE_RE.match(line)),
+            len(lines),
+        )
+        lines.insert(insert_at, replacement)
+    return "\n".join(lines) + ("\n" if trailing_newline or lines else "")
 
 
 def validate_project_text(text: str, source: str | Path) -> ProjectManifest:
@@ -395,6 +489,8 @@ def load_campaign_manifest(
             f"{resolved} belongs to project {project_id!r}, not {expect_project_id!r}"
         )
 
+    status = _campaign_status(raw.get("status"), resolved)
+
     defaults_raw = raw.get("defaults") or {}
     if not isinstance(defaults_raw, dict):
         raise ProjectError(f"{resolved}: defaults must be a mapping")
@@ -428,6 +524,7 @@ def load_campaign_manifest(
         campaign_id=campaign_id,
         project_id=project_id,
         label=str(raw["label"]),
+        status=status,
         defaults=CampaignDefaults(
             band=_optional_str(defaults_raw.get("band")),
             site=_optional_str(defaults_raw.get("site")),
@@ -436,6 +533,34 @@ def load_campaign_manifest(
         ),
         path=resolved,
     )
+
+
+def _campaign_status(value: Any, where: Path | str) -> str:
+    """The lifecycle status a campaign manifest declares.
+
+    Absent means `open`: that is what every campaign declared before this
+    field existed was, and reading it any other way would close rounds
+    nobody closed. Present means exactly one of the two values -- validated,
+    never repaired, like every other id in this module, because a status
+    that was meant to say `closed` and is silently read as something else is
+    the one mistake this field exists to prevent.
+    """
+    if value is None:
+        return CAMPAIGN_STATUS_OPEN
+    if not isinstance(value, str):
+        raise ProjectError(
+            f"{where}: status must be one of {list(CAMPAIGN_STATUSES)}, "
+            f"found {type(value).__name__}"
+        )
+    candidate = value.strip()
+    if candidate not in CAMPAIGN_STATUSES:
+        raise ProjectError(
+            f"{where}: status {value!r} is not one of {list(CAMPAIGN_STATUSES)}. "
+            "A campaign is open while it may still be recorded into, and closed "
+            "when the round is finished; a closed campaign stays readable and "
+            "analysable."
+        )
+    return candidate
 
 
 def _optional_str(value: Any) -> str | None:
@@ -498,6 +623,28 @@ def resolve_campaign(project: ProjectManifest, campaign_id: str) -> CampaignMani
     return load_campaign_manifest(
         path, expect_project_id=project.project_id, expect_campaign_id=wanted
     )
+
+
+def require_open_campaign(project: ProjectManifest, campaign_id: str) -> CampaignManifest:
+    """The campaign a new recording may be written into, or a refusal saying
+    why not.
+
+    One function rather than a check repeated at each door, so `web serve`,
+    `survey capture` and `live stop` refuse a closed round in the same words
+    -- and so a door added later gets the rule by calling this rather than by
+    remembering it.
+
+    It refuses; it never closes, opens or writes anything.
+    """
+    campaign = resolve_campaign(project, campaign_id)
+    if campaign.is_closed:
+        raise ProjectError(
+            f"campaign {campaign.campaign_id!r} is closed ({campaign.path}), so it "
+            "accepts no new stops. Its data stays readable and analysable -- the geo "
+            "commands, the digest and the field app's campaign views all still read "
+            "it. To record again, use an open campaign or declare a new one."
+        )
+    return campaign
 
 
 @dataclass(frozen=True, slots=True)
@@ -567,6 +714,9 @@ def resolve_setting(
 __all__ = [
     "ANALYZER_P25_SITE_GEOLOCATION",
     "CAMPAIGN_DIR_NAME",
+    "CAMPAIGN_STATUSES",
+    "CAMPAIGN_STATUS_CLOSED",
+    "CAMPAIGN_STATUS_OPEN",
     "MANIFEST_SCHEMA_VERSION",
     "ORIGIN_CAMPAIGN",
     "ORIGIN_DEFAULT",
@@ -584,7 +734,9 @@ __all__ = [
     "load_campaign_manifest",
     "load_project_manifest",
     "normalise_project_id",
+    "require_open_campaign",
     "resolve_campaign",
+    "set_campaign_status_text",
     "resolve_project",
     "resolve_setting",
 ]

@@ -30,6 +30,7 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - [`docs/phase6a-survey.md`](docs/phase6a-survey.md)
 - [`docs/phase7-geolocation-design.md`](docs/phase7-geolocation-design.md)
 - [`docs/projects-and-campaigns.md`](docs/projects-and-campaigns.md)
+- [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
 - [`docs/PHASE7-FIELD-GEOLOCATION.md`](docs/PHASE7-FIELD-GEOLOCATION.md)
 - [`docs/PHASE6-FIELD-800MHZ.md`](docs/PHASE6-FIELD-800MHZ.md)
 - [`docs/FIELD-RECORDING-GUIDE.md`](docs/FIELD-RECORDING-GUIDE.md)
@@ -743,7 +744,31 @@ In the field app the campaign says *where new evidence is written*, and a separa
 
 Legacy brings back the transmitter work, not just the run list: modes, credible regions, site verdicts and the plan the historical analysis produced, each marked `Historical whole-database analysis` because a conclusion stored without a campaign was computed from every round in the file at the time. `All campaigns` lists every round that solved a site separately and labelled, and offers no next-stop plan, since a plan only means anything inside one round.
 
-`config/hardware/*.yaml` declares the receiver a round is run with; a campaign names one under `defaults.hardware`, and `--hardware` names one directly on `survey run` / `survey capture`. It outranks the site profile for gain, because gain belongs to the radio rather than to the place -- but it is still a declaration, and only the radio's own read-back is ever recorded as `applied`.
+A campaign is **open** until it is closed. `status: open | closed` in the
+campaign manifest is the round's own lifecycle, and an absent key means open,
+so nothing declared before it existed changes. Closed refuses new capture,
+drive, hold and stop edits -- `web serve` fails at startup before the SDR is
+opened, and `survey capture --project` / `live stop --project` fail before the
+radio is probed -- while taking nothing away from reading: the round still
+lists, still browses, and every analysis command still reads it. It is not
+called `active`, because which campaign a *deployment* records into is a
+different question, answered by `FIELD_CAMPAIGN` on that machine.
+
+On a Pi, `fieldctl campaign list | current | new | use | close` manages that.
+`current` names the effective project and campaign, which of the two
+environment files each came from, and what the running service says it is
+recording into. `use` switches safely: a lock, a refusal while any job is
+unfinished, a stop before the config changes, a rewrite of only
+`FIELD_PROJECT` and `FIELD_CAMPAIGN` in `field.env.local`, a restart, a
+verification through the API, and a full rollback if any of it fails. Every
+changing command reports first and needs `--write`. See
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+
+`config/hardware/*.yaml` declares the receiver a round is run with; a campaign names one under `defaults.hardware`, and `--hardware` names one directly on `survey run` / `survey capture`. It outranks the site profile for gain, because gain belongs to the radio rather than to the place -- but it is still a declaration, and only the radio's own read-back is ever recorded as `applied`. Beside that
+declaration, a run records what the device itself answered when it was opened
+-- its serial and its label -- in `hardware_json.identity`, which holds
+observations and nothing else, so a campaign can say which radio recorded
+which stop rather than only which one was meant to.
 
 See [`docs/projects-and-campaigns.md`](docs/projects-and-campaigns.md) for the manifest reference, the adoption order of operations, the campaign-scoping rules, the hardware profile and the full precedence tables.
 

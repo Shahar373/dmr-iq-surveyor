@@ -7,7 +7,11 @@ Three claims about a receiver setting look alike and are not:
     requested   what this software asked the radio for
     declared    what the operator wrote in the site profile beforehand
 
-They are stored in separate buckets and never merged. The geolocation solver
+They are stored in separate buckets and never merged. `identity` is a fourth
+bucket and follows the same rule: it holds what the radio answered about
+itself -- its serial, its label -- and never what a hardware profile declared
+the receiver to be. A declaration that arrived there would look exactly like
+a reading, which is the confusion the other three buckets exist to prevent. The geolocation solver
 reads level as distance, so a declaration presented as a measurement is the
 kind of confident wrong number this project refuses everywhere else. Keeping
 them apart is not the same as discarding the weaker ones: a declaration is
@@ -20,7 +24,7 @@ The stored shape (`survey_runs.hardware_json`), version 1:
     {
       "schema_version": 1,
       "source": "applied" | "requested" | "declared" | "not_recorded",
-      "identity":  {"driver": ..., "serial": ...},
+      "identity":  {"driver": ..., "serial": ..., "label": ...},
       "applied":   {"center_frequency_hz": ..., "gains": {"IFGR": ...}, ...},
       "requested": {"center_frequency_hz": ..., "if_gain_reduction_db": ...},
       "declared":  {"site_id": ..., "receiver": ..., "gain": ..., ...}
@@ -139,6 +143,17 @@ def _scalar_mapping(values: Any) -> dict[str, Any]:
         for key, value in values.items()
         if isinstance(key, str) and _is_scalar(value)
     }
+
+
+def scalar_identity(values: Any) -> dict[str, Any]:
+    """The identity a device reported, keeping only what a reading can be.
+
+    The public name for the filter both write paths apply: the capture path
+    reads it out of a capture report, the live drive reads it off the open
+    device, and neither may hand the store a value it will refuse -- a drive
+    that built such a blob lost every bin, not one reading.
+    """
+    return _scalar_mapping(values)
 
 
 def _known(values: Any) -> dict[str, Any]:
@@ -329,7 +344,16 @@ def hardware_from_capture_manifest(manifest: Any) -> dict[str, Any]:
     if not isinstance(settings, dict):
         return hardware_provenance()
     return hardware_provenance(
-        identity={"driver": settings.get("driver"), "serial": settings.get("serial")},
+        # Requested first, observed over the top. `--serial` pins which radio
+        # to open, so it belongs here even when the device answers nothing;
+        # when the device does answer, what it says it is outranks what it
+        # was asked to be. Only the device's own answers are merged in --
+        # nothing declared in a profile reaches this bucket.
+        identity={
+            "driver": settings.get("driver"),
+            "serial": settings.get("serial"),
+            **scalar_identity(manifest.get("device_identity")),
+        },
         applied=applied_bucket(manifest.get("device_settings_applied")),
         requested=requested_bucket(
             center_frequency_hz=settings.get("center_frequency_hz"),
@@ -704,5 +728,6 @@ __all__ = [
     "normalise_hardware",
     "receiver_settings",
     "requested_bucket",
+    "scalar_identity",
     "with_declared",
 ]
