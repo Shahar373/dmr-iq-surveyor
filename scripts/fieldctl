@@ -450,6 +450,685 @@ cmd_render_unit() {
         "${ROOT_DIR}/deploy/dmr-field.service"
 }
 
+# --- campaigns ----------------------------------------------------------
+#
+# Everything that reads or writes a campaign MANIFEST is delegated to
+# `dmr-surveyor project campaign`, which owns the schema, the one campaign-id
+# validator and the atomic write. What lives here is the part only this host
+# knows: which campaign this deployment is recording into, whether a job is
+# running, and how to change that without losing a stop or leaving the
+# service down.
+
+require_python() {
+    command -v python3 >/dev/null 2>&1 \
+        || die "python3 is needed to read the campaign listing and the API's JSON, and is not on PATH"
+}
+
+require_project() {
+    [[ -n "$FIELD_PROJECT" ]] || die "no project is configured. FIELD_PROJECT names the project manifest whose campaigns these commands manage; set it in ${ENV_LOCAL_FILE} (or ${FIELD_ENV_FILE}) and try again."
+}
+
+require_surveyor() {
+    [[ -x "$FIELD_SURVEYOR_BIN" ]] \
+        || die "${FIELD_SURVEYOR_BIN} is not executable. FIELD_SURVEYOR_BIN must name the dmr-surveyor entry point of the deployment's virtualenv."
+}
+
+campaign_listing() {
+    # The project's campaigns as JSON, from the one command that knows how to
+    # read a manifest. Read-only, needs no privileges, opens no SDR.
+    require_project
+    require_surveyor
+    local -a arguments=(project campaign list --project "$FIELD_PROJECT" --json)
+    if [[ -n "$FIELD_CAMPAIGN" ]]; then
+        arguments+=(--current "$FIELD_CAMPAIGN")
+    fi
+    "$FIELD_SURVEYOR_BIN" "${arguments[@]}"
+}
+
+campaign_row() {
+    # One field of one campaign from a saved listing: campaign_row FILE ID FIELD.
+    # Exit 4 means the project declares no such campaign.
+    python3 -c '
+import json, sys
+
+path, wanted, field = sys.argv[1:4]
+with open(path, encoding="utf-8") as handle:
+    document = json.load(handle)
+for row in document.get("campaigns", []):
+    if row.get("campaign_id") != wanted:
+        continue
+    if row.get("problem") and field == "status":
+        print("unreadable")
+        sys.exit(0)
+    value = row.get(field)
+    print("" if value is None else value)
+    sys.exit(0)
+sys.exit(4)
+' "$1" "$2" "$3"
+}
+
+api_active_job() {
+    # Print the first job that is not in a terminal state, or return 1.
+    #
+    # Terminal is the job model's own word: succeeded, failed and cancelled
+    # are finished, and anything else -- pending, running, a job mid-cancel --
+    # is a job this must not restart out from under. Reading it the other way
+    # round (only "running" counts) is what would abandon a capture that has
+    # been submitted and has not started yet.
+    python3 -c '
+import json, sys
+
+TERMINAL = {"succeeded", "failed", "cancelled"}
+try:
+    document = json.load(sys.stdin)
+except ValueError:
+    sys.exit(2)
+jobs = document if isinstance(document, list) else document.get("jobs", [])
+if not isinstance(jobs, list):
+    sys.exit(2)
+for job in jobs:
+    if not isinstance(job, dict):
+        continue
+    status = job.get("status") or job.get("state") or ""
+    if status not in TERMINAL:
+        print("%s %s (%s)" % (job.get("kind") or "job", job.get("job_id") or "", status))
+        sys.exit(0)
+sys.exit(1)
+'
+}
+
+api_json_field() {
+    # One dotted path out of a JSON document on stdin. Exit 4 if it is absent.
+    python3 -c '
+import json, sys
+
+try:
+    document = json.load(sys.stdin)
+except ValueError:
+    sys.exit(2)
+for part in sys.argv[1].split("."):
+    if not isinstance(document, dict) or part not in document:
+        sys.exit(4)
+    document = document[part]
+print("" if document is None else document)
+' "$1"
+}
+
+local_env() {
+    # The only writer of the local environment file.
+    #
+    #   local_env set     PATH PROJECT CAMPAIGN
+    #   local_env backup  PATH DESTINATION
+    #   local_env restore PATH BACKUP|--absent
+    #
+    # `set` rewrites FIELD_PROJECT and FIELD_CAMPAIGN and nothing else: every
+    # other line, every comment, the file's order and its trailing bytes are
+    # preserved, because an operator's local overrides live in this file and a
+    # campaign switch is not an invitation to reformat them.
+    python3 - "$@" <<'PYEOF'
+import os
+import sys
+import tempfile
+
+KEYS = ("FIELD_PROJECT", "FIELD_CAMPAIGN")
+
+
+def refuse_symlink(path):
+    if os.path.islink(path):
+        sys.stderr.write(
+            "fieldctl: %s is a symbolic link. Writing would replace the link with a "
+            "regular file and leave its target unchanged, so this is refused.\n" % path
+        )
+        raise SystemExit(1)
+
+
+def write_atomically(path, text):
+    """A temporary sibling, fsynced, then rename -- so a reader never sees a
+    half-written file and a crash leaves the original exactly as it was."""
+    directory = os.path.dirname(path) or "."
+    mode = 0o644
+    owner = None
+    if os.path.exists(path):
+        info = os.stat(path)
+        mode = info.st_mode & 0o7777
+        owner = (info.st_uid, info.st_gid)
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        if owner is not None:
+            try:
+                os.chown(temporary, owner[0], owner[1])
+            except PermissionError:
+                pass
+        os.replace(temporary, path)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
+
+
+def apply_settings(path, values):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            original = handle.read()
+    except FileNotFoundError:
+        original = ""
+    lines = original.splitlines()
+    seen = set()
+    for index, line in enumerate(lines):
+        for key in KEYS:
+            if line.startswith(key + "=") and key not in seen:
+                lines[index] = "%s=%s" % (key, values[key])
+                seen.add(key)
+    missing = [key for key in KEYS if key not in seen]
+    if missing and lines and lines[-1].strip():
+        pass
+    for key in missing:
+        lines.append("%s=%s" % (key, values[key]))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+operation = sys.argv[1]
+path = sys.argv[2]
+
+if operation == "set":
+    refuse_symlink(path)
+    write_atomically(path, apply_settings(path, {"FIELD_PROJECT": sys.argv[3], "FIELD_CAMPAIGN": sys.argv[4]}))
+elif operation == "backup":
+    destination = sys.argv[3]
+    if not os.path.exists(path):
+        raise SystemExit(3)
+    with open(path, encoding="utf-8") as handle:
+        content = handle.read()
+    with open(destination, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    os.chmod(destination, 0o600)
+elif operation == "restore":
+    source = sys.argv[3]
+    refuse_symlink(path)
+    if source == "--absent":
+        # There was no local file before this command; putting the deployment
+        # back means there is none afterwards either.
+        if os.path.exists(path):
+            os.unlink(path)
+    else:
+        with open(source, encoding="utf-8") as handle:
+            write_atomically(path, handle.read())
+else:
+    raise SystemExit("unknown operation %r" % operation)
+PYEOF
+}
+
+service_is_active() {
+    [[ "$(systemctl is-active "$FIELD_UNIT" 2>/dev/null || true)" == "active" ]]
+}
+
+service_has_failed() {
+    [[ "$(systemctl is-active "$FIELD_UNIT" 2>/dev/null || true)" == "failed" ]]
+}
+
+require_root_for() {
+    # A write under /etc needs root, and fieldctl never calls sudo itself: a
+    # command that silently escalates is one nobody can predict the blast
+    # radius of. It refuses before changing anything and prints the exact line
+    # to run instead.
+    #
+    # The uid decides, not the file's mode. `/etc/dmr-field` is root-owned by
+    # the installer, so an operator running as themselves cannot write it, and
+    # a permission probe would say so only after the attempt -- which for
+    # `campaign use` would be after the service had already been stopped.
+    # Reading the uid through `id` rather than $EUID is also what lets this
+    # refusal be tested on a machine that happens to be running the suite as
+    # root.
+    local path="$1"
+    shift
+    [[ "$(id -u 2>/dev/null || echo 0)" == "0" ]] && return 0
+    die "writing ${path} needs root, and this process is not root. Run: sudo fieldctl $*"
+}
+
+campaign_lock() {
+    # Held for the whole stop/write/start/verify sequence, so two operators
+    # cannot swap the campaign at the same time and leave the file saying one
+    # thing and the running service another. Advisory and released when this
+    # process exits, including when it is killed.
+    local lock="${ENV_LOCAL_FILE}.lock"
+    exec 9>"$lock" || die "could not open the campaign lock ${lock}"
+    chmod 600 "$lock" 2>/dev/null || true
+    flock -n 9 || die "another fieldctl campaign command is holding ${lock}. Wait for it to finish rather than running two switches at once."
+}
+
+cmd_campaign_list() {
+    require_python
+    local listing
+    listing="$(campaign_listing)" || die "the campaign listing could not be read"
+    printf '%s' "$listing" | python3 -c '
+import json, sys
+
+document = json.load(sys.stdin)
+print("project  %s" % document.get("project_id", "?"))
+print("manifest %s" % document.get("manifest", "?"))
+campaigns = document.get("campaigns", [])
+if not campaigns:
+    print("\nNo campaigns are declared in this project yet.")
+    raise SystemExit(0)
+print("")
+print("%-24s %-8s %-8s %6s  %s" % ("campaign", "status", "current", "runs", "label"))
+for row in campaigns:
+    if row.get("problem"):
+        # Reported as the problem it is, in its own row. One unreadable
+        # manifest among twenty is exactly when this listing is needed most.
+        print("%-24s %-8s %-8s %6s  PROBLEM: %s" % (row.get("campaign_id", "?"), "?", "", "", row["problem"]))
+        continue
+    print("%-24s %-8s %-8s %6s  %s" % (
+        row.get("campaign_id", "?"),
+        row.get("status", "?"),
+        "yes" if row.get("current") else "",
+        row.get("runs", 0),
+        row.get("label", ""),
+    ))
+    settings = [
+        "%s %s" % (name, row.get(name))
+        for name in ("band", "site", "hardware")
+        if row.get(name)
+    ]
+    capture = row.get("capture") or {}
+    if capture:
+        settings.append(", ".join("%s=%g" % (key, value) for key, value in sorted(capture.items())))
+    if settings:
+        print("%-24s   %s" % ("", "; ".join(settings)))
+unassigned = document.get("unassigned_runs") or 0
+if unassigned:
+    print("\n%d run(s) carry no campaign -- the rounds recorded before campaigns existed." % unassigned)
+'
+}
+
+cmd_campaign_current() {
+    require_python
+    local listing status manifest api_campaign api_project argv_campaign
+
+    printf 'project  %s [%s]\n' \
+        "${FIELD_PROJECT:-none -- not a project deployment}" "$(env_source FIELD_PROJECT)"
+    printf 'campaign %s [%s]\n' \
+        "${FIELD_CAMPAIGN:-none -- stops recorded here stay unassigned}" \
+        "$(env_source FIELD_CAMPAIGN)"
+
+    if [[ -n "$FIELD_PROJECT" && -n "$FIELD_CAMPAIGN" ]]; then
+        if listing="$(campaign_listing 2>/dev/null)"; then
+            local scratch
+            scratch="$(mktemp)"
+            printf '%s' "$listing" > "$scratch"
+            status="$(campaign_row "$scratch" "$FIELD_CAMPAIGN" status 2>/dev/null || true)"
+            manifest="$(campaign_row "$scratch" "$FIELD_CAMPAIGN" manifest 2>/dev/null || true)"
+            rm -f "$scratch"
+            printf 'status   %s\n' "${status:-NOT DECLARED in this project -- the service will refuse to start}"
+            printf 'manifest %s\n' "${manifest:-none}"
+        else
+            printf 'status   UNKNOWN -- the campaign listing could not be read\n'
+        fi
+    fi
+
+    printf 'capture  %s Hz, %s S/s, %ss, driver %s, solve %s m\n' \
+        "$FIELD_CENTER_FREQUENCY" "$FIELD_SAMPLE_RATE" "$FIELD_DURATION" \
+        "$FIELD_DRIVER" "$FIELD_SOLVE_RESOLUTION_M"
+
+    # What the service was actually started with, from the one function that
+    # assembles it -- not a second copy of the same logic.
+    build_argv
+    argv_campaign=""
+    local index
+    for index in "${!ARGV[@]}"; do
+        if [[ "${ARGV[$index]}" == "--campaign" ]]; then
+            argv_campaign="${ARGV[$((index + 1))]}"
+        fi
+    done
+    printf 'argv     %s\n' "${argv_campaign:-no --campaign flag}"
+
+    if ! service_is_active; then
+        printf 'api      service is not running\n'
+        return 0
+    fi
+    local state
+    if ! state="$(api_get /api/state)"; then
+        printf 'api      not reachable\n'
+        return 0
+    fi
+    api_campaign="$(printf '%s' "$state" | api_json_field scope.capture_campaign_id 2>/dev/null || true)"
+    api_project="$(printf '%s' "$state" | api_json_field scope.project_id 2>/dev/null || true)"
+    printf 'api      recording into %s (project %s)\n' \
+        "${api_campaign:-nothing -- stops stay unassigned}" "${api_project:-none}"
+
+    # The disagreement that matters: the file says one round, the running
+    # process is recording into another. It happens whenever the file has been
+    # edited and the service not restarted, and it is invisible otherwise.
+    if [[ "$api_campaign" != "$FIELD_CAMPAIGN" ]]; then
+        printf 'WARNING  the configuration says %s and the running service is recording into %s.\n' \
+            "${FIELD_CAMPAIGN:-no campaign}" "${api_campaign:-no campaign}"
+        printf '         The service has not been restarted since the change. Stops are going to\n'
+        printf '         the campaign the API reports, not the one configured.\n'
+    fi
+    if [[ -n "$argv_campaign" && "$argv_campaign" != "$FIELD_CAMPAIGN" ]]; then
+        printf 'WARNING  the argv this would start (%s) is not the configured campaign (%s).\n' \
+            "$argv_campaign" "${FIELD_CAMPAIGN:-none}"
+    fi
+}
+
+cmd_campaign_new() {
+    local target="" write=0
+    local -a extra=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --write)      write=1; shift ;;
+            --label|--band|--site|--hardware|--from)
+                          [[ $# -ge 2 ]] || die "$1 needs a value"
+                          extra+=("$1" "$2"); shift 2 ;;
+            --*)          die "unknown option $1 for 'campaign new'" ;;
+            *)            [[ -z "$target" ]] || die "campaign new takes one campaign id"
+                          target="$1"; shift ;;
+        esac
+    done
+    [[ -n "$target" ]] || die "campaign new needs a campaign id"
+    require_python
+    require_project
+    require_surveyor
+
+    # Resolved first, both because a project that does not resolve should fail
+    # before anything else is considered and because this is what tells the
+    # root check which directory is about to be written.
+    local listing campaign_dir
+    listing="$(campaign_listing)" || die "project ${FIELD_PROJECT} could not be read"
+    campaign_dir="$(printf '%s' "$listing" | api_json_field manifest)" \
+        || die "the campaign listing did not name the project manifest"
+    campaign_dir="$(dirname "$campaign_dir")/campaigns"
+
+    # The new round continues the current one unless told otherwise: same
+    # radio, same band, same place, same capture settings, a different day.
+    # With no current campaign there is nothing to copy, and the project's
+    # own defaults apply to the new round exactly as they would have.
+    local copies=0 item
+    for item in "${extra[@]}"; do
+        [[ "$item" == "--from" ]] && copies=1
+    done
+    if (( ! copies )) && [[ -n "$FIELD_CAMPAIGN" ]]; then
+        extra+=(--from "$FIELD_CAMPAIGN")
+    fi
+
+    local -a arguments=(project campaign new --project "$FIELD_PROJECT" --campaign-id "$target" "${extra[@]}")
+    if (( ! write )); then
+        "$FIELD_SURVEYOR_BIN" "${arguments[@]}" --dry-run
+        log "Nothing was written. Re-run with --write to create the manifest."
+        log "Creating a campaign does not switch this deployment to it: that is"
+        log "\`fieldctl campaign use ${target}\`, and it is a separate, deliberate step."
+        return 0
+    fi
+    require_root_for "${campaign_dir}/${target}.yaml" campaign new "$target" --write
+    "$FIELD_SURVEYOR_BIN" "${arguments[@]}"
+}
+
+cmd_campaign_close() {
+    local target="" write=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --write) write=1; shift ;;
+            --*)     die "unknown option $1 for 'campaign close'" ;;
+            *)       [[ -z "$target" ]] || die "campaign close takes one campaign id"
+                     target="$1"; shift ;;
+        esac
+    done
+    [[ -n "$target" ]] || die "campaign close needs a campaign id"
+    require_python
+    require_project
+    require_surveyor
+
+    # The one thing the manifest cannot know. Closing the campaign this
+    # deployment is recording into would leave the service pointed at a
+    # campaign it is no longer allowed to write to, and it would not find out
+    # until its next start -- which is a restart nobody planned, at the side
+    # of a road.
+    if [[ "$target" == "$FIELD_CAMPAIGN" ]]; then
+        die "${target} is the campaign this deployment is recording into. Switch to another campaign first (\`fieldctl campaign use <other>\`), then close this one."
+    fi
+
+    if (( ! write )); then
+        "$FIELD_SURVEYOR_BIN" project campaign close --project "$FIELD_PROJECT" --campaign-id "$target"
+        return 0
+    fi
+    local listing manifest
+    listing="$(campaign_listing)" || die "project ${FIELD_PROJECT} could not be read"
+    local scratch
+    scratch="$(mktemp)"
+    printf '%s' "$listing" > "$scratch"
+    manifest="$(campaign_row "$scratch" "$target" manifest 2>/dev/null || true)"
+    rm -f "$scratch"
+    [[ -n "$manifest" ]] || die "${target} is not a campaign of project ${FIELD_PROJECT}"
+    require_root_for "$manifest" campaign close "$target" --write
+    campaign_lock
+    "$FIELD_SURVEYOR_BIN" project campaign close --project "$FIELD_PROJECT" --campaign-id "$target" --write
+}
+
+campaign_use_rollback() {
+    # Put the deployment back exactly as it was found, and say whether that
+    # worked. Called from every failure path after the file has been written.
+    local backup="$1" was_active="$2" previous="$3"
+    log "Rolling back: restoring ${ENV_LOCAL_FILE} and the previous campaign."
+    if ! local_env restore "$ENV_LOCAL_FILE" "$backup"; then
+        log "ROLLBACK FAILED: ${ENV_LOCAL_FILE} could not be restored."
+        [[ "$backup" == "--absent" ]] || log "The previous contents are in ${backup}. Restore them by hand before starting the service."
+        exit 1
+    fi
+    if (( was_active )); then
+        systemctl start "$FIELD_UNIT" || log "ROLLBACK: the service did not start; run \`fieldctl logs\`."
+        local deadline=$(( SECONDS + FIELD_TAILSCALE_WAIT + 15 )) state restored=""
+        while (( SECONDS < deadline )); do
+            if state="$(api_get /api/state)"; then
+                restored="$(printf '%s' "$state" | api_json_field scope.capture_campaign_id 2>/dev/null || true)"
+                break
+            fi
+            service_has_failed && break
+            sleep 2
+        done
+        if [[ "$restored" == "$previous" ]]; then
+            log "Rolled back: the service is recording into ${previous:-no campaign} again."
+        else
+            log "ROLLBACK INCOMPLETE: the service reports ${restored:-nothing} rather than ${previous:-no campaign}. Check \`fieldctl status\` and \`fieldctl logs\`."
+        fi
+    fi
+}
+
+cmd_campaign_use() {
+    local target="" write=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --write) write=1; shift ;;
+            --*)     die "unknown option $1 for 'campaign use'" ;;
+            *)       [[ -z "$target" ]] || die "campaign use takes one campaign id"
+                     target="$1"; shift ;;
+        esac
+    done
+    [[ -n "$target" ]] || die "campaign use needs a campaign id"
+    require_python
+    require_project
+    require_surveyor
+
+    local listing_file status
+    listing_file="$(mktemp)"
+    # shellcheck disable=SC2064 -- the path is fixed at trap time on purpose.
+    trap "rm -f '$listing_file'" EXIT
+    campaign_listing > "$listing_file" || die "the campaign listing could not be read"
+
+    if ! status="$(campaign_row "$listing_file" "$target" status)"; then
+        die "${target} is not a campaign of project ${FIELD_PROJECT}. \`fieldctl campaign list\` shows the ones that are; \`fieldctl campaign new ${target}\` declares it."
+    fi
+    case "$status" in
+        open)       ;;
+        closed)     die "${target} is closed, so it accepts no new stops. Its data stays readable and analysable; to record again, use an open campaign or declare a new one." ;;
+        unreadable) die "${target}'s manifest could not be read. \`fieldctl campaign list\` prints the reason; fix the manifest before switching to it." ;;
+        *)          die "${target} reports status ${status}, which this build does not understand" ;;
+    esac
+
+    if [[ "$target" == "$FIELD_CAMPAIGN" ]]; then
+        log "${target} is already the campaign this deployment records into. Nothing to do."
+        return 0
+    fi
+
+    local was_active=0
+    service_is_active && was_active=1
+
+    if (( ! write )); then
+        printf 'current  %s\n' "${FIELD_CAMPAIGN:-none -- stops stay unassigned}"
+        printf 'target   %s (status %s)\n' "$target" "$status"
+        printf 'file     %s\n' "$ENV_LOCAL_FILE"
+        printf 'base     %s left untouched\n' "$FIELD_ENV_FILE"
+        printf 'service  %s\n' "$( (( was_active )) && printf 'running' || printf 'not running' )"
+        printf '\nWith --write this would:\n'
+        printf '  1. take an exclusive lock on %s.lock\n' "$ENV_LOCAL_FILE"
+        if (( was_active )); then
+            printf '  2. refuse if the API reports a job that has not finished\n'
+            printf '  3. stop %s, so no capture can start between the check and the switch\n' "$FIELD_UNIT"
+            printf '  4. set FIELD_PROJECT and FIELD_CAMPAIGN in %s, keeping every other line\n' "$ENV_LOCAL_FILE"
+            printf '  5. start %s and wait for the API to report campaign %s\n' "$FIELD_UNIT" "$target"
+            printf '  6. restore the previous file and campaign if any of that fails\n'
+        else
+            printf '  2. set FIELD_PROJECT and FIELD_CAMPAIGN in %s, keeping every other line\n' "$ENV_LOCAL_FILE"
+            printf '  3. leave the service stopped, because it is stopped now\n'
+        fi
+        printf '\nNothing was written, stopped or started.\n'
+        return 0
+    fi
+
+    require_root_for "$ENV_LOCAL_FILE" campaign use "$target" --write
+    # Refused BEFORE the service is stopped, not when the write is attempted.
+    # `local_env` refuses a symlink too, but by then the service would already
+    # be down and the restore would fail for the same reason -- leaving the
+    # deployment stopped over a check that could have been made while
+    # everything was still running.
+    if [[ -L "$ENV_LOCAL_FILE" ]]; then
+        die "${ENV_LOCAL_FILE} is a symbolic link. Writing would replace the link with a regular file and leave its target unchanged, so this is refused. Edit the target directly, or remove the link."
+    fi
+    campaign_lock
+
+    local previous="$FIELD_CAMPAIGN"
+    if (( was_active )); then
+        local jobs active
+        if ! jobs="$(api_get /api/jobs)"; then
+            die "the service is running but its API could not be reached, so it cannot be asked whether a capture is in progress. Refusing to restart it blind; check \`fieldctl status\`."
+        fi
+        if active="$(printf '%s' "$jobs" | api_active_job)"; then
+            die "a job has not finished: ${active}. Restarting would abandon it. Wait for it, or cancel it in the app, then run this again."
+        fi
+        # Stopped BEFORE the file is touched, and after the job check, so
+        # there is no window in which the app could start a capture against
+        # the campaign that is about to stop being the current one.
+        log "Stopping ${FIELD_UNIT}."
+        systemctl stop "$FIELD_UNIT" || die "${FIELD_UNIT} could not be stopped; nothing was changed"
+    fi
+
+    local backup="--absent"
+    if [[ -e "$ENV_LOCAL_FILE" ]]; then
+        backup="$(mktemp)"
+        chmod 600 "$backup"
+        local_env backup "$ENV_LOCAL_FILE" "$backup" || die "${ENV_LOCAL_FILE} could not be backed up; nothing was changed"
+    fi
+
+    if ! local_env set "$ENV_LOCAL_FILE" "$FIELD_PROJECT" "$target"; then
+        log "${ENV_LOCAL_FILE} could not be written."
+        campaign_use_rollback "$backup" "$was_active" "$previous"
+        exit 1
+    fi
+    log "Set FIELD_CAMPAIGN=${target} in ${ENV_LOCAL_FILE}."
+
+    if (( ! was_active )); then
+        log "The service was not running, so it was not started. Start it with \`fieldctl start\`."
+        [[ "$backup" == "--absent" ]] || rm -f "$backup"
+        return 0
+    fi
+
+    if ! systemctl start "$FIELD_UNIT"; then
+        log "${FIELD_UNIT} did not start."
+        campaign_use_rollback "$backup" "$was_active" "$previous"
+        exit 1
+    fi
+
+    # The startup budget the unit itself allows for: `wait-network` may sit
+    # out FIELD_TAILSCALE_WAIT before the server is even exec'd, so a shorter
+    # deadline here would roll back a service that was going to come up fine.
+    local deadline=$(( SECONDS + FIELD_TAILSCALE_WAIT + 15 )) state=""
+    while (( SECONDS < deadline )); do
+        if state="$(api_get /api/state)"; then
+            break
+        fi
+        state=""
+        if service_has_failed; then
+            log "${FIELD_UNIT} failed to start."
+            break
+        fi
+        sleep 2
+    done
+    if [[ -z "$state" ]]; then
+        log "The service did not answer its API after the switch."
+        campaign_use_rollback "$backup" "$was_active" "$previous"
+        exit 1
+    fi
+
+    local now_campaign now_project
+    now_campaign="$(printf '%s' "$state" | api_json_field scope.capture_campaign_id 2>/dev/null || true)"
+    now_project="$(printf '%s' "$state" | api_json_field scope.project_id 2>/dev/null || true)"
+    if [[ "$now_campaign" != "$target" ]]; then
+        log "The service came up recording into ${now_campaign:-nothing}, not ${target}."
+        campaign_use_rollback "$backup" "$was_active" "$previous"
+        exit 1
+    fi
+    printf 'campaign %s\n' "$now_campaign"
+    printf 'project  %s\n' "${now_project:-none}"
+
+    assert_token_not_in_argv
+    [[ "$backup" == "--absent" ]] || rm -f "$backup"
+    printf 'The service is running and recording into %s.\n' "$target"
+}
+
+assert_token_not_in_argv() {
+    # The token reaches the service as a FILE PATH; if it ever reached argv it
+    # would be in /proc/<pid>/cmdline for every local account and in every
+    # `systemctl status`. Checked here because this command is the one that
+    # just restarted the service.
+    local pid argv
+    pid="$(systemctl show "$FIELD_UNIT" --property=MainPID --value 2>/dev/null || true)"
+    if [[ -z "$pid" || "$pid" == "0" || ! -r "/proc/${pid}/cmdline" ]]; then
+        printf 'argv     not checked -- the service PID could not be read\n'
+        return 0
+    fi
+    [[ -r "$FIELD_TOKEN_FILE" ]] || return 0
+    argv="$(tr '\0' ' ' < "/proc/${pid}/cmdline")"
+    # Compared without ever printing either side.
+    if printf '%s' "$argv" | grep -qF -f <(tr -d '\r\n' < "$FIELD_TOKEN_FILE"); then
+        printf 'argv     WARNING: the token value appears in the service argv\n'
+        return 0
+    fi
+    printf 'argv     clean -- the token is passed as a path, not a value\n'
+}
+
+cmd_campaign() {
+    [[ $# -ge 1 ]] || usage
+    local subcommand="$1"
+    shift
+    case "$subcommand" in
+        list)    cmd_campaign_list "$@" ;;
+        current) cmd_campaign_current "$@" ;;
+        new)     cmd_campaign_new "$@" ;;
+        use)     cmd_campaign_use "$@" ;;
+        close)   cmd_campaign_close "$@" ;;
+        *)       usage ;;
+    esac
+}
+
 usage() {
     cat >&2 <<'USAGE'
 usage: fieldctl <command>
@@ -463,6 +1142,15 @@ usage: fieldctl <command>
   wait-network                block until a bind address exists (ExecStartPre)
   exec                        become the server process (ExecStart)
   render-unit U G W F         fill the unit template (used by the installer)
+
+  campaign list               every campaign in this project, with its status
+  campaign current            what this deployment records into, and where from
+  campaign new ID [options]   declare a campaign (reports only, unless --write)
+  campaign use ID             record into it from now on (reports only, unless --write)
+  campaign close ID           finish a round (reports only, unless --write)
+
+    campaign new options: --label L --from ID --band B --site S --hardware H
+    --write under /etc needs root; this never calls sudo for you.
 USAGE
     exit 2
 }
@@ -483,6 +1171,7 @@ main() {
         wait-network)   cmd_wait_network "$@" ;;
         exec)           cmd_exec "$@" ;;
         render-unit)    [[ $# -eq 4 ]] || usage; cmd_render_unit "$@" ;;
+        campaign)       cmd_campaign "$@" ;;
         *)              usage ;;
     esac
 }
