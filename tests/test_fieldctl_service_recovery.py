@@ -196,7 +196,16 @@ sys.exit(0)
             encoding="utf-8",
         )
         (self.bin / "flock").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        for name in ("systemctl", "curl", "surveyor", "flock"):
+        # `--write` refuses unless the process is root, and these tests are
+        # about what a write does rather than about who may do it. Stubbed
+        # rather than left to the real uid: this suite passed locally as root
+        # and failed on a CI runner that is not, which is the harness being
+        # wrong about itself, not the deployment.
+        (self.bin / "id").write_text(
+            '#!/bin/sh\nif [ "$1" = "-u" ]; then echo 0; exit 0; fi\nexit 0\n',
+            encoding="utf-8",
+        )
+        for name in ("systemctl", "curl", "surveyor", "flock", "id"):
             (self.bin / name).chmod(0o755)
 
     # -- driving it -------------------------------------------------------
