@@ -810,6 +810,12 @@ def _refuse_symlink(path: Path) -> None:
     symlink means replacing the link with a regular file -- so the file the
     operator believes they are editing is left untouched and the link they
     set up is gone.
+
+    Checked on the path as given. A path that came back from
+    `load_campaign_manifest` has already been resolved and therefore names
+    the target rather than the link, which is exactly what should be written
+    and is why this passes for one; a path this module assembled itself, as
+    `campaign new` does, has not, and is where the refusal bites.
     """
     if path.is_symlink():
         _fail(

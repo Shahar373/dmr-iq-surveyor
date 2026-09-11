@@ -39,6 +39,48 @@ FIELD_UNIT="${FIELD_UNIT:-dmr-field.service}"
 log()  { printf '%s\n' "$*" >&2; }
 die()  { printf 'fieldctl: %s\n' "$*" >&2; exit 1; }
 
+# Scratch files this script creates, removed however it exits -- including on
+# a Ctrl-C. One of them holds the API token (see `api_get`), and a token left
+# in $TMPDIR because somebody interrupted a status check is a secret on disk
+# that nobody will think to look for.
+#
+# Registered rather than removed inline so there is exactly one EXIT trap: a
+# second `trap ... EXIT` anywhere would silently replace this one.
+SCRATCH_FILES=()
+
+scratch_file() {
+    local path
+    path="$(mktemp)" || die "could not create a temporary file"
+    chmod 600 "$path"
+    SCRATCH_FILES+=("$path")
+    printf '%s\n' "$path"
+}
+
+remove_scratch_files() {
+    # Always succeeds. `set -e` is in force inside a trap handler too, so a
+    # cleanup that returned non-zero when there was nothing to clean would
+    # abort the handler before it re-raised the signal -- and would change
+    # the script's exit status on the way out.
+    if (( ${#SCRATCH_FILES[@]} )); then
+        rm -f "${SCRATCH_FILES[@]}"
+    fi
+    SCRATCH_FILES=()
+}
+
+on_signal() {
+    # Clean up, then die of the signal rather than swallowing it. A plain
+    # `trap ... INT` would make Ctrl-C a no-op, and this script has a place
+    # where Ctrl-C is the documented way out: `fieldctl restart` offers five
+    # seconds to cancel before it abandons a running job.
+    remove_scratch_files
+    trap - INT TERM EXIT
+    kill -"$1" "$$"
+}
+
+trap remove_scratch_files EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+
 # --- configuration ------------------------------------------------------
 
 # What each key's value came from, so `fieldctl campaign current` can say
@@ -252,8 +294,7 @@ api_get() {
     [[ -r "$FIELD_TOKEN_FILE" ]] || return 1
 
     url="https://${host}:${FIELD_PORT}${path}"
-    config="$(mktemp)"
-    chmod 600 "$config"
+    config="$(scratch_file)"
     {
         printf 'header = "X-Auth-Token: '
         tr -d '\r\n' < "$FIELD_TOKEN_FILE"
@@ -265,6 +306,8 @@ api_get() {
          --cacert "$FIELD_TLS_CERT" \
          --config "$config" \
          "$url" 2>/dev/null || status=$?
+    # Removed now rather than only at exit: a long-running command should not
+    # keep the token on disk between requests.
     rm -f "$config"
     return "$status"
 }
@@ -629,11 +672,13 @@ def apply_settings(path, values):
             if line.startswith(key + "=") and key not in seen:
                 lines[index] = "%s=%s" % (key, values[key])
                 seen.add(key)
-    missing = [key for key in KEYS if key not in seen]
-    if missing and lines and lines[-1].strip():
-        pass
-    for key in missing:
+    # A key the file does not mention yet is appended rather than silently
+    # dropped: this file is often created by this command, and a local
+    # override that sets neither key is the normal starting point.
+    for key in (key for key in KEYS if key not in seen):
         lines.append("%s=%s" % (key, values[key]))
+    # The one byte this may add: a file whose last line had no newline gets
+    # one, because the next append would otherwise join two settings.
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -764,11 +809,10 @@ cmd_campaign_current() {
     if [[ -n "$FIELD_PROJECT" && -n "$FIELD_CAMPAIGN" ]]; then
         if listing="$(campaign_listing 2>/dev/null)"; then
             local scratch
-            scratch="$(mktemp)"
+            scratch="$(scratch_file)"
             printf '%s' "$listing" > "$scratch"
             status="$(campaign_row "$scratch" "$FIELD_CAMPAIGN" status 2>/dev/null || true)"
             manifest="$(campaign_row "$scratch" "$FIELD_CAMPAIGN" manifest 2>/dev/null || true)"
-            rm -f "$scratch"
             printf 'status   %s\n' "${status:-NOT DECLARED in this project -- the service will refuse to start}"
             printf 'manifest %s\n' "${manifest:-none}"
         else
@@ -904,10 +948,9 @@ cmd_campaign_close() {
     local listing manifest
     listing="$(campaign_listing)" || die "project ${FIELD_PROJECT} could not be read"
     local scratch
-    scratch="$(mktemp)"
+    scratch="$(scratch_file)"
     printf '%s' "$listing" > "$scratch"
     manifest="$(campaign_row "$scratch" "$target" manifest 2>/dev/null || true)"
-    rm -f "$scratch"
     [[ -n "$manifest" ]] || die "${target} is not a campaign of project ${FIELD_PROJECT}"
     require_root_for "$manifest" campaign close "$target" --write
     campaign_lock
@@ -959,9 +1002,7 @@ cmd_campaign_use() {
     require_surveyor
 
     local listing_file status
-    listing_file="$(mktemp)"
-    # shellcheck disable=SC2064 -- the path is fixed at trap time on purpose.
-    trap "rm -f '$listing_file'" EXIT
+    listing_file="$(scratch_file)"
     campaign_listing > "$listing_file" || die "the campaign listing could not be read"
 
     if ! status="$(campaign_row "$listing_file" "$target" status)"; then
@@ -1031,6 +1072,9 @@ cmd_campaign_use() {
         systemctl stop "$FIELD_UNIT" || die "${FIELD_UNIT} could not be stopped; nothing was changed"
     fi
 
+    # Deliberately not a scratch file: when a rollback fails, the message
+    # tells the operator where the previous contents are, and a cleanup trap
+    # that removed it on the way out would make that message a lie.
     local backup="--absent"
     if [[ -e "$ENV_LOCAL_FILE" ]]; then
         backup="$(mktemp)"
