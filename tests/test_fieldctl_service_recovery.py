@@ -131,6 +131,7 @@ case "$1" in
     printf '%s' "$campaign" > "$STATE/unit.campaign"
     printf '%s' "$project"  > "$STATE/unit.project"
     echo active > "$STATE/unit.state"
+    [[ -n "${{SLOW_START:-}}" ]] && sleep 5
     ;;
   show) printf '\\n' ;;
 esac
@@ -195,6 +196,16 @@ sys.exit(0)
 ''',
             encoding="utf-8",
         )
+        # A python3 that delays the environment-file write AFTER it has
+        # happened, so a signal can be injected into the window between the
+        # rename and the caller hearing about it.
+        (self.bin / "python3").write_text(
+            '#!/bin/bash\n'
+            '/usr/bin/python3 "$@"; status=$?\n'
+            'if [[ -n "${SLOW_WRITE:-}" && "$2" == set ]]; then sleep 5; fi\n'
+            'exit $status\n',
+            encoding="utf-8",
+        )
         (self.bin / "flock").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         # `--write` refuses unless the process is root, and these tests are
         # about what a write does rather than about who may do it. Stubbed
@@ -205,7 +216,7 @@ sys.exit(0)
             '#!/bin/sh\nif [ "$1" = "-u" ]; then echo 0; exit 0; fi\nexit 0\n',
             encoding="utf-8",
         )
-        for name in ("systemctl", "curl", "surveyor", "flock", "id"):
+        for name in ("systemctl", "curl", "surveyor", "flock", "id", "python3"):
             (self.bin / name).chmod(0o755)
 
     # -- driving it -------------------------------------------------------
@@ -246,6 +257,20 @@ sys.exit(0)
             timeout=180,
             check=False,
         )
+
+    def interrupt_during(self, *arguments: str, after: float = 4.0, **extra: str):
+        """Run a command and SIGTERM it once the injected delay is reached."""
+        process = subprocess.Popen(
+            ["bash", str(FIELDCTL), *arguments],
+            env=self._environment(**extra),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(after)
+        process.terminate()
+        _, errors = process.communicate(timeout=180)
+        return process.returncode, errors
 
     # -- what the deployment looks like afterwards ------------------------
 
@@ -512,18 +537,106 @@ def test_a_no_op_the_service_confirms_is_still_a_no_op(pi: Pi) -> None:
     assert pi.calls("start") == []
 
 
-def test_a_no_op_says_so_when_the_service_cannot_be_asked(pi: Pi) -> None:
-    """Unreadable is not disagreement, and nothing is being changed either
-    way -- so this states what it could not confirm rather than refusing."""
+def test_a_no_op_is_refused_when_the_service_cannot_be_asked(pi: Pi) -> None:
+    """An unreadable API is not confirmation.
+
+    This asserted exit 0 when it was written, on the reasoning that nothing
+    was being changed either way. That reasoning is wrong about what the
+    message claims: "already the campaign this deployment records into" is a
+    statement about the running service, and the file cannot support it --
+    the service may have been recording something else since before the file
+    was edited. Exit 0 there tells an operator the deployment is fine when
+    nothing has checked. Nothing is still changed; the status now says the
+    claim could not be made.
+    """
     pi.boot("day2")
     (pi.bin / "curl").write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
     (pi.bin / "curl").chmod(0o755)
 
     result = pi.run("campaign", "use", "day2", "--write")
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode != 0
     assert "could not be read" in result.stderr
+    assert "Nothing was changed" in result.stderr
     assert pi.calls("stop") == []
+    assert pi.calls("start") == []
+    assert pi.configured_campaign == "day2"
+    assert pi.recording_into == "day2"
+
+
+# -- an interrupt inside a call, after its effect and before it returns ---
+#
+# A call that has done its work and not yet returned looks exactly like one
+# that never ran. These inject the signal into precisely that window, which
+# is where the first round's phase markers -- raised after each call returned
+# -- left the deployment disagreeing with its own configuration.
+
+
+def test_an_interrupt_after_the_new_service_started_still_puts_it_back(pi: Pi) -> None:
+    """SIGTERM once systemd has started the new process but before
+    `systemctl start` returns. Recovering as though nothing had started left
+    the file on day1 and the radio on day2, over stop, start, start."""
+    pi.boot("day1")
+
+    status, errors = pi.interrupt_during(
+        "campaign", "use", "day2", "--write", SLOW_START="1"
+    )
+
+    assert status != 0
+    assert pi.configured_campaign == "day1"
+    assert pi.recording_into == "day1", "the radio kept the campaign nobody chose"
+    assert pi.unit_state == "active"
+    # The second stop is the one that lets the restored file take effect.
+    assert len(pi.calls("stop")) == 2, pi.calls()
+    assert len(pi.calls("start")) == 2, pi.calls()
+    assert "Rolling back" in errors
+    assert pi.scratch_files == []
+
+
+def test_an_interrupt_after_the_file_was_replaced_still_puts_it_back(pi: Pi) -> None:
+    """SIGTERM once the rename has happened but before the writer returns.
+
+    Atomic means no reader sees a half-written file. It does not mean every
+    failure happened before the rename -- and treating it that way left both
+    the file and the service on the new campaign."""
+    pi.boot("day1")
+
+    status, errors = pi.interrupt_during(
+        "campaign", "use", "day2", "--write", SLOW_WRITE="1"
+    )
+
+    assert status != 0
+    assert pi.configured_campaign == "day1", "the replaced file was never put back"
+    assert pi.recording_into == "day1"
+    assert pi.unit_state == "active"
+    assert "Rolling back" in errors
+    assert pi.scratch_files == [], "the backup outlived the recovery"
+
+
+def test_an_interrupt_mid_call_still_dies_of_the_signal(pi: Pi) -> None:
+    pi.boot("day1")
+
+    status, _ = pi.interrupt_during(
+        "campaign", "use", "day2", "--write", SLOW_START="1"
+    )
+
+    assert status == -signal.SIGTERM
+
+
+def test_a_failure_before_anything_changed_leaves_the_service_running(pi: Pi) -> None:
+    """The other end of the same machinery: nothing was stopped or written,
+    so there is nothing to undo and the deployment must be untouched."""
+    pi.boot("day1")
+
+    result = pi.run("campaign", "use", "day9", "--write")
+
+    assert result.returncode != 0
+    assert pi.configured_campaign == "day1"
+    assert pi.recording_into == "day1"
+    assert pi.unit_state == "active"
+    assert pi.calls("stop") == []
+    assert pi.calls("start") == []
+    assert pi.scratch_files == []
 
 
 # -- the token never survives any of it -----------------------------------

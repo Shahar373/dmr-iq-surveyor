@@ -80,7 +80,14 @@ remove_scratch_files() {
 # recovery serve a failed API check and a SIGTERM alike: without it, the
 # signal handler could only delete temporary files, and an interrupt landing
 # after the stop left the Pi not recording with nothing said about it.
-USE_PHASE=none            # none | stopping | stopped | written | started
+# Each step has a phase for "about to" as well as "done". A call that has
+# had its effect but has not returned yet is indistinguishable from one that
+# never ran, unless the phase is raised BEFORE the call -- and an interrupt
+# lands in that window as readily as anywhere else. Every "-ing" phase is
+# therefore recovered as though the step had completed, because undoing a
+# step that did not happen is harmless and failing to undo one that did is
+# not.
+USE_PHASE=none            # none | stopping | stopped | writing | written | starting | started
 USE_BACKUP="--absent"
 USE_WAS_ACTIVE=0
 USE_PREVIOUS=""
@@ -103,12 +110,13 @@ campaign_use_recover() {
     # nothing, so restoring the file and calling start left the old
     # configuration on disk and the new one in the running process -- the
     # file said one campaign and the radio recorded another.
-    if [[ "$USE_PHASE" == "started" ]]; then
+    if [[ "$USE_PHASE" == "starting" || "$USE_PHASE" == "started" ]]; then
         systemctl stop "$FIELD_UNIT" \
             || log "ROLLBACK: ${FIELD_UNIT} could not be stopped, so it is still running the new configuration."
     fi
 
-    if [[ "$USE_PHASE" == "written" || "$USE_PHASE" == "started" ]]; then
+    if [[ "$USE_PHASE" == "writing" || "$USE_PHASE" == "written" \
+       || "$USE_PHASE" == "starting" || "$USE_PHASE" == "started" ]]; then
         if ! local_env restore "$ENV_LOCAL_FILE" "$USE_BACKUP"; then
             log "ROLLBACK FAILED: ${ENV_LOCAL_FILE} could not be restored."
             [[ "$USE_BACKUP" == "--absent" ]] \
@@ -1289,11 +1297,13 @@ cmd_campaign_use() {
                 # chose.
                 die "${ENV_LOCAL_FILE} names campaign ${target} in project ${expect_project:-none}, but ${FIELD_UNIT} is recording into campaign ${API_SCOPE_CAMPAIGN:-nothing} in project ${API_SCOPE_PROJECT:-nothing}. The service has not been restarted since the configuration changed. \`fieldctl campaign current\` shows both; restart the service, or switch to the campaign you want."
             fi
-            # Unreadable is not disagreement. Nothing is being changed either
-            # way, so this says what it could not confirm instead of refusing
-            # a command that would do nothing.
-            log "${target} is already the campaign this deployment records into. The service is running but its API could not be read, so this is the configuration's word, not the service's; \`fieldctl campaign current\` shows both."
-            return 0
+            # An unreadable API is not confirmation either. "Nothing to do"
+            # is a claim about the running service, and the only evidence for
+            # it is the service's own answer: without one, the file may well
+            # name a campaign the radio stopped recording into hours ago.
+            # Nothing is changed here -- no file, no service -- but the exit
+            # status says the claim could not be made.
+            die "${ENV_LOCAL_FILE} names campaign ${target}, but ${FIELD_UNIT} is running and its API could not be read, so this cannot confirm the service is recording into it. Nothing was changed. Check \`fieldctl campaign current\`, and if the service is wedged, \`fieldctl restart\`."
         fi
         log "${target} is already the campaign this deployment records into, and the service is not running. Nothing to do."
         return 0
@@ -1400,14 +1410,16 @@ cmd_campaign_use() {
         fi
     fi
 
+    # Raised before the call, and the backup is kept rather than discarded on
+    # failure. The write is atomic in the sense that no reader sees a
+    # half-written file -- not in the sense that every failure happened before
+    # the rename. A signal, or an error after it, leaves the new file in place
+    # while the caller never hears that it succeeded, so the recovery has to
+    # be able to put the old one back either way. Restoring a file that was
+    # never replaced costs nothing.
+    USE_PHASE=writing
     if ! local_env set "$ENV_LOCAL_FILE" "$FIELD_PROJECT" "$target"; then
-        # The write is atomic: a failure leaves the file exactly as it was, so
-        # there is nothing to roll back. Rolling back anyway rewrote a file
-        # that was never damaged -- through the same call that had just failed
-        # -- and then exited with the service still stopped.
-        [[ "$backup" == "--absent" ]] || rm -f "$backup"
-        USE_BACKUP="--absent"
-        abort_after_stop "${ENV_LOCAL_FILE} could not be written; the campaign was not changed."
+        abort_after_stop "${ENV_LOCAL_FILE} could not be written; the campaign may not have been changed."
     fi
     USE_PHASE=written
     log "Set FIELD_CAMPAIGN=${target} in ${ENV_LOCAL_FILE}."
@@ -1420,13 +1432,18 @@ cmd_campaign_use() {
         return 0
     fi
 
+    # Raised before the call for the same reason: systemd starts the unit and
+    # only then returns, so an interrupt inside `systemctl start` finds a
+    # process that is already up and holding the new configuration. Recovering
+    # as though it had not started left the file restored and the radio
+    # recording the new campaign -- stop, start, start, and a deployment
+    # disagreeing with its own configuration.
+    USE_PHASE=starting
     if ! systemctl start "$FIELD_UNIT"; then
         log "${FIELD_UNIT} did not start."
         campaign_use_recover || true
         exit 1
     fi
-    # Started, which is the phase that needs a stop before anything can be
-    # put back: the running process is holding the new configuration.
     USE_PHASE=started
 
     if ! api_scope_await "$expect_project" "$target"; then

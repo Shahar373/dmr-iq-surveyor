@@ -773,7 +773,13 @@ and called `start` left the old configuration on disk and the new one in the
 radio. The same recovery runs when the command is interrupted: a SIGINT or
 SIGTERM between the stop and the end of the switch brings the service back
 before re-raising the signal, because a Pi left not recording is the one
-outcome worse than a failed switch. It then verifies the previous campaign
+outcome worse than a failed switch. Each step is marked as begun *before* the
+call that performs it, not after it returns. A call that has had its effect
+and not yet returned is indistinguishable from one that never ran, and an
+interrupt lands in that window as readily as anywhere else -- so an undo that
+trusted the return left the file restored and the radio still on the new
+campaign. Atomicity does not help here either: it promises no reader sees a
+half-written file, not that every failure happened before the rename. It then verifies the previous campaign
 came back and exits non-zero saying what is actually in force. `use` refuses a closed campaign, a
 campaign the project does not declare, and a `field.env.local` that is a
 symbolic link (writing through one would replace the link and leave its target
@@ -791,9 +797,11 @@ alone then waves through a close of the round being recorded. A service whose
 API cannot be read is not permission to proceed: the command refuses rather
 than falling back to the file. `use` applies the same rule to its own no-op --
 "already the campaign this deployment records into" is a claim about a running
-process, so it is confirmed against the API before it is made, and a
-disagreement is refused with both states named rather than reported as nothing
-to do.
+process, so it is confirmed against the API before it is made. A disagreement
+is refused with both states named rather than reported as nothing to do, and
+so is an answer that cannot be read: nothing is changed either way, but a
+claim about the service that no answer from the service supports is not worth
+an exit status of zero.
 
 `new` copies the current campaign's band, site, hardware and capture settings
 by default, so the second round of a survey is declared by naming what changed

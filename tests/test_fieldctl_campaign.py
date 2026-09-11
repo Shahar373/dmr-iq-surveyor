@@ -414,8 +414,18 @@ def test_switching_to_a_campaign_the_project_does_not_declare_is_refused(
 def test_switching_to_the_campaign_already_in_use_is_a_stated_no_op(
     pi: Deployment,
 ) -> None:
+    """`set_api_campaign` is what makes this a no-op rather than a refusal.
+
+    "Already the campaign this deployment records into" is a claim about the
+    running service, and a service reads its configuration once, at start --
+    so the file alone cannot support it, and the API has to agree before the
+    claim is made. Without this line the deployment is one whose API cannot
+    be read, which `test_fieldctl_service_recovery.py` covers and which is
+    refused.
+    """
     pi.set_local("FIELD_CAMPAIGN=day1\n")
     pi.set_service("active")
+    pi.set_api_campaign("day1")
 
     result = pi.run("campaign", "use", "day1", "--write")
 
