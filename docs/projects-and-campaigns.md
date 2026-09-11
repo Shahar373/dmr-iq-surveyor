@@ -656,16 +656,32 @@ three doors that lead to a recording rather than reimplemented at each:
   recordings directory is made and long before the SDR. A service pointed at
   a closed campaign leaves nothing behind.
 - `survey capture --project P --campaign <closed>` and `live stop --project P
-  --campaign <closed>` fail before the radio is probed. `--project` is
-  optional on both and does exactly one thing: it checks the round against
-  that project's manifests. It deliberately does **not** resolve band, site
-  or gain from the manifest, because those commands have never read one and
-  making them do so would change what a stop is recorded with.
+  --campaign <closed>` fail before the radio is probed, and `survey run
+  --project P --campaign <closed>` fails before the recording is read.
+  `--project` is optional on all three and does exactly one thing: it checks
+  the round against that project's manifests. It deliberately does **not**
+  resolve band, site or gain from the manifest, because those commands have
+  never read one and making them do so would change what a stop is recorded
+  with. `survey run` is included because it writes a `survey_runs` row under
+  the campaign exactly as the other two do, and filing a day's recordings is
+  the work most likely to happen after the round was closed.
+- A campaign closed **while a service is running** stops taking stops at
+  once. The startup check cannot cover that case -- it ran before the close
+  -- so the doors that write new evidence (a capture, a drive, a pull-over
+  hold, analysing a recording, and editing a stop) re-read the manifest each
+  time they are asked. Without that, the running service kept recording into
+  a finished round until its next restart, and that restart then failed,
+  which on a Pi means at the side of a road. A manifest that cannot be read
+  leaves the service behaving exactly as it did before the check existed:
+  refusing there would take a working deployment down over a path that
+  moved, and startup already proved the campaign was open.
 
 Closing edits the manifest rather than re-rendering it: one line is replaced
 or inserted and every other byte, comments included, is left alone. A campaign
 file is one an operator may have annotated, and closing a round is not an
-occasion to drop their notes.
+occasion to drop their notes. The rewrite keeps the file's mode and owner,
+because closing under `/etc` is done as root and a manifest left root-only is
+one the service user can no longer read at startup.
 
 Nothing about closing touches the database. No row is moved, relabelled or
 deleted, and there is no migration.

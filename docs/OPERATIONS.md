@@ -383,7 +383,8 @@ sudo fieldctl campaign close 2026-09_day1 --write
 ```
 
 A closed campaign accepts no new capture, drive or pull-over hold, and its
-stops cannot be edited. **Everything else about it is unchanged**: it stays in
+stops cannot be edited — including on a service that is already running, which
+re-reads the manifest at each of those doors rather than only at startup. **Everything else about it is unchanged**: it stays in
 the listing, stays browsable in the field app, and every analysis command
 still reads it. Nothing is deleted and no database row is touched.
 
