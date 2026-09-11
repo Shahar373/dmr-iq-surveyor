@@ -796,6 +796,22 @@ if unassigned:
 '
 }
 
+campaign_in_argv() {
+    # The --campaign value of the argv the service would run, or a non-zero
+    # exit if that argv cannot be built at all. The subshell is the point:
+    # `build_argv` exits on a missing site profile or an unresolvable bind
+    # address, and that must end this function rather than the command.
+    (
+        build_argv
+        local index
+        for index in "${!ARGV[@]}"; do
+            if [[ "${ARGV[$index]}" == "--campaign" ]]; then
+                printf '%s\n' "${ARGV[$((index + 1))]}"
+            fi
+        done
+    )
+}
+
 cmd_campaign_current() {
     require_python
     local listing status manifest api_campaign api_project argv_campaign
@@ -824,17 +840,18 @@ cmd_campaign_current() {
         "$FIELD_CENTER_FREQUENCY" "$FIELD_SAMPLE_RATE" "$FIELD_DURATION" \
         "$FIELD_DRIVER" "$FIELD_SOLVE_RESOLUTION_M"
 
-    # What the service was actually started with, from the one function that
-    # assembles it -- not a second copy of the same logic.
-    build_argv
-    argv_campaign=""
-    local index
-    for index in "${!ARGV[@]}"; do
-        if [[ "${ARGV[$index]}" == "--campaign" ]]; then
-            argv_campaign="${ARGV[$((index + 1))]}"
-        fi
-    done
-    printf 'argv     %s\n' "${argv_campaign:-no --campaign flag}"
+    # What the service would actually be started with, from the one function
+    # that assembles it -- not a second copy of the same logic. In a subshell
+    # because assembling it can legitimately fail (no bind address yet, a site
+    # profile that is not there), and a read-only report must degrade rather
+    # than die: which campaign is current is exactly what an operator needs to
+    # know while something else is broken.
+    if argv_campaign="$(campaign_in_argv)"; then
+        printf 'argv     %s\n' "${argv_campaign:-no --campaign flag}"
+    else
+        argv_campaign=""
+        printf 'argv     could not be assembled; run `fieldctl print-command` to see why\n'
+    fi
 
     if ! service_is_active; then
         printf 'api      service is not running\n'
@@ -1079,7 +1096,20 @@ cmd_campaign_use() {
     if [[ -e "$ENV_LOCAL_FILE" ]]; then
         backup="$(mktemp)"
         chmod 600 "$backup"
-        local_env backup "$ENV_LOCAL_FILE" "$backup" || die "${ENV_LOCAL_FILE} could not be backed up; nothing was changed"
+        if ! local_env backup "$ENV_LOCAL_FILE" "$backup"; then
+            # The file is untouched, so there is nothing to restore -- and
+            # restoring from a backup that failed to write is how an empty
+            # file would get installed as the configuration. But the service
+            # is already stopped by now, and leaving the deployment down over
+            # a failed copy is the worse outcome, so it is started again.
+            log "${ENV_LOCAL_FILE} could not be backed up; the campaign was not changed."
+            rm -f "$backup"
+            if (( was_active )); then
+                systemctl start "$FIELD_UNIT" \
+                    || log "${FIELD_UNIT} did not start again; run \`fieldctl logs\`."
+            fi
+            exit 1
+        fi
     fi
 
     if ! local_env set "$ENV_LOCAL_FILE" "$FIELD_PROJECT" "$target"; then

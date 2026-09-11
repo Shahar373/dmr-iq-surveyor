@@ -293,6 +293,22 @@ def test_current_warns_when_the_running_service_disagrees_with_the_file(
     assert "day1" in result.stdout and "day2" in result.stdout
 
 
+def test_current_still_reports_when_the_launch_command_cannot_be_assembled(
+    pi: Deployment,
+) -> None:
+    """Which campaign is current is exactly what an operator needs to know
+    while something else is broken. A missing site profile, or a tailnet that
+    is down, stops the argv being assembled -- it must not stop the report."""
+    pi.set_local(f"FIELD_CAMPAIGN=day1\nFIELD_SITE={pi.root}/absent.yaml\n")
+
+    result = pi.run("campaign", "current")
+
+    assert result.returncode == 0, result.stderr
+    assert "day1" in result.stdout
+    assert "status   open" in result.stdout
+    assert "could not be assembled" in result.stdout
+
+
 def test_neither_reading_command_ever_prints_the_token_or_a_bookmark(
     pi: Deployment,
 ) -> None:
