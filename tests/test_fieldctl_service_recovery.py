@@ -17,6 +17,20 @@ what the process read.
 
 Each test names the state the deployment is left in, because that is the
 thing an operator at the side of a road actually has.
+
+One contract changed after this suite was first written, and two tests moved
+with it. A no-op on a running service used to exit 0 when the API could not
+be read, on the reasoning that nothing was being changed either way. That
+reasoning is wrong about what the message claims: "already the campaign this
+deployment records into" is a statement about the running service, and the
+configuration file cannot support it -- a service reads its files once, at
+start, so the file may name a campaign the radio stopped recording into
+hours ago. Exit 0 there tells an operator the deployment is fine when
+nothing has checked. The two tests that pinned the old behaviour are
+`test_a_no_op_is_refused_when_the_service_cannot_be_asked` here, and
+`test_switching_to_the_campaign_already_in_use_is_a_stated_no_op` in
+`test_fieldctl_campaign.py`, which now has the API confirm the campaign so
+that it still tests the no-op it was written for.
 """
 
 from __future__ import annotations
