@@ -492,12 +492,27 @@ here."* That matters beyond the historical case, because `dmr-surveyor geo
 solve` with no `--campaign` is a supported thing to run at any time, and from
 then on the newest unscoped plan is one drawn across every round in the file.
 
-`all` is labelled the same way and for the same reason. It runs nothing: no
-joint solve, no shared reference gain, no shared noise floor -- every number
-on it is a row that was already in the file. But evidence counts on a site
-card do span every round, and the region drawn for a site is whichever round
-solved it last, so the view says that rather than letting it read as a
-combined answer.
+The phrase is `Historical whole-database analysis`, and it is one phrase
+everywhere it appears -- the plan, the site card, the map popup for a mode and
+for a region -- rather than three near-misses an operator has to decide are the
+same thing. `stored_analysis_label()` is the only place it is written.
+
+`all` runs nothing either: no joint solve, no shared reference gain, no shared
+noise floor. Every number on it is a row that was already in the file. But it
+does have to *group* them, and grouping turned out to be the difference between
+an overview and a lie. `latest_solutions` keeps one row per site -- the most
+recently inserted -- which is the right answer for a file holding one round and
+the wrong one for a file holding three: the newest round wins every site, and a
+round whose solve found too little hides the rounds that found something. On
+the acceptance fixture that is exactly what happened, and every transmitter
+analysis on the overview disappeared behind a later campaign's
+`insufficient_evidence`. So `all` reads `latest_solutions_by_campaign` instead
+-- one stored row per (site, round) -- and each site lists every round that
+solved it, labelled and apart.
+
+`all` offers **no next-stop plan at all**, and says so. A plan is computed from
+one round's evidence and only means anything inside it; handing over the newest
+one would be precisely the shared aggregation an overview must not do.
 
 A solve scoped to the unassigned runs refuses to store itself.
 `geo_solutions.campaign_id IS NULL` already means "this solve read the whole
@@ -547,8 +562,9 @@ Done:
 4. **PR3 acceptance on a real Pi** -- reboot, a full capture, provenance,
    isolation, and no token leak.
 5. **PR4** -- capture campaign separated from view scope; legacy analyses
-   readable again; Current / Legacy / All selector; no write or delete through
-   a historical view. *This section.*
+   readable again, transmitter results included and labelled; Current / Legacy
+   / All selector; no write or delete through a historical view. *This
+   section.*
 
 Planned, in order, and none of it started here:
 

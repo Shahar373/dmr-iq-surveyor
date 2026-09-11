@@ -284,12 +284,17 @@ the campaign new work actually goes to. **New captures always belong to
 running and keeps posting its fixes -- glancing at history does not interrupt
 it, and Stop drive still works.
 
-Legacy and All also say where their *conclusions* came from. A plan or region
-stored without a campaign was computed from every round in the database at the
-time, not from the stops listed beside it, and the banner says so. That is
-worth knowing whenever `dmr-surveyor geo solve` has been run without
-`--campaign`, because the newest unscoped plan is then one drawn across
-every round in the file.
+Legacy brings back the *analyses*, not just the stop list: the modes, the 50%
+and 90% credible regions, the site verdicts and the next-stop plan the
+historical work produced. They are marked **`Historical whole-database
+analysis`** wherever they appear, because a conclusion stored without a
+campaign was computed from every round in the database at the time, not from
+the stops listed beside it. That is worth knowing whenever `dmr-surveyor geo
+solve` has been run without `--campaign`.
+
+All lists every round that solved a site, separately and labelled, and offers
+no next-stop plan -- a plan is computed from one round's evidence and only
+means anything inside it.
 
 The choice is not remembered anywhere. Reload the page and you are back on
 the campaign being recorded -- which is the point: nobody should discover

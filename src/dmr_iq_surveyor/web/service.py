@@ -62,7 +62,7 @@ from dmr_iq_surveyor.survey.provenance import (
     hardware_from_capture_manifest,
     normalise_campaign_id,
 )
-from dmr_iq_surveyor.survey.scope import CampaignScope
+from dmr_iq_surveyor.survey.scope import CampaignScope, stored_analysis_label
 from dmr_iq_surveyor.survey.store import delete_survey_run
 from dmr_iq_surveyor.web.devices import STATE_CHECKING as DEVICE_STATE_CHECKING
 from dmr_iq_surveyor.web.devices import DeviceMonitor
@@ -609,7 +609,9 @@ class FieldService:
         """Just the sites. `/api/sites` used to build the whole state
         payload -- SDR probe included -- and throw all but this away."""
         return site_overview(
-            database_path=self.settings.database_path, scope=self._read_scope(view)
+            database_path=self.settings.database_path,
+            scope=self._read_scope(view),
+            group_by_campaign=view.groups_by_campaign,
         )
 
     def require_device_ready(self) -> None:
@@ -818,7 +820,9 @@ class FieldService:
 
     def geojson(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
         collection = build_map_geojson(
-            database_path=self.settings.database_path, scope=self._read_scope(view)
+            database_path=self.settings.database_path,
+            scope=self._read_scope(view),
+            group_by_campaign=view.groups_by_campaign,
         )
         plan = self.plan(view)
         collection["features"].extend(plan.get("geojson", {}).get("features", []))
@@ -830,17 +834,33 @@ class FieldService:
         connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
         """The latest next-stop plan, or an explicit note that there is none."""
+        empty = {
+            "status": "none",
+            "campaign_id": None,
+            "unscoped_solve": False,
+            "analysis_label": None,
+            "plan": {},
+            "geojson": {"type": "FeatureCollection", "features": []},
+        }
+        # A next-stop plan is one round's advice about where to drive next,
+        # computed from that round's evidence alone. Across rounds there is no
+        # such thing, and offering the newest one would be exactly the shared
+        # aggregation an overview must not do -- on a real file that meant the
+        # last campaign to solve supplied "the" plan for everything before it.
+        # Said, rather than left as an empty panel to be read as "no solve".
+        if view.groups_by_campaign:
+            return {
+                **empty,
+                "reason": (
+                    "an overview of every round has no next-stop plan: a plan is "
+                    "computed from one round's evidence and only means anything "
+                    "inside it. Switch to a single campaign to see its plan"
+                ),
+            }
         with self._reading(connection) as reader:
             stored = latest_plan(reader, scope=self._read_scope(view))
         if stored is None:
-            return {
-                "status": "none",
-                "reason": "no solve has run yet",
-                "campaign_id": None,
-                "unscoped_solve": False,
-                "plan": {},
-                "geojson": {"type": "FeatureCollection", "features": []},
-            }
+            return {**empty, "reason": "no solve has run yet"}
         return {
             "status": stored["status"],
             "reason": stored["reason"],
@@ -852,6 +872,7 @@ class FieldService:
             # and the difference has to be sayable rather than implied.
             "campaign_id": stored["campaign_id"],
             "unscoped_solve": stored["campaign_id"] is None,
+            "analysis_label": stored_analysis_label(stored["campaign_id"]),
             "plan": json.loads(stored["plan_json"] or "{}"),
             "geojson": json.loads(stored["geojson"] or "{}"),
         }

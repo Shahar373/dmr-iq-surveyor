@@ -79,6 +79,15 @@ class ViewScope:
     def is_read_only(self) -> bool:
         return self.kind != CURRENT
 
+    @property
+    def groups_by_campaign(self) -> bool:
+        """Whether this view spans rounds and so must show them apart.
+
+        Only `all` does. Every other view holds exactly one boundary, so
+        there is nothing to group and the reads stay exactly as they were.
+        """
+        return self.kind == ALL
+
     def label(self, capture_campaign_id: str | None) -> str:
         """One phrase an operator can read off a status bar."""
         if self.kind == LEGACY:

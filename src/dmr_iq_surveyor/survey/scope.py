@@ -171,6 +171,26 @@ class CampaignScope:
 WHOLE_DATABASE = CampaignScope(None)
 UNASSIGNED_ONLY = CampaignScope(unassigned_only=True)
 
+# What a stored `campaign_id IS NULL` on a solution or a plan actually says.
+# Not "this belongs to the unassigned runs" -- there is no such solve, because
+# `stored_campaign_id()` refuses to write one. It says the solve read whatever
+# the whole file held at the time, which is what every analysis run before
+# campaigns existed did. Shown beside a campaign's own conclusions it needs a
+# name, or it reads as one of them.
+HISTORICAL_WHOLE_DATABASE_LABEL = "Historical whole-database analysis"
+
+
+def stored_analysis_label(campaign_id: str | None) -> str:
+    """Name the boundary a stored solution or plan was computed under.
+
+    One function so the phrase is identical everywhere it appears -- the API,
+    the map popup, the site card -- rather than three near-misses an operator
+    has to decide are the same thing.
+    """
+    if campaign_id is None:
+        return HISTORICAL_WHOLE_DATABASE_LABEL
+    return f"Campaign {campaign_id}"
+
 
 def resolve_scope(campaign: str | None) -> CampaignScope:
     """Validate a campaign id and turn it into a scope.
@@ -187,9 +207,11 @@ def resolve_scope(campaign: str | None) -> CampaignScope:
 
 
 __all__ = [
+    "HISTORICAL_WHOLE_DATABASE_LABEL",
     "UNASSIGNED_ONLY",
     "WHOLE_DATABASE",
     "CampaignScope",
     "CampaignScopeError",
     "resolve_scope",
+    "stored_analysis_label",
 ]

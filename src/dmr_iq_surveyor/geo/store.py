@@ -456,6 +456,41 @@ def latest_solutions(
     return [dict(row) for row in rows]
 
 
+def latest_solutions_by_campaign(
+    connection: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Every campaign's own latest solution for every site it solved.
+
+    `latest_solutions` answers "what is the current conclusion", and unscoped
+    it has to pick one row per site -- the most recently inserted. That is the
+    right answer for a file with one round in it, and the wrong shape for an
+    overview of several: the newest round wins every site, and a round whose
+    solve found nothing hides the rounds that found something. On a real file
+    that meant the historical 868 analyses vanished from the overview behind a
+    later campaign's `insufficient_evidence`.
+
+    So this returns one row per (site, campaign) instead. Nothing is combined,
+    averaged or re-solved -- these are the stored rows, grouped by the boundary
+    each was computed under, which is the only honest way to show rounds that
+    were never meant to be compared.
+    """
+    rows = connection.execute(
+        """
+        SELECT g.*, s.site_key, s.rfss, s.site, s.observation_status
+        FROM geo_solutions g
+        JOIN p25_sites s ON s.p25_site_id = g.p25_site_id
+        WHERE g.geo_solution_id = (
+            SELECT MAX(inner_solution.geo_solution_id)
+            FROM geo_solutions inner_solution
+            WHERE inner_solution.p25_site_id = g.p25_site_id
+              AND inner_solution.campaign_id IS g.campaign_id
+        )
+        ORDER BY s.rfss, s.site, g.campaign_id IS NOT NULL, g.campaign_id
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def solution_history(
     connection: sqlite3.Connection,
     p25_site_id: int,
@@ -489,6 +524,7 @@ __all__ = [
     "fetch_all_measurements",
     "fetch_site_measurements",
     "latest_solutions",
+    "latest_solutions_by_campaign",
     "replace_run_measurements",
     "run_exclusion",
     "solution_history",

@@ -85,6 +85,12 @@ html, body {
   background: color-mix(in srgb, var(--warn) 10%, var(--panel));
 }
 #scope-notice { flex: none; margin: 0 14px 10px; }
+.solution-row {
+  border-left: 2px solid var(--line);
+  padding: 4px 0 4px 9px;
+  margin: 6px 0;
+}
+.solution-row .key { font-size: 13px; font-weight: 600; margin-right: 6px; }
 .scope-line { margin: 0 0 6px; }
 .scope-line:last-child { margin-bottom: 0; }
 .group-head {

@@ -462,6 +462,7 @@ function measurementPopup(properties) {
 
 function estimatePopup(properties) {
   const rows = [
+    ["analysis", properties.analysis_label || "—"],
     ["status", properties.status],
     ["detections", properties.detection_count],
     ["non-detections", properties.non_detection_count],
@@ -514,6 +515,7 @@ async function refreshMap() {
         `<b>${escapeHtml(properties.site_key)}</b><dl>` +
         `<dt>region</dt><dd>${Math.round(properties.credible_level * 100)}% credible</dd>` +
         `<dt>area</dt><dd>${formatArea(properties.area_km2)}</dd>` +
+        `<dt>analysis</dt><dd>${escapeHtml(properties.analysis_label || "—")}</dd>` +
         `<dt>status</dt><dd>${escapeHtml(properties.status)}</dd></dl>`
       ).addTo(inner ? layers.regions50 : layers.regions90);
     } else if (properties.kind === "plan_cell") {
@@ -849,17 +851,17 @@ function renderScope() {
     // and passing someone else's answer off as this view's.
     if (state.plan && state.plan.unscoped_solve && state.plan.status !== "none") {
       lines.push(
-        "The plan and regions below come from a solve that was run without a " +
-          "campaign, so it read every round in the database at the time — not " +
-          "only the stops listed here."
+        `${state.plan.analysis_label}: the plan and regions below come from a ` +
+          "solve that was run without a campaign, so it read every round in the " +
+          "database at the time — not only the stops listed here."
       );
     }
     if (viewScope === "all") {
       lines.push(
-        "Evidence counts on the Sites tab span every round in the file, and " +
-          "the region drawn for a site is whichever round solved it last. " +
-          "Rounds establish their own reference gain and noise floor, so this " +
-          "is an overview, not a combined answer."
+        "Each site lists every round that solved it, separately and labelled. " +
+          "Rounds establish their own reference gain and noise floor, so nothing " +
+          "here is combined, re-solved or averaged — and there is no next-stop " +
+          "plan, because a plan only means anything inside one round."
       );
     }
     if (live.jobId) {
@@ -921,6 +923,47 @@ function elsewhereHint(noun) {
   );
 }
 
+/* `Historical whole-database analysis` is not decoration. A stored
+ * `campaign_id IS NULL` means the solve read whatever the file held at the
+ * time -- it is not the unassigned runs' own answer, and there is no such
+ * thing, because a solve scoped to them refuses to store itself. Beside a
+ * campaign's conclusions it has to be named, or it reads as one of them. */
+function analysisLine(campaignId, label) {
+  const text = label || "analysis boundary not recorded";
+  if (campaignId !== null && campaignId !== undefined) {
+    return el("div", "meta", text);
+  }
+  const line = el("div", "warn", text);
+  line.append(
+    el("div", "meta", "computed from every round in the database at the time, "
+      + "not only the stops listed here")
+  );
+  return line;
+}
+
+/* Under `all` a site has as many answers as rounds that solved it, and they
+ * were never meant to be compared -- each established its own reference gain
+ * and noise floor. Listed apart and labelled, never reduced to one. */
+function renderSolutionsByCampaign(card, solutions) {
+  const useful = solutions.filter(
+    (entry) => entry.mode_latitude !== null || entry.detection_count
+  );
+  if (!useful.length) return;
+  card.append(el("div", "group-head", "Analyses by round"));
+  for (const entry of useful) {
+    const row = el("div", "solution-row");
+    row.append(el("span", "key", entry.analysis_label));
+    const [badgeKind, badgeText] = statusBadge(entry.status);
+    row.append(el("span", "badge " + badgeKind, badgeText));
+    row.append(
+      el("div", "meta",
+        `${entry.detection_count} detection(s), ${entry.non_detection_count} non-detection(s)` +
+        (entry.area_km2_90 ? ` · 90% ${formatArea(entry.area_km2_90)}` : ""))
+    );
+    card.append(row);
+  }
+}
+
 function renderSites() {
   const container = $("#site-list");
   container.replaceChildren();
@@ -946,17 +989,10 @@ function renderSites() {
     // Outside the current campaign, several rounds' answers can be on screen
     // at once. Say which one drew each rather than letting them read as a
     // single conclusion.
-    if (viewReadOnly && site.solved_at) {
-      card.append(
-        el(
-          "div",
-          site.solution_campaign_id === null ? "warn" : "meta",
-          site.solution_campaign_id === null
-            ? "solved without a campaign — this region was computed from every "
-              + "round in the database, not only the stops listed here"
-            : "solved under campaign " + site.solution_campaign_id
-        )
-      );
+    if (viewScope === "all" && (site.solutions || []).length) {
+      renderSolutionsByCampaign(card, site.solutions);
+    } else if (viewReadOnly && site.solved_at) {
+      card.append(analysisLine(site.solution_campaign_id, site.solution_analysis_label));
     }
     for (const warning of site.warnings || []) card.append(el("div", "warn", warning));
 
