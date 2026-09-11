@@ -9,6 +9,7 @@
 const TOKEN = new URLSearchParams(location.search).get("token") || "";
 const state = {
   settings: null,
+  scope: null,
   position: null,
   sites: [],
   stops: [],
@@ -147,6 +148,22 @@ async function api(path, options = {}) {
 }
 
 const $ = (selector) => document.querySelector(selector);
+
+/* Which rounds are on screen. Deliberately a plain variable: not localStorage,
+ * not the URL, not anything the server remembers. A reload is back on the
+ * campaign being recorded, because "I thought I was looking at today" is the
+ * one mistake this whole feature exists to prevent.
+ *
+ * "current" adds no parameter at all, so every request the app makes in its
+ * normal state is byte-identical to the one it made before view scopes
+ * existed. */
+let viewScope = "current";
+let viewReadOnly = false;
+
+function scoped(path) {
+  if (viewScope === "current") return path;
+  return path + (path.includes("?") ? "&" : "?") + "scope=" + encodeURIComponent(viewScope);
+}
 
 /* Popup bodies are assembled as HTML, and their values come from a
  * user-supplied site snapshot (notes, status reasons) and from job messages.
@@ -465,7 +482,7 @@ async function refreshMap() {
   // Which layers the operator turned off must survive a refresh -- they are
   // turned off precisely when the map is too busy to read.
   const hidden = Object.keys(layers).filter((name) => !map.hasLayer(layers[name]));
-  const collection = await api("/api/geojson");
+  const collection = await api(scoped("/api/geojson"));
   ["regions50", "regions90", "measurements", "nondetections", "estimates", "plan"].forEach(
     (name) => layers[name].clearLayers()
   );
@@ -587,10 +604,50 @@ function renderPlan() {
   });
 }
 
+function campaignLabel(campaignId) {
+  return campaignId === null || campaignId === undefined
+    ? "unassigned (recorded before campaigns)"
+    : campaignId;
+}
+
+/* Under `all` the list spans rounds that were never meant to be compared --
+ * each establishes its own reference gain and its own noise floor. So it is
+ * grouped and headed rather than blended into one ordering that would read
+ * as a single round's work. Every other view holds exactly one campaign, so
+ * there is nothing to group and the list stays as it was. */
+function groupStopsByCampaign(stops) {
+  if (viewScope !== "all") return [[null, stops]];
+  const groups = new Map();
+  for (const stop of stops) {
+    const key = stop.campaign_id === undefined ? null : stop.campaign_id;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(stop);
+  }
+  return [...groups.entries()].sort((a, b) => {
+    if (a[0] === null) return -1;
+    if (b[0] === null) return 1;
+    return String(a[0]).localeCompare(String(b[0]));
+  });
+}
+
 function renderStops() {
   const container = $("#stop-list");
   container.replaceChildren();
-  for (const stop of state.stops || []) {
+  for (const [campaignId, group] of groupStopsByCampaign(state.stops || [])) {
+    if (viewScope === "all") {
+      container.append(
+        el("p", "group-head", `${campaignLabel(campaignId)} — ${group.length} stop(s)`)
+      );
+    }
+    renderStopCards(container, group);
+  }
+  if (!(state.stops || []).length) {
+    container.append(el("p", "hint", elsewhereHint("stops")));
+  }
+}
+
+function renderStopCards(container, stops) {
+  for (const stop of stops) {
     const excluded = Boolean(stop.exclusion_reason);
     const card = el("div", "stop" + (excluded ? " excluded" : ""));
     const header = el("header");
@@ -599,6 +656,11 @@ function renderStops() {
       el("span", "badge " + (excluded ? "warn" : "ok"), excluded ? "not counting" : "counting")
     );
     card.append(header);
+    // Only outside the current campaign: in it, every row is this round's
+    // and a badge on all of them says nothing.
+    if (viewReadOnly) {
+      card.append(el("div", "meta", "campaign: " + campaignLabel(stop.campaign_id)));
+    }
     const when = (stop.capture_start_utc || "").replace("T", " ").slice(0, 16);
     card.append(
       el(
@@ -613,14 +675,19 @@ function renderStops() {
     );
     if (excluded) card.append(el("div", "meta", stop.exclusion_reason));
 
+    // Built per card, so they cannot be on MUTATING_CONTROLS -- the view is
+    // applied to each as it is made, and renderStops() runs on every scope
+    // change, so a historical stop is never offered an action that the
+    // server would only refuse afterwards.
     const actions = el("div", "actions");
     const toggle = el("button", null, excluded ? "Put back" : "Set aside");
+    toggle.disabled = viewReadOnly;
     toggle.addEventListener("click", async () => {
       const path = `/api/stops/${encodeURIComponent(stop.survey_run_id)}/` +
         (excluded ? "include" : "exclude");
       const body = excluded ? {} : { reason: "set aside by the operator in the field" };
       try {
-        await api(path, { method: "POST", body: JSON.stringify(body) });
+        await api(scoped(path), { method: "POST", body: JSON.stringify(body) });
         await refreshState();
       } catch (error) {
         alert("Could not change the stop: " + error.message);
@@ -629,10 +696,11 @@ function renderStops() {
     actions.append(toggle);
 
     const remove = el("button", "danger", "Delete");
+    remove.disabled = viewReadOnly;
     remove.addEventListener("click", async () => {
       if (!confirm(`Delete ${stop.survey_run_id} and everything measured at it? This cannot be undone.`)) return;
       try {
-        await api(`/api/stops/${encodeURIComponent(stop.survey_run_id)}/delete`, {
+        await api(scoped(`/api/stops/${encodeURIComponent(stop.survey_run_id)}/delete`), {
           method: "POST",
           body: JSON.stringify({}),
         });
@@ -652,14 +720,11 @@ function renderStops() {
     }
     container.append(card);
   }
-  if (!(state.stops || []).length) {
-    container.append(el("p", "hint", "No stops recorded yet."));
-  }
 }
 
 async function showHistory(siteKey, target) {
   try {
-    const payload = await api("/api/history/" + encodeURIComponent(siteKey));
+    const payload = await api(scoped("/api/history/" + encodeURIComponent(siteKey)));
     const areas = payload.history
       .map((entry) => entry.area_km2_90)
       .filter((value) => value !== null && value !== undefined);
@@ -678,6 +743,119 @@ async function showHistory(siteKey, target) {
   } catch (error) {
     target.textContent = "history unavailable: " + error.message;
   }
+}
+
+/* ----------------------------------------------------------- view scope */
+
+/* Every control that adds to, removes from or re-derives what is in the
+ * database. Locked as a set rather than one at a time, so a control added
+ * later is either on this list or is a deliberate exception. */
+const MUTATING_CONTROLS = [
+  "#record", "#purge", "#resolve",
+  "#use-gps", "#save-position", "#pick-on-map",
+  "#drive-share", "#drive-start", "#drive-solve", "#drive-hold",
+];
+
+/* The view is the outer authority on every mutating control: a job callback
+ * or a live poll may re-enable one for its own reasons, and must not be able
+ * to hand back a button the current view has taken away. */
+function setEnabled(selector, enabled) {
+  const control = $(selector);
+  if (control) control.disabled = viewReadOnly || !enabled;
+}
+
+function scopeOptionLabel(entry, captureCampaignId) {
+  if (entry.campaign_id === null) return `Legacy / unassigned (${entry.runs})`;
+  if (entry.campaign_id === captureCampaignId) return `Current campaign (${entry.runs})`;
+  return `Campaign ${entry.campaign_id} (${entry.runs})`;
+}
+
+function renderScope() {
+  const scope = state.scope;
+  const select = $("#view-scope");
+  if (!scope) return;
+  // Set before anything renders a control: renderStops() builds its own
+  // buttons and reads this directly, and refreshState() calls us first.
+  viewReadOnly = Boolean(scope.read_only);
+
+  const project = $("#scope-project");
+  project.hidden = !scope.project_id;
+  project.textContent = "project " + (scope.project_id || "");
+
+  const campaign = $("#scope-campaign");
+  campaign.textContent = scope.capture_campaign_id
+    ? "recording to " + scope.capture_campaign_id
+    : "no campaign — recording unassigned";
+
+  const hardware = $("#scope-hardware");
+  hardware.hidden = !scope.hardware_profile;
+  hardware.textContent = "receiver " + (scope.hardware_profile || "");
+
+  // Rebuilt from the census, so a campaign that exists in the file is
+  // offered whether or not this deployment has ever heard of it -- and one
+  // that holds nothing is not offered at all.
+  const options = [["current", "Showing: current campaign"]];
+  for (const entry of scope.campaigns || []) {
+    if (entry.view === "current") continue;
+    if (entry.campaign_id === scope.capture_campaign_id) continue;
+    options.push([entry.view, "Showing: " + scopeOptionLabel(entry, scope.capture_campaign_id)]);
+  }
+  options.push(["all", "Showing: all campaigns — overview"]);
+  select.replaceChildren();
+  for (const [value, label] of options) {
+    const option = el("option", null, label);
+    option.value = value;
+    select.append(option);
+  }
+  select.value = scope.view;
+  // A scope the server accepted but that no longer has an option -- the last
+  // run of a campaign was deleted, say. Show it rather than silently snapping
+  // the selector to something the operator is not looking at.
+  if (select.value !== scope.view) {
+    const orphan = el("option", null, "Showing: " + scope.view_label);
+    orphan.value = scope.view;
+    select.append(orphan);
+    select.value = scope.view;
+  }
+  select.classList.toggle("historical", Boolean(scope.read_only));
+
+  const notice = $("#scope-notice");
+  notice.hidden = !viewReadOnly;
+  notice.textContent = "";
+  if (viewReadOnly) {
+    const target = scope.capture_campaign_id || "no campaign (unassigned)";
+    notice.className = "notice";
+    notice.textContent =
+      `Historical view — ${scope.view_label}. Read-only: recording, solving and ` +
+      `editing stops are switched off here. New captures always belong to ` +
+      `${target}, whatever is on screen. Switch back to the current campaign to work.`;
+  }
+  applyViewLock();
+}
+
+function applyViewLock() {
+  for (const selector of MUTATING_CONTROLS) {
+    const control = $(selector);
+    if (control) control.disabled = viewReadOnly;
+  }
+}
+
+/* What to say when this view is empty. "No data" is only the truth when the
+ * file is empty; the whole reason this release exists is that it was being
+ * said over 51 rounds of work that were merely out of scope. */
+function elsewhereHint(noun) {
+  const scope = state.scope;
+  if (!scope) return `No ${noun} recorded yet.`;
+  const elsewhere = (scope.campaigns || []).filter((entry) => entry.view !== scope.view);
+  const total = elsewhere.reduce((sum, entry) => sum + entry.runs, 0);
+  if (!total) return `No ${noun} recorded yet — this database is empty.`;
+  const where = elsewhere
+    .map((entry) => (entry.campaign_id === null ? "Legacy" : entry.campaign_id) + ` (${entry.runs})`)
+    .join(", ");
+  return (
+    `No ${noun} in ${scope.view_label}. ${total} run(s) are filed elsewhere in this ` +
+    `database — ${where}. Use the selector at the top to look at them.`
+  );
 }
 
 function renderSites() {
@@ -718,8 +896,9 @@ function renderSites() {
     }
     container.append(card);
   }
-  $("#site-summary").textContent =
-    `${solved} of ${state.sites.length} site(s) have a bounded region`;
+  $("#site-summary").textContent = state.sites.length
+    ? `${solved} of ${state.sites.length} site(s) have a bounded region`
+    : elsewhereHint("sites");
 }
 
 /* ------------------------------------------------------------------ jobs */
@@ -781,8 +960,8 @@ function watchJob(jobId, cursor = 0) {
 }
 
 async function finishJob(jobId) {
-  $("#record").disabled = false;
-  $("#resolve").disabled = false;
+  setEnabled("#record", true);
+  setEnabled("#resolve", true);
   $("#cancel-job").hidden = true;
   state.jobId = null;
   try {
@@ -865,7 +1044,7 @@ async function startCapture(confirmPosition = false) {
   };
   if (confirmPosition) body.confirm_position = true;
   try {
-    const job = await api("/api/capture", { method: "POST", body: JSON.stringify(body) });
+    const job = await api(scoped("/api/capture"), { method: "POST", body: JSON.stringify(body) });
     watchJob(job.job_id);  // keeps the button disabled until the job ends
   } catch (error) {
     // A stale marked position is recoverable, and recording a stop against
@@ -903,7 +1082,7 @@ async function startCapture(confirmPosition = false) {
 async function purgeRecordings() {
   if (!confirm("Delete every kept recording? Their measurements are already stored; only the raw IQ goes.")) return;
   try {
-    const result = await api("/api/recordings/purge", { method: "POST", body: JSON.stringify({}) });
+    const result = await api(scoped("/api/recordings/purge"), { method: "POST", body: JSON.stringify({}) });
     alert(`Freed ${result.freed_gib} GiB from ${result.deleted_count} recording(s).`);
     await refreshState();
   } catch (error) {
@@ -913,7 +1092,7 @@ async function purgeRecordings() {
 
 async function startSolve() {
   try {
-    const job = await api("/api/solve", {
+    const job = await api(scoped("/api/solve"), {
       method: "POST",
       body: JSON.stringify({ rebuild_measurements: true }),
     });
@@ -1042,7 +1221,7 @@ async function startDrive() {
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   try {
-    const job = await api("/api/live/start", {
+    const job = await api(scoped("/api/live/start"), {
       method: "POST",
       body: JSON.stringify({
         max_seconds: Number($("#drive-minutes").value) * 60,
@@ -1150,8 +1329,8 @@ function renderLive(payload) {
   $("#drive-start").hidden = running;
   $("#drive-stop").hidden = !running;
   $("#drive-solve").hidden = !running;
-  $("#drive-solve").disabled = Boolean(payload.solving);
-  if (!running) $("#drive-start").disabled = !window.isSecureContext;
+  setEnabled("#drive-solve", !payload.solving);
+  if (!running) setEnabled("#drive-start", window.isSecureContext);
   if (running && payload.job_id) live.jobId = payload.job_id;
 
   const status = $("#drive-status");
@@ -1328,12 +1507,14 @@ async function pollLive() {
 /* ----------------------------------------------------------------- setup */
 
 async function refreshState() {
-  const payload = await api("/api/state", { timeoutMs: STATE_TIMEOUT_MS });
+  const payload = await api(scoped("/api/state"), { timeoutMs: STATE_TIMEOUT_MS });
   state.settings = payload.settings;
   state.position = payload.position;
   state.sites = payload.sites;
   state.stops = payload.stops || [];
   state.plan = payload.plan || null;
+  state.scope = payload.scope || null;
+  renderScope();
   renderPosition();
   renderSites();
   renderStops();
@@ -1369,6 +1550,9 @@ async function refreshState() {
   }
 
   renderDeviceStatus(payload.device);
+  // Last, after every renderer that has an opinion about a button: the view
+  // decides what may be used, and it decides it after they have all spoken.
+  applyViewLock();
   return payload;
 }
 
@@ -1436,6 +1620,21 @@ function wireUi() {
     }
     savePosition(position.latitude, position.longitude, position.accuracy_m, position.source === "browser_gps" ? "device" : "manual");
   });
+  $("#view-scope").addEventListener("change", async (event) => {
+    const chosen = event.target.value;
+    const previous = viewScope;
+    viewScope = chosen;
+    try {
+      // Both, together: a map still showing one scope's measurements under
+      // another scope's stop list is the confusion this release is fixing.
+      await refreshState();
+      await refreshMap();
+    } catch (error) {
+      viewScope = previous;
+      alert("Could not switch view: " + error.message);
+      await refreshState().catch(() => {});
+    }
+  });
   $("#record").addEventListener("click", () => startCapture());
   $("#purge").addEventListener("click", purgeRecordings);
   $("#drive-share").addEventListener("click", () => {
@@ -1450,6 +1649,7 @@ function wireUi() {
     $(id).addEventListener("click", () => {
       const query = new URLSearchParams({ format });
       if (TOKEN) query.set("token", TOKEN);
+      if (viewScope !== "current") query.set("scope", viewScope);
       window.open("/api/export?" + query.toString(), "_blank");
     });
   }
