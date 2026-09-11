@@ -16,6 +16,7 @@ commands, skip to [Daily use](#daily-use).
 | `/opt/dmr-field/app` | The deployment checkout. Nothing else uses it. |
 | `/opt/dmr-field/venv` | Its virtualenv, with the SoapySDR bindings linked in. |
 | `/etc/dmr-field/field.env` | Configuration. No secrets — `systemctl show` can read it. |
+| `/etc/dmr-field/field.env.local` | Optional local overrides, read after `field.env` and winning over it. Created by `fieldctl campaign use`; survives an update. |
 | `/etc/dmr-field/token` | The shared API token, mode `0600`. Never in Git. |
 | `/etc/dmr-field/sites/…yaml` | Your site profile. Never in Git. |
 | `/var/lib/dmr-field` | Recordings, reports, the database, `position.json`. |
@@ -155,7 +156,16 @@ fieldctl logs -f       # follow
 fieldctl restart       # warns first if a job is running
 fieldctl stop
 fieldctl start
+
+fieldctl campaign list     # every round in the project, and its status
+fieldctl campaign current  # what this Pi is recording into, and from where
 ```
+
+`fieldctl` reads the same two environment files the unit does —
+`/etc/dmr-field/field.env`, then `/etc/dmr-field/field.env.local` if it is
+there, with the local file winning — so `fieldctl status` and
+`fieldctl print-command` report the configuration the service is actually
+running with. `status` names which of the two each value came from.
 
 After a reboot you should need none of them. The Pi boots, waits for the
 tailnet, and the bookmark works.
@@ -253,9 +263,16 @@ dmr-surveyor project init --adopt \
 
 `FIELD_CAMPAIGN` is the collection round every stop is recorded under. It
 selects `<project root>/campaigns/<id>.yaml`, which must already exist, and
-it is **only read alongside `FIELD_PROJECT`** -- set on its own it does
-nothing and every stop comes back unassigned. `fieldctl status` says so
-rather than leaving it to be discovered after a day of driving.
+that manifest is what pins the round's band, site, hardware and capture
+settings. Set on its own, without `FIELD_PROJECT`, the id still **tags** every
+stop -- it reaches `survey_runs.campaign_id` either way -- but no manifest
+pins anything and the `fieldctl campaign` commands have no project to work in.
+`fieldctl status` says so rather than leaving it to be discovered after a day
+of driving.
+
+A campaign whose manifest says `status: closed` is refused at startup: the
+service will not come up recording into a finished round. Switch to an open
+one with `fieldctl campaign use`.
 
 ### Older analyses are browsed, not lost
 
@@ -329,6 +346,61 @@ sudo -u shahar fieldctl status          # project, campaign, band, capture
 ```
 
 `fieldctl restart` then applies it.
+
+### Switching to another campaign
+
+Do not hand-edit `field.env` for this. `fieldctl campaign use` exists because
+the hand-edit had no way to notice a capture that was still running, no way
+back from a typo, and no check that the service came up recording into the
+campaign that was asked for.
+
+```bash
+fieldctl campaign list                  # what exists, and which of them is open
+fieldctl campaign use 2026-09_day2      # reports; changes nothing
+sudo fieldctl campaign use 2026-09_day2 --write
+```
+
+The dry run is the default and prints the current campaign, the target, the
+file that would change, and the steps in order. `--write` then takes a lock,
+refuses if the API reports a job that has not finished, stops the service,
+rewrites **only** `FIELD_PROJECT` and `FIELD_CAMPAIGN` in
+`/etc/dmr-field/field.env.local` — keeping every other line and comment, and
+leaving `field.env` untouched — starts the service, and waits for the API to
+confirm the campaign. If any of that fails it restores the previous file, or
+removes it if there was none, starts the service again, checks the previous
+campaign came back, and exits non-zero.
+
+It refuses, before stopping anything, a campaign the project does not declare,
+a campaign that is closed, and a `field.env.local` that is a symbolic link.
+Running it as yourself refuses too, and prints the `sudo` line to use;
+`fieldctl` never calls `sudo` for you.
+
+### Finishing a round
+
+```bash
+fieldctl campaign close 2026-09_day1                  # reports
+sudo fieldctl campaign close 2026-09_day1 --write
+```
+
+A closed campaign accepts no new capture, drive or pull-over hold, and its
+stops cannot be edited. **Everything else about it is unchanged**: it stays in
+the listing, stays browsable in the field app, and every analysis command
+still reads it. Nothing is deleted and no database row is touched.
+
+Close refuses to close the campaign this Pi is recording into — switch to
+another one first, or the service would be left pointed at a campaign it may
+no longer write to and would only find out at its next start.
+
+Starting the next round usually means copying this one:
+
+```bash
+sudo fieldctl campaign new 2026-09_day2 --label "Day 2, north" --write
+fieldctl campaign current               # confirm before and after
+```
+
+`new` copies the current campaign's band, site, hardware and capture settings
+unless told otherwise, and does **not** switch this Pi to the new campaign;
+that is `use`, deliberately separate.
 
 ### Gain, and the hardware profile
 
@@ -406,6 +478,11 @@ on the Raspberry Pi: a full reboot, the service coming back on its own, the
 same bookmark and token still working, and a capture completing with no
 overflows. It also records the two defects that run found before it passed.
 
+`docs/validation/pr4-capture-campaign-and-view-scope.md` records the update to
+the campaign / view-scope split: the current campaign still recorded into, the
+51 rounds that predate campaigns visible again with their transmitter
+analyses, and neither historical view able to change anything.
+
 The application itself — capture, survey, device recovery, the geolocation
 solve — is validated separately in `docs/validation/pi-smoke-v0.10.md`.
 
@@ -415,7 +492,12 @@ solve — is validated separately in `docs/validation/pi-smoke-v0.10.md`.
   serve`; every command still works exactly as it did by hand, and
   `scripts/run_field_app.sh` is untouched.
 - `fieldctl restart` abandons a running capture. It warns and waits five
-  seconds; it cannot resume one.
+  seconds; it cannot resume one. `fieldctl campaign use --write` refuses
+  instead of warning, but it refuses on what the API reported a moment
+  earlier: it then stops the service before writing, so nothing can start a
+  capture in between, and it cannot resume one either.
+- It does not assign a historical run to a campaign, and closing a campaign
+  does not move, relabel or delete anything.
 - Stopping the service sends `SIGINT` so the server can release the SDR, but a
   capture wedged inside a driver call can outlive it. `TimeoutStopSec=30`, then
   `SIGKILL`. See `docs/validation/pi-smoke-v0.10.md` for the underlying
