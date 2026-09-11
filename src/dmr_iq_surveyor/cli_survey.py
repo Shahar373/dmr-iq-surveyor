@@ -20,6 +20,11 @@ from dmr_iq_surveyor.capture.core import CaptureSettings, run_capture_and_survey
 from dmr_iq_surveyor.capture.device import probe_soapysdr
 from dmr_iq_surveyor.capture.gps import resolve_gps
 from dmr_iq_surveyor.capture.preflight import run_preflight
+from dmr_iq_surveyor.project.manifest import (
+    ProjectError,
+    require_open_campaign,
+    resolve_project,
+)
 from dmr_iq_surveyor.reporting.export import export_survey
 from dmr_iq_surveyor.survey.pipeline import (
     DEFAULT_DATABASE_PATH,
@@ -45,6 +50,36 @@ survey_app = typer.Typer(
     help="Protocol-agnostic RF survey: discovery, persistent inventory, and run comparison.",
 )
 console = Console()
+
+
+PROJECT_CHECK_HELP = (
+    'Project manifest, project directory, or a name under projects/<name>/. Given with --campaign it checks this round against the project before the radio is touched: the campaign manifest must exist, belong to this project and be open. It changes no other setting -- band, site and gain are resolved exactly as they are without it'
+)
+
+
+def _check_campaign_against_project(project: str | None, campaign: str | None) -> None:
+    """Refuse a round this recording may not be written into.
+
+    Optional, and off unless `--project` is given, because these commands have
+    never read a manifest and making them do so would change what a stop is
+    recorded with. What it adds is the one check a manifest can make that the
+    flags cannot: whether the round named actually exists in this project and
+    is still open. A closed round refused here costs nothing; discovered
+    afterwards it costs the stop.
+    """
+    if project is None:
+        return
+    if campaign is None:
+        console.print(
+            "[bold red]--project is given without --campaign[/bold red], so there is "
+            "nothing for it to check. Name the round with --campaign, or drop --project."
+        )
+        raise typer.Exit(code=1)
+    try:
+        require_open_campaign(resolve_project(project), campaign)
+    except (ProjectError, FileNotFoundError) as exc:
+        console.print(f"[bold red]Campaign refused:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 def _hardware_profile(name: str | None):
@@ -414,6 +449,10 @@ def survey_capture(
             ),
         ),
     ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", help=PROJECT_CHECK_HELP),
+    ] = None,
     hardware: Annotated[
         str | None,
         typer.Option(
@@ -504,6 +543,8 @@ def survey_capture(
     except ProvenanceError as exc:
         console.print(f"[bold red]{exc}[/bold red]")
         raise typer.Exit(code=1) from exc
+
+    _check_campaign_against_project(project, campaign)
 
     # Before the radio is touched: a profile that does not resolve must fail
     # now, not after ninety seconds of recording.

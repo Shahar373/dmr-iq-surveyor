@@ -176,7 +176,10 @@ def project_show(project: ProjectOption) -> None:
         except (ProjectError, FileNotFoundError) as exc:
             listing.add_row(path.stem, "-", f"[red]{exc}[/red]")
             continue
-        listing.add_row(campaign.campaign_id, campaign.label, "ok")
+        # The lifecycle, not a bare "ok". A campaign that reads correctly and
+        # a campaign that may still be recorded into are two different facts,
+        # and the second is the one an operator is looking for here.
+        listing.add_row(campaign.campaign_id, campaign.label, campaign.status)
     console.print(listing)
 
 
