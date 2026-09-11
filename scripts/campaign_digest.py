@@ -33,6 +33,7 @@ from dmr_iq_surveyor.survey.pipeline import (
 )
 from dmr_iq_surveyor.survey.provenance import (
     SOURCE_LABELS,
+    identity_value,
     if_gain_reading,
     lna_state_reading,
     load_hardware,
@@ -165,6 +166,27 @@ def stops(connection: sqlite3.Connection, campaign: str | None = None) -> None:
         unit="",
         plural="LNA STATE",
     )
+
+    # What the radio said it was, kept apart from what the profile declared
+    # the receiver to be. The two agree on a well-kept campaign and differ
+    # exactly when it matters: a spare RSP swapped in mid-round reads as one
+    # campaign at one gain in the declaration and as two radios here.
+    observed = Counter()
+    for row in runs:
+        hardware = load_hardware(row["hardware_json"])
+        label = identity_value(hardware, "label")
+        serial = identity_value(hardware, "serial")
+        if label is None and serial is None:
+            observed["not recorded"] += 1
+            continue
+        observed[" ".join(str(part) for part in (label, serial) if part)] += 1
+    if observed:
+        print(
+            "  receiver (observed)  "
+            + ", ".join(f"{name} x{count}" for name, count in observed.most_common())
+        )
+        if len(observed) > 1 and "not recorded" not in observed:
+            print("       more than one radio reported itself across this campaign")
 
     rates = Counter(row["sample_rate_hz"] for row in runs)
     print(

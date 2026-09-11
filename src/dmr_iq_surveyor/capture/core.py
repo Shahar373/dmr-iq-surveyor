@@ -255,6 +255,11 @@ def run_capture(
         "gap_seconds": gap_seconds,
         "time_coverage": time_coverage,
         "device_settings_applied": getattr(resolved_device, "applied_settings", {}),
+        # What the radio said it is, as opposed to what it was asked for.
+        # Carried the same way the read-back settings are, with the same
+        # default: a device that answers nothing contributes nothing, and
+        # the capture is unaffected either way.
+        "device_identity": getattr(resolved_device, "observed_identity", {}),
         "device_close_error": device_close_error,
         "writer_close_error": writer_close_error,
         "start_utc": writer_summary["start_utc"],

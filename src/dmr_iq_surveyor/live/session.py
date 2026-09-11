@@ -425,7 +425,13 @@ class LiveSession:
         # device what it ended up at, so a drive DOES have a read-back;
         # only a device that exposes none falls back to `requested`.
         self._hardware = hardware_provenance(
-            identity={"driver": requested.driver, "serial": requested.serial},
+            identity={
+                "driver": requested.driver,
+                "serial": requested.serial,
+                # From the device opened just above -- one open, one answer,
+                # carried by every bin this drive writes.
+                **getattr(resolved_device, "observed_identity", {}),
+            },
             applied=applied_bucket(getattr(resolved_device, "applied_settings", None)),
             requested=requested_bucket(
                 center_frequency_hz=requested.center_frequency_hz,

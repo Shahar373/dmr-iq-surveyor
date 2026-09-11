@@ -101,6 +101,69 @@ class DeviceSettings:
         return asdict(self)
 
 
+# What the radio can be asked about itself, and the key each answer is
+# recorded under. Only ever what the device reports: a serial an operator
+# typed is what was *asked for*, and a serial in a hardware profile is what
+# was *declared*. Neither is an observation, and this bucket is observations.
+IDENTITY_SERIAL = "serial"
+IDENTITY_LABEL = "label"
+
+
+def _identity_text(value: Any) -> str | None:
+    """A device's answer, if it is one worth recording.
+
+    A driver that does not know an attribute answers with an empty string
+    about as often as it omits the key, and both mean the same thing: not
+    observed. Recorded as absent rather than as `""`, because an empty
+    string in this bucket would read as a serial the radio reported and
+    nobody can look up.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def device_identity(device: Any) -> dict[str, str]:
+    """What an already-open device says it is.
+
+    Called with the handle the capture is running on, so it costs no second
+    open, no second enumeration and no probe subprocess -- the SDRplay API
+    hands a device to one client at a time, and asking twice is how a capture
+    ends up racing itself for its own radio.
+
+    Every call is guarded separately: a driver that exposes none of them
+    leaves this empty, which is the honest description of it, and a capture
+    is never lost to a question about a name. What comes back is only what
+    the device answered.
+    """
+    identity: dict[str, str] = {}
+
+    info: Any = {}
+    try:
+        info = device.getHardwareInfo()
+    except Exception:  # noqa: BLE001 -- an identity is never worth a failed capture
+        info = {}
+    if isinstance(info, dict):
+        for key in (IDENTITY_SERIAL, IDENTITY_LABEL):
+            text = _identity_text(info.get(key))
+            if text is not None:
+                identity[key] = text
+
+    if IDENTITY_LABEL not in identity:
+        # SoapySDR's hardware key is the coarser answer -- the model rather
+        # than this unit -- and it is what SDRplay's driver fills in when the
+        # info mapping carries no label of its own.
+        try:
+            text = _identity_text(device.getHardwareKey())
+        except Exception:  # noqa: BLE001 -- same reason
+            text = None
+        if text is not None:
+            identity[IDENTITY_LABEL] = text
+
+    return identity
+
+
 @dataclass(slots=True)
 class DeviceProbe:
     available: bool
@@ -161,6 +224,10 @@ class SoapyIqDevice:
         self._buffer: np.ndarray | None = None
         self.overflow_count: int = 0
         self.applied_settings: dict[str, Any] = {}
+        # What the radio said it is, filled in once the device is open.
+        # Empty until then, and empty afterwards for a driver that answers
+        # nothing -- never a guess made from what was asked for.
+        self.observed_identity: dict[str, str] = {}
 
     def open(self, settings: DeviceSettings) -> None:
         settings.validate()
@@ -169,6 +236,10 @@ class SoapyIqDevice:
 
         self._channel = settings.channel
         self._device = SoapySDR.Device(device_args_string(settings.driver, settings.serial))
+        # Asked of the handle this capture is about to stream from, at the
+        # one moment the radio is certainly ours and certainly the one being
+        # recorded with.
+        self.observed_identity = device_identity(self._device)
         try:
             self._configure(settings, SOAPY_SDR_RX)
             self._stream = self._device.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [self._channel])
