@@ -597,21 +597,51 @@ In progress:
    for a running job, restarts and can roll back; the `field.env.local`
    parity fix; the receiver serial and label completed in observed hardware
    identity; the PR4 Pi acceptance written up formally. *The two sections
-   below.*
+   below.* **The implementation is merged. A follow-up fix to the switch's
+   recovery is open, and the Pi has not been updated: it is still running
+   PR4.**
+
+   The follow-up is the part an external run against stateful stubs found,
+   and every one of it is about the *service* rather than the file: a
+   rollback that restored the configuration while the process kept running
+   the new one, an interrupt after the stop that left the deployment not
+   recording, a success check that compared the campaign but not the
+   project, and two commands -- `close` and a `use` that is a no-op --
+   deciding from the configuration file about a service that may have read a
+   different one hours ago.
+
+   **Then, and only then, the Pi.** Update the checkout and the installed
+   copy of `fieldctl` -- they are two files, and the installed one is what
+   runs -- and take a short acceptance: declare a campaign, switch to it,
+   close a different one, check that the configuration and the API agree,
+   reboot, and record one short capture. Check what the running service is
+   actually set to, not what the manifest says it should be: frequency,
+   sample rate, duration and hardware profile. `fieldctl` passes the
+   `FIELD_*` values as explicit flags on every start, and an explicit flag
+   outranks a campaign manifest's `defaults.capture`, so a round can run at
+   settings its own manifest does not name. That precedence is not being
+   changed here; the acceptance exists to make it visible. This is the
+   operator's to run, from the Pi.
 
 Planned, in order, and none of it started here:
 
-7. **PR6 -- historical campaign curation.** An explicit assignment command
+7. **Field geolocation validation.** Moved ahead of PR6 and PR7 deliberately.
+   Everything above this line is bookkeeping around measurements; none of it
+   shows that the measurements locate anything. Two steps, in order: first
+   prove that a stop yields usable positive measurements at all -- a real
+   detection on live, continuous P25, at a known gain, with a level the
+   solver can read as distance -- and only then a campaign of 6-10 stops
+   with the geometry the planner asks for, checked against a transmitter
+   whose location is known. Until the first step passes, the second is a
+   day of driving that cannot fail informatively.
+8. **PR6 -- historical campaign curation.** An explicit assignment command
    with a dry run, selecting by run id or by time range. No automatic
    backfill, ever. Derived analysis is **recomputed**, never given a blind
    label -- a run moved into a campaign changes that campaign's reference
    gain and noise floor, so its conclusions have to be drawn again.
-8. **PR7 -- rich analysis UI.** A campaign dashboard, full provenance per run,
+9. **PR7 -- rich analysis UI.** A campaign dashboard, full provenance per run,
    campaign comparison, and detection / geometry / solution-confidence
    measures.
-9. **Field validation.** A new campaign, not the acceptance one: 6-10 stops on
-   live, continuous P25, checking detection, the solver, and accuracy against
-   ground truth.
 10. **Later only.** An analyzer abstraction for P25, VOR, ATIS, DMR and other
     signal types. Not before the above.
 
@@ -726,13 +756,25 @@ escalates is one nobody can predict the blast radius of.
 4. rewrite only `FIELD_PROJECT` and `FIELD_CAMPAIGN` in `field.env.local`,
    keeping every other line, comment and override, and leaving `field.env`
    untouched;
-5. start the service, wait for the API, and verify the project and campaign
-   it reports;
+5. start the service, wait for the API, and verify **both** the project and
+   the campaign it reports -- a campaign id is not an identity, the same id
+   can exist in another project, and a missing field is not an answer of
+   "none";
 6. check the token is not in the service's argv.
 
-Any failure restores the previous file exactly -- or removes it, if there was
-none -- starts the service again, verifies the previous campaign came back,
-and exits non-zero saying what is in force. `use` refuses a closed campaign, a
+Any failure puts back **both halves** of what the switch changed. Which half
+depends on how far it got, and the command tracks that rather than guessing:
+before the stop there is nothing to undo; after it the service has to be
+started again; after the write the file has to be restored first; and after
+the start the running process has to be **stopped** before any of that means
+anything, because `systemctl start` against a unit that is already active
+starts nothing and re-reads nothing -- so a rollback that restored the file
+and called `start` left the old configuration on disk and the new one in the
+radio. The same recovery runs when the command is interrupted: a SIGINT or
+SIGTERM between the stop and the end of the switch brings the service back
+before re-raising the signal, because a Pi left not recording is the one
+outcome worse than a failed switch. It then verifies the previous campaign
+came back and exits non-zero saying what is actually in force. `use` refuses a closed campaign, a
 campaign the project does not declare, and a `field.env.local` that is a
 symbolic link (writing through one would replace the link and leave its target
 untouched) -- all of that before the service is stopped.
@@ -741,6 +783,17 @@ untouched) -- all of that before the service is stopped.
 Switch to another one first; otherwise the service would be left pointed at a
 campaign it may no longer write to and would not find out until its next
 start, which is a restart nobody planned, at the side of a road.
+
+It asks the **service**, not only the file, and does so under the same lock
+that guards the write. A configuration edited without a restart leaves the
+file naming one campaign while the radio still writes another, and the file
+alone then waves through a close of the round being recorded. A service whose
+API cannot be read is not permission to proceed: the command refuses rather
+than falling back to the file. `use` applies the same rule to its own no-op --
+"already the campaign this deployment records into" is a claim about a running
+process, so it is confirmed against the API before it is made, and a
+disagreement is refused with both states named rather than reported as nothing
+to do.
 
 `new` copies the current campaign's band, site, hardware and capture settings
 by default, so the second round of a survey is declared by naming what changed
