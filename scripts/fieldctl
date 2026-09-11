@@ -9,10 +9,18 @@
 # `fieldctl print-command` shows the argv the service actually runs rather
 # than a second copy of it that can drift.
 #
-# Configuration comes from /etc/dmr-field/field.env (override with
-# FIELD_ENV_FILE). A variable already set in the environment wins over the
-# file, so a single setting can be overridden for one invocation without
-# editing anything.
+# Configuration comes from the same two files the systemd unit reads, in the
+# same order: /etc/dmr-field/field.env first, then /etc/dmr-field/field.env.local
+# if it exists. The local file wins, because that is what
+# `EnvironmentFile=` does with a key that appears twice, and a wrapper that
+# reported a different effective configuration from the one the service is
+# running would be worse than no wrapper at all.
+#
+# FIELD_ENV_FILE overrides the base path; the local path is always that path
+# with `.local` appended, so the pair moves together and there is no second
+# knob to keep in step. A variable already set and non-empty in the
+# environment still wins over both files, so a single setting can be
+# overridden for one invocation without editing anything.
 #
 # The shared API token is never passed as an argument, printed, or logged.
 # `fieldctl status` reaches the API through a curl config file precisely so
@@ -21,6 +29,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIELD_ENV_FILE="${FIELD_ENV_FILE:-/etc/dmr-field/field.env}"
+# Derived, never configured separately. The unit hardcodes the pair as
+# `field.env` and `-field.env.local`; deriving one from the other is what
+# keeps `FIELD_ENV_FILE=/dev/null` (how the tests isolate themselves from a
+# real /etc/dmr-field) isolating both files rather than only the first.
+ENV_LOCAL_FILE="${FIELD_ENV_FILE}.local"
 FIELD_UNIT="${FIELD_UNIT:-dmr-field.service}"
 
 log()  { printf '%s\n' "$*" >&2; }
@@ -28,26 +41,82 @@ die()  { printf 'fieldctl: %s\n' "$*" >&2; exit 1; }
 
 # --- configuration ------------------------------------------------------
 
+# What each key's value came from, so `fieldctl campaign current` can say
+# which file an operator has to edit rather than leaving them to guess
+# between two. Keyed by variable name; values are `base`, `local` or
+# `environment`.
+declare -A ENV_VALUES=()
+declare -A ENV_SOURCES=()
+
+parse_env_file() {
+    # One EnvironmentFile=, parsed rather than sourced. systemd's
+    # EnvironmentFile= is not shell: there is no expansion and no command
+    # substitution, and `FIELD_BAND=a b` means exactly the two words.
+    # Sourcing the same file would give it shell semantics that the running
+    # service does not have, so fieldctl would disagree with systemd about
+    # the configuration it is reporting on.
+    #
+    # A later file overwrites an earlier one, including with an empty value:
+    # `FIELD_CAMPAIGN=` in the local file is how systemd is told to clear a
+    # campaign the base file sets, and a reader that treated empty as
+    # "nothing to say" would put the cleared value back.
+    local path="$1" origin="$2" line key value
+    [[ -r "$path" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" == *=* ]] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key//[[:space:]]/}"
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        ENV_VALUES["$key"]="$value"
+        ENV_SOURCES["$key"]="$origin"
+    done < "$path"
+}
+
+env_source() {
+    # Where the value in effect for one key came from, for reporting only.
+    # A key neither file mentions is either a one-off override in this
+    # process's environment or the built-in default; those are different
+    # answers to "which file do I edit", so they are not merged.
+    local key="$1"
+    if [[ -n "${ENV_SOURCES[$key]:-}" ]]; then
+        printf '%s\n' "${ENV_SOURCES[$key]}"
+        return 0
+    fi
+    if [[ -n "${!key:-}" ]]; then
+        printf 'environment\n'
+        return 0
+    fi
+    printf 'default\n'
+}
+
 load_env() {
-    # Parsed rather than sourced. systemd's EnvironmentFile= is not shell:
-    # there is no expansion and no command substitution, and `FIELD_BAND=a b`
-    # means exactly the two words. Sourcing the same file would give it shell
-    # semantics that the running service does not have, so fieldctl would
-    # disagree with systemd about the configuration it is reporting on.
-    local line key value
-    if [[ -r "$FIELD_ENV_FILE" ]]; then
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
-            [[ "$line" == *=* ]] || continue
-            key="${line%%=*}"
-            value="${line#*=}"
-            key="${key//[[:space:]]/}"
-            [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-            # Already set and non-empty in the environment: leave it alone.
-            [[ -n "${!key:-}" ]] && continue
-            printf -v "$key" '%s' "$value"
+    # The base file, then the local one -- the same two files in the same
+    # order as the unit's two EnvironmentFile= lines, so every command here
+    # reports on the configuration the service actually runs with. The local
+    # file is optional exactly as the unit's `-` prefix makes it.
+    local key
+    ENV_VALUES=()
+    ENV_SOURCES=()
+    parse_env_file "$FIELD_ENV_FILE" base
+    parse_env_file "$ENV_LOCAL_FILE" local
+
+    # A variable already set and non-empty in the environment beats both
+    # files. That is this wrapper's own convention for a one-off override,
+    # and it is also what makes `fieldctl exec` agree with systemd: by then
+    # systemd has already merged the same two files into the environment
+    # this process was started with.
+    if (( ${#ENV_VALUES[@]} )); then
+        for key in "${!ENV_VALUES[@]}"; do
+            if [[ -n "${!key:-}" ]]; then
+                ENV_SOURCES["$key"]=environment
+                ENV_VALUES["$key"]="${!key}"
+                continue
+            fi
+            printf -v "$key" '%s' "${ENV_VALUES[$key]}"
             export "${key?}"
-        done < "$FIELD_ENV_FILE"
+        done
     fi
 
     : "${FIELD_SURVEYOR_BIN:=/opt/dmr-field/venv/bin/dmr-surveyor}"
@@ -308,18 +377,35 @@ cmd_status() {
         printf 'cert     MISSING at %s\n' "$FIELD_TLS_CERT"
     fi
 
+    printf 'env      %s\n' "$FIELD_ENV_FILE"
+    if [[ -r "$ENV_LOCAL_FILE" ]]; then
+        printf 'env      %s (overrides the base file, as the unit reads it)\n' "$ENV_LOCAL_FILE"
+    else
+        printf 'env      %s absent (optional, exactly as the unit treats it)\n' "$ENV_LOCAL_FILE"
+    fi
     printf 'site     %s\n' "${FIELD_SITE:-UNSET -- the service cannot start}"
     printf 'band     %s\n' "$FIELD_BAND"
-    # Printed whether set or not. A project binds the service to one database
-    # and refuses every other, and a campaign decides what each stop is
-    # recorded as; both are invisible from the outside otherwise.
-    printf 'project  %s\n' "${FIELD_PROJECT:-none -- not a project deployment}"
-    printf 'campaign %s\n' "${FIELD_CAMPAIGN:-none -- stops recorded here stay unassigned}"
+    # Printed whether set or not, and with the file each came from. A project
+    # binds the service to one database and refuses every other, and a
+    # campaign decides what each stop is recorded as; both are invisible from
+    # the outside otherwise, and with two environment files "where is this set"
+    # is its own question.
+    printf 'project  %s [%s]\n' \
+        "${FIELD_PROJECT:-none -- not a project deployment}" "$(env_source FIELD_PROJECT)"
+    printf 'campaign %s [%s]\n' \
+        "${FIELD_CAMPAIGN:-none -- stops recorded here stay unassigned}" \
+        "$(env_source FIELD_CAMPAIGN)"
     if [[ -n "$FIELD_CAMPAIGN" && -z "$FIELD_PROJECT" ]]; then
-        # `web serve` only reads --campaign alongside --project, so this
-        # combination silently does nothing. Said here rather than
-        # discovered after a day of stops came back unassigned.
-        printf 'WARNING  FIELD_CAMPAIGN is set but FIELD_PROJECT is not; stops stay unassigned\n'
+        # Stops ARE tagged: `web serve` passes --campaign whether or not
+        # --project is given, and the id reaches survey_runs.campaign_id
+        # either way. What a campaign without a project does not get is the
+        # manifest -- the band, site, hardware and capture settings the round
+        # is meant to be pinned to -- and every `fieldctl campaign` command
+        # needs that manifest, so none of them will work here.
+        printf 'WARNING  FIELD_CAMPAIGN is set but FIELD_PROJECT is not; stops are still tagged\n'
+        printf '         %s, but no campaign manifest pins this round and `fieldctl campaign`\n' \
+            "$FIELD_CAMPAIGN"
+        printf '         cannot manage it without a project\n'
     fi
     # Printed because these decide whether a stop is recordable at all on
     # this storage, and because the values in effect are otherwise invisible
