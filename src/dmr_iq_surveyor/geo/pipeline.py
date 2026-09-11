@@ -47,6 +47,7 @@ from dmr_iq_surveyor.geo.store import (
     fetch_all_measurements,
     fetch_site_measurements,
     latest_solutions,
+    latest_solutions_by_campaign,
     replace_run_measurements,
     store_plan,
     store_solution,
@@ -56,7 +57,11 @@ from dmr_iq_surveyor.reference.p25_sites import load_p25_site_csv
 from dmr_iq_surveyor.reference.store import import_snapshot, list_sites
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
 from dmr_iq_surveyor.survey.provenance import Reading, receiver_settings
-from dmr_iq_surveyor.survey.scope import WHOLE_DATABASE, CampaignScope
+from dmr_iq_surveyor.survey.scope import (
+    WHOLE_DATABASE,
+    CampaignScope,
+    stored_analysis_label,
+)
 
 METHOD = "bayesian_grid_log_distance"
 
@@ -209,6 +214,11 @@ def materialise_measurements(
         "summary": summarise(total),
         "settings": resolved.to_dict(),
         "campaign_id": scope.campaign_id,
+        # Says which of the three scopes ran, because `campaign_id: null`
+        # alone cannot tell "every run in the file" from "only the runs that
+        # declare no campaign" -- and those rebuild against different
+        # reference gains.
+        "scope": scope.label,
         "reference_gain": reference_gain,
         "reference_gain_sources": gain_sources,
         "gain_drift_runs": drifted,
@@ -703,9 +713,15 @@ def solve_all_sites(
     # a bare timestamp makes them collide within the same second -- the second
     # would replace the first's plan outright, since `geo_plans.solve_batch_id`
     # is the primary key.
+    #
+    # Asked for before any work starts, not after: a solve scoped to the
+    # unassigned runs has no honest boundary to record, and refusing here
+    # costs a second rather than minutes of grid search whose result would
+    # then have nowhere truthful to go.
+    stored_campaign_id = scope.stored_campaign_id()
     batch = solve_batch_id or "_".join(
         part
-        for part in (datetime.now(UTC).strftime("%Y%m%d_%H%M%S"), scope.campaign_id)
+        for part in (datetime.now(UTC).strftime("%Y%m%d_%H%M%S"), stored_campaign_id)
         if part
     )
     # Measurements built before their run's exclusion changed are rebuilt
@@ -800,7 +816,7 @@ def solve_all_sites(
             # the result back can tell a campaign's own conclusion from one
             # drawn across every round in the file. NULL for an unscoped
             # solve, which is what it is: a whole-database answer.
-            row["campaign_id"] = scope.campaign_id
+            row["campaign_id"] = stored_campaign_id
             store_solution(connection, solve_batch_id=batch, row=row)
 
         plan = _build_plan(
@@ -815,7 +831,7 @@ def solve_all_sites(
             solve_batch_id=batch,
             plan=plan,
             geojson=plan_to_geojson(plan),
-            campaign_id=scope.campaign_id,
+            campaign_id=stored_campaign_id,
         )
         measurement_summary = summarise(fetch_all_measurements(connection, scope=scope))
     finally:
@@ -826,7 +842,7 @@ def solve_all_sites(
         "tool": "dmr-iq-surveyor",
         "tool_version": __version__,
         "solve_batch_id": batch,
-        "campaign_id": scope.campaign_id,
+        "campaign_id": stored_campaign_id,
         "method": METHOD,
         "source_model": SOURCE_MODEL,
         "geolocation_maturity": GEOLOCATION_MATURITY,
@@ -873,17 +889,30 @@ def solve_all_sites(
 
 
 def build_map_geojson(
-    *, database_path: str | Path | None = None, scope: CampaignScope = WHOLE_DATABASE
+    *,
+    database_path: str | Path | None = None,
+    scope: CampaignScope = WHOLE_DATABASE,
+    group_by_campaign: bool = False,
 ) -> dict[str, Any]:
     """One FeatureCollection carrying everything the map needs.
 
     Measurement points, solved modes and credible regions travel together so
     a region can never be displayed without the evidence that produced it.
+
+    `group_by_campaign` draws every round's own latest answer rather than one
+    winner per site. It is for an overview of a file holding several rounds,
+    where "most recently inserted" silently hides the rounds that found
+    something behind the one that did not. Nothing is combined or re-solved
+    either way -- these are stored rows.
     """
     connection = connect_geo_database(_database(database_path))
     try:
         measurements = fetch_all_measurements(connection, scope=scope)
-        solutions = latest_solutions(connection, scope=scope)
+        solutions = (
+            latest_solutions_by_campaign(connection)
+            if group_by_campaign
+            else latest_solutions(connection, scope=scope)
+        )
     finally:
         connection.close()
 
@@ -916,8 +945,17 @@ def build_map_geojson(
         )
 
     for solution in solutions:
+        # Which boundary drew this, on the feature itself. A region and a mode
+        # outlive the session that produced them and get looked at beside
+        # other rounds' answers, so "whose is this" has to travel with them
+        # rather than being inferred from whatever view happens to be open.
+        provenance = {
+            "campaign_id": solution["campaign_id"],
+            "analysis_label": stored_analysis_label(solution["campaign_id"]),
+        }
         geojson = json.loads(solution["geojson"] or "{}")
         for feature in geojson.get("features", []):
+            feature.setdefault("properties", {}).update(provenance)
             features.append(feature)
         if solution["mode_latitude"] is not None and solution["mode_longitude"] is not None:
             features.append(
@@ -934,6 +972,7 @@ def build_map_geojson(
                         "area_km2_90": solution["area_km2_90"],
                         "path_loss_exponent": solution["path_loss_exponent"],
                         "azimuth_span_deg": solution["azimuth_span_deg"],
+                        **provenance,
                         "warnings": json.loads(solution["warnings_json"] or "[]"),
                     },
                     "geometry": {
@@ -949,15 +988,28 @@ def build_map_geojson(
 
 
 def site_overview(
-    *, database_path: str | Path | None = None, scope: CampaignScope = WHOLE_DATABASE
+    *,
+    database_path: str | Path | None = None,
+    scope: CampaignScope = WHOLE_DATABASE,
+    group_by_campaign: bool = False,
 ) -> list[dict[str, Any]]:
-    """Registry sites joined with their measurement counts and latest status."""
+    """Registry sites joined with their measurement counts and latest status.
+
+    `group_by_campaign` adds a `solutions` list to each site -- one entry per
+    round that solved it, each naming the boundary it was computed under. The
+    top-level status fields are unchanged, so every existing caller reads
+    exactly what it read before.
+    """
     connection = connect_geo_database(_database(database_path))
     try:
         sites = list_sites(connection)
         solutions = {
             row["p25_site_id"]: row for row in latest_solutions(connection, scope=scope)
         }
+        per_campaign: dict[int, list[dict[str, Any]]] = {}
+        if group_by_campaign:
+            for row in latest_solutions_by_campaign(connection):
+                per_campaign.setdefault(int(row["p25_site_id"]), []).append(row)
         # The site registry itself is campaign-independent -- a P25 site
         # exists whether or not this round drove past it -- so the sites are
         # listed unscoped and only the evidence counted against them is
@@ -1012,6 +1064,37 @@ def site_overview(
                 "area_km2_50": (solution or {}).get("area_km2_50"),
                 "area_km2_90": (solution or {}).get("area_km2_90"),
                 "solved_at": (solution or {}).get("solved_at"),
+                # One entry per round that solved this site, when an overview
+                # asked for them. Empty otherwise, so a reader can tell "not
+                # grouped" from "grouped, and only one round solved it".
+                "solutions": [
+                    {
+                        "campaign_id": row["campaign_id"],
+                        "analysis_label": stored_analysis_label(row["campaign_id"]),
+                        "status": row["status"],
+                        "status_reason": row["status_reason"],
+                        "detection_count": row["detection_count"],
+                        "non_detection_count": row["non_detection_count"],
+                        "mode_latitude": row["mode_latitude"],
+                        "mode_longitude": row["mode_longitude"],
+                        "area_km2_50": row["area_km2_50"],
+                        "area_km2_90": row["area_km2_90"],
+                        "solved_at": row["solved_at"],
+                        "solve_batch_id": row["solve_batch_id"],
+                    }
+                    for row in per_campaign.get(site_id, ())
+                ],
+                # Which round drew this conclusion. `None` is a solve that
+                # read the whole file, not a solve of the unassigned runs --
+                # a reader showing several rounds at once needs to be able to
+                # say which one it is looking at rather than implying they
+                # are one answer.
+                "solution_campaign_id": (solution or {}).get("campaign_id"),
+                "solution_analysis_label": (
+                    stored_analysis_label((solution or {}).get("campaign_id"))
+                    if solution is not None
+                    else None
+                ),
                 "warnings": json.loads((solution or {}).get("warnings_json") or "[]"),
             }
         )

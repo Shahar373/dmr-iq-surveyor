@@ -45,17 +45,65 @@ html, body {
   top: 0; left: 0; right: 0;
   z-index: 500;
   display: flex;
-  gap: 8px;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
+  gap: 6px;
   padding: max(8px, env(safe-area-inset-top)) 12px 8px;
   background: color-mix(in srgb, var(--panel) 88%, transparent);
   backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--line);
 }
-.brand { font-weight: 650; letter-spacing: -0.01em; }
+.topline {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+}
+/* The topbar carries two rows now, so the brand gets a line of its own
+ * rather than being squeezed into three by the pills beside it. */
+.brand { font-weight: 650; letter-spacing: -0.01em; flex: none; white-space: nowrap; }
 
-.pills { display: flex; gap: 6px; align-items: center; }
+/* The scope row wraps before it truncates: on a narrow phone a campaign id
+ * the operator cannot read is worse than a topbar one line taller. */
+#scopebar { flex-wrap: wrap; row-gap: 6px; }
+#scopebar .pills { min-width: 0; justify-content: flex-start; }
+.scope-select {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  max-width: 100%;
+}
+/* Not-current is the exceptional state, so it is coloured like one -- the
+ * same warn tint the notices use, not a fourth colour to learn. */
+.scope-select.historical {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 50%, var(--line));
+  background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+}
+#scope-notice { flex: none; margin: 0 14px 10px; }
+.solution-row {
+  border-left: 2px solid var(--line);
+  padding: 4px 0 4px 9px;
+  margin: 6px 0;
+}
+.solution-row .key { font-size: 13px; font-weight: 600; margin-right: 6px; }
+.scope-line { margin: 0 0 6px; }
+.scope-line:last-child { margin-bottom: 0; }
+.group-head {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--muted);
+  text-transform: none;
+  margin: 12px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.pills { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; row-gap: 6px; justify-content: flex-end; }
 .pill {
   font-size: 12px;
   padding: 3px 9px;

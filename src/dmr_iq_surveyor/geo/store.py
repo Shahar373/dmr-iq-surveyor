@@ -173,20 +173,29 @@ def latest_plan(
 ) -> dict[str, Any] | None:
     """The most recent plan, by insertion order rather than by clock.
 
-    Scoped, this is the most recent plan *this campaign* produced. A plan
-    written by an unscoped solve carries no campaign and is not offered as
-    one campaign's next stop, because it was computed from every run in the
-    file -- including rounds this one is meant to be separate from.
+    Scoped to a campaign, this is the most recent plan *that campaign*
+    produced. A plan written by an unscoped solve carries no campaign and is
+    not offered as one campaign's next stop, because it was computed from
+    every run in the file -- including rounds this one is meant to be
+    separate from.
+
+    The unassigned scope is the one case where a `NULL` plan *is* returned,
+    and it is not the same claim. `geo_plans.campaign_id IS NULL` means "this
+    solve read the whole database", not "this solve read the unassigned
+    runs", so what comes back is the answer that was standing before
+    campaigns existed -- which is exactly what a reader of the unassigned
+    runs is asking for, and exactly what it must be told it is getting. The
+    row carries `campaign_id`, and `FieldService.plan()` passes it on as
+    `unscoped_solve` so the page can say so rather than implying the plan was
+    drawn from the stops beside it.
     """
-    if scope.is_whole_database:
-        row = connection.execute(
-            "SELECT * FROM geo_plans ORDER BY rowid DESC LIMIT 1"
-        ).fetchone()
-    else:
-        row = connection.execute(
-            "SELECT * FROM geo_plans WHERE campaign_id = ? ORDER BY rowid DESC LIMIT 1",
-            (scope.campaign_id,),
-        ).fetchone()
+    predicate, parameters = scope.where("geo_plans")
+    row = connection.execute(
+        "SELECT * FROM geo_plans "
+        + (f"WHERE {predicate} " if predicate else "")
+        + "ORDER BY rowid DESC LIMIT 1",
+        parameters,
+    ).fetchone()
     return dict(row) if row is not None else None
 
 
@@ -426,14 +435,10 @@ def latest_solutions(
     # narrowed. Narrowing only the outer one would rank this campaign's
     # solutions against another campaign's and then find none of them
     # current, reporting a site as unsolved that this campaign had solved.
-    if scope.is_whole_database:
-        condition, parameters = "", ()
-    else:
-        condition, parameters = " AND g.campaign_id = ?", (scope.campaign_id,)
-    inner = (
-        "" if scope.is_whole_database else " AND inner_solution.campaign_id = ?"
-    )
-    inner_parameters = () if scope.is_whole_database else (scope.campaign_id,)
+    outer_predicate, parameters = scope.where("g")
+    condition = f" AND {outer_predicate}" if outer_predicate else ""
+    inner_predicate, inner_parameters = scope.where("inner_solution")
+    inner = f" AND {inner_predicate}" if inner_predicate else ""
     rows = connection.execute(
         f"""
         SELECT g.*, s.site_key, s.rfss, s.site, s.observation_status
@@ -451,16 +456,49 @@ def latest_solutions(
     return [dict(row) for row in rows]
 
 
+def latest_solutions_by_campaign(
+    connection: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Every campaign's own latest solution for every site it solved.
+
+    `latest_solutions` answers "what is the current conclusion", and unscoped
+    it has to pick one row per site -- the most recently inserted. That is the
+    right answer for a file with one round in it, and the wrong shape for an
+    overview of several: the newest round wins every site, and a round whose
+    solve found nothing hides the rounds that found something. On a real file
+    that meant the historical 868 analyses vanished from the overview behind a
+    later campaign's `insufficient_evidence`.
+
+    So this returns one row per (site, campaign) instead. Nothing is combined,
+    averaged or re-solved -- these are the stored rows, grouped by the boundary
+    each was computed under, which is the only honest way to show rounds that
+    were never meant to be compared.
+    """
+    rows = connection.execute(
+        """
+        SELECT g.*, s.site_key, s.rfss, s.site, s.observation_status
+        FROM geo_solutions g
+        JOIN p25_sites s ON s.p25_site_id = g.p25_site_id
+        WHERE g.geo_solution_id = (
+            SELECT MAX(inner_solution.geo_solution_id)
+            FROM geo_solutions inner_solution
+            WHERE inner_solution.p25_site_id = g.p25_site_id
+              AND inner_solution.campaign_id IS g.campaign_id
+        )
+        ORDER BY s.rfss, s.site, g.campaign_id IS NOT NULL, g.campaign_id
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def solution_history(
     connection: sqlite3.Connection,
     p25_site_id: int,
     *,
     scope: CampaignScope = WHOLE_DATABASE,
 ) -> list[dict[str, Any]]:
-    if scope.is_whole_database:
-        condition, parameters = "", ()
-    else:
-        condition, parameters = " AND campaign_id = ?", (scope.campaign_id,)
+    predicate, parameters = scope.where("geo_solutions")
+    condition = f" AND {predicate}" if predicate else ""
     return [
         dict(row)
         for row in connection.execute(
@@ -486,6 +524,7 @@ __all__ = [
     "fetch_all_measurements",
     "fetch_site_measurements",
     "latest_solutions",
+    "latest_solutions_by_campaign",
     "replace_run_measurements",
     "run_exclusion",
     "solution_history",

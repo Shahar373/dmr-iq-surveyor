@@ -10,10 +10,25 @@
 <div id="map"></div>
 
 <header id="topbar">
-  <div class="brand">P25 site survey</div>
-  <div class="pills">
-    <div id="disk" class="pill">disk…</div>
-    <div id="connection" class="pill">connecting…</div>
+  <div class="topline">
+    <div class="brand">P25 site survey</div>
+    <div class="pills">
+      <div id="disk" class="pill">disk…</div>
+      <div id="connection" class="pill">connecting…</div>
+    </div>
+  </div>
+  <!-- Where the work is going, and what is on screen, side by side and
+       always visible. Those were one value until PR4, and an operator could
+       not tell a campaign with no stops yet from an empty database. -->
+  <div class="topline" id="scopebar">
+    <div class="pills">
+      <div id="scope-project" class="pill" hidden>project…</div>
+      <div id="scope-campaign" class="pill">campaign…</div>
+      <div id="scope-hardware" class="pill" hidden>receiver…</div>
+    </div>
+    <select id="view-scope" class="scope-select" aria-label="Which rounds to show">
+      <option value="current">Showing: current campaign</option>
+    </select>
   </div>
 </header>
 
@@ -27,6 +42,9 @@
 
 <section id="sheet">
   <div class="grabber" id="grabber"></div>
+  <!-- Outside the panels on purpose: a read-only view has to say so on
+       whichever tab the operator happens to be on. -->
+  <div id="scope-notice" class="notice" hidden></div>
 
   <div class="panel" data-panel="record">
     <div class="row">

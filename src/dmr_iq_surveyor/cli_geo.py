@@ -80,9 +80,11 @@ def _scope(campaign: str | None) -> CampaignScope:
 
 
 def _scope_note(scope: CampaignScope) -> str:
+    # `label`, not `campaign_id`: a scope can also be the unassigned runs,
+    # whose campaign_id is None and would print as "(campaign None)".
     if scope.is_whole_database:
         return ""
-    return f" (campaign {scope.campaign_id})"
+    return f" ({scope.label})"
 
 
 @geo_app.command("import-sites")
@@ -443,7 +445,7 @@ def geo_plan(database: DatabaseOption = None, campaign: CampaignOption = None) -
     if stored is None:
         if not scope.is_whole_database:
             console.print(
-                f"No plan for campaign {scope.campaign_id}. Run "
+                f"No plan for {scope.label}. Run "
                 f"`dmr-surveyor geo solve --campaign {scope.campaign_id}` first; a plan from "
                 "an unscoped solve is not offered here, because it was computed from every "
                 "run in the database."

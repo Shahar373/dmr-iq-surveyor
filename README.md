@@ -739,6 +739,10 @@ Without `--project` nothing binds, nothing is opened at startup, and every exist
 
 A campaign is an analysis boundary, not only a tag: `--campaign` on the `geo` commands and the digest computes every derived value -- reference gain, noise floor, common-mode, solutions, plan, exports -- from that round's runs alone, and never sweeps in a run recorded before campaigns existed.
 
+In the field app the campaign says *where new evidence is written*, and a separate **view scope** says *what is on screen*. The status bar names both; a selector switches between the current campaign, `Legacy / unassigned` (the rounds recorded before campaigns existed), one other campaign, and an `All campaigns` overview grouped by round. Only the current campaign is writable -- recording, solving and editing stops are refused from a historical view, with a message naming where new work actually goes -- and the choice is never remembered, so a reload is back on the campaign being recorded. Nothing is moved, relabelled or backfilled; a view is a question asked of `campaign_id`, never an edit to it.
+
+Legacy brings back the transmitter work, not just the run list: modes, credible regions, site verdicts and the plan the historical analysis produced, each marked `Historical whole-database analysis` because a conclusion stored without a campaign was computed from every round in the file at the time. `All campaigns` lists every round that solved a site separately and labelled, and offers no next-stop plan, since a plan only means anything inside one round.
+
 `config/hardware/*.yaml` declares the receiver a round is run with; a campaign names one under `defaults.hardware`, and `--hardware` names one directly on `survey run` / `survey capture`. It outranks the site profile for gain, because gain belongs to the radio rather than to the place -- but it is still a declaration, and only the radio's own read-back is ever recorded as `applied`.
 
 See [`docs/projects-and-campaigns.md`](docs/projects-and-campaigns.md) for the manifest reference, the adoption order of operations, the campaign-scoping rules, the hardware profile and the full precedence tables.

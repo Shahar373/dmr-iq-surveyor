@@ -30,6 +30,12 @@ from dmr_iq_surveyor.capture.probe import ProbeRunner
 from dmr_iq_surveyor.web.jobs import Job
 from dmr_iq_surveyor.web.service import FieldService, FieldSettings, PositionStale
 from dmr_iq_surveyor.web.tls import HANDSHAKE_TIMEOUT_SECONDS, Certificate, build_context
+from dmr_iq_surveyor.web.viewscope import (
+    CURRENT_VIEW,
+    ReadOnlyViewError,
+    ViewScope,
+    ViewScopeError,
+)
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 
@@ -178,27 +184,34 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_error_json(401, "missing or invalid token")
             return
         try:
+            view = self._view(query)
+        except ViewScopeError as exc:
+            self._send_error_json(400, str(exc))
+            return
+        try:
             if path == "/api/state":
-                self._send_json(self.service.state())
+                self._send_json(self.service.state(view))
             elif path == "/api/position":
                 self._send_json(self.service.get_position())
             elif path == "/api/sites":
-                self._send_json({"sites": self.service.sites_overview()})
+                self._send_json({"sites": self.service.sites_overview(view)})
             elif path == "/api/geojson":
-                self._send_json(self.service.geojson())
+                self._send_json(self.service.geojson(view))
             elif path == "/api/disk":
                 self._send_json(self.service.disk())
             elif path == "/api/plan":
-                self._send_json(self.service.plan())
+                self._send_json(self.service.plan(view))
             elif path == "/api/stops":
-                self._send_json({"stops": self.service.stops()})
+                self._send_json({"stops": self.service.stops(view)})
             elif path == "/api/live":
                 self._send_json(self.service.live_status())
             elif path == "/api/export":
-                self._send_export((query.get("format") or ["geojson"])[0])
+                self._send_export((query.get("format") or ["geojson"])[0], view)
             elif path.startswith("/api/history/"):
                 self._send_json(
-                    self.service.site_history(unquote(path.split("/api/history/", 1)[1]))
+                    self.service.site_history(
+                        unquote(path.split("/api/history/", 1)[1]), view
+                    )
                 )
             elif path == "/api/jobs":
                 self._send_json({"jobs": self.service.jobs.list()})
@@ -227,21 +240,27 @@ class _Handler(BaseHTTPRequestHandler):
             return
         path = parsed.path
         try:
+            view = self._view(query)
+        except ViewScopeError as exc:
+            self._discard_body()
+            self._send_error_json(400, str(exc))
+            return
+        try:
             payload = self._read_json()
             if path == "/api/position":
-                self._send_json(self.service.set_position(payload))
+                self._send_json(self.service.set_position(payload, view))
             elif path == "/api/capture":
-                self._start(lambda: self.service.start_capture(payload))
+                self._start(lambda: self.service.start_capture(payload, view))
             elif path == "/api/analyse":
-                self._start(lambda: self.service.start_analysis(payload))
+                self._start(lambda: self.service.start_analysis(payload, view))
             elif path == "/api/solve":
-                self._start(lambda: self.service.start_solve(payload))
+                self._start(lambda: self.service.start_solve(payload, view))
             elif path == "/api/live/start":
-                self._start(lambda: self.service.start_live(payload))
+                self._start(lambda: self.service.start_live(payload, view))
             elif path == "/api/live/solve":
-                self._send_json(self.service.request_live_solve())
+                self._send_json(self.service.request_live_solve(view))
             elif path == "/api/live/hold":
-                self._send_json(self.service.request_live_hold(payload))
+                self._send_json(self.service.request_live_hold(payload, view))
             elif path == "/api/live/position":
                 # Posted about once a second for a whole drive, so it stays
                 # the cheapest handler here: validate, store, answer.
@@ -252,21 +271,26 @@ class _Handler(BaseHTTPRequestHandler):
                 # SDRplay service is wedged still gets a reply.
                 self._send_json(self.service.rescan_device())
             elif path == "/api/recordings/purge":
-                self._send_json(self.service.purge())
+                self._send_json(self.service.purge(view))
             elif path.startswith("/api/stops/") and path.endswith("/exclude"):
                 self._send_json(
                     self.service.set_stop_excluded(
                         unquote(path.split("/")[3]),
                         excluded=True,
                         reason=str(payload.get("reason") or ""),
+                        view=view,
                     )
                 )
             elif path.startswith("/api/stops/") and path.endswith("/include"):
                 self._send_json(
-                    self.service.set_stop_excluded(unquote(path.split("/")[3]), excluded=False)
+                    self.service.set_stop_excluded(
+                        unquote(path.split("/")[3]), excluded=False, view=view
+                    )
                 )
             elif path.startswith("/api/stops/") and path.endswith("/delete"):
-                self._send_json(self.service.delete_stop(unquote(path.split("/")[3])))
+                self._send_json(
+                    self.service.delete_stop(unquote(path.split("/")[3]), view)
+                )
             elif path.startswith("/api/jobs/") and path.endswith("/cancel"):
                 job = self.service.jobs.get(path.split("/")[3])
                 if job is None:
@@ -276,6 +300,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(job.snapshot())
             else:
                 self._send_error_json(404, f"no such endpoint: {path}")
+        except ReadOnlyViewError as exc:
+            # 409, not 400: the request is well formed and the operator may
+            # make it -- just not from the view they are on. Caught before
+            # ValueError below only because it is a RuntimeError; listed
+            # first for readers, not for Python.
+            self._send_error_json(409, str(exc))
         except ValueError as exc:
             self._send_error_json(400, str(exc))
         except (BrokenPipeError, ConnectionResetError):
@@ -284,6 +314,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_error_json(500, f"{type(exc).__name__}: {exc}")
 
     # -- handlers ----------------------------------------------------------
+
+    def _view(self, query: dict[str, list[str]]) -> ViewScope:
+        """Which view this one request is made from.
+
+        Per request and nothing else: no cookie, no session, no server-side
+        "current selection". A request that says nothing is on the current
+        campaign, so every client that predates this parameter -- and every
+        reload -- lands back on the round being recorded rather than on
+        whatever was last browsed.
+        """
+        return self.service.resolve_view((query.get("scope") or [""])[0])
 
     def _start(self, factory: Callable[[], Job]) -> None:
         try:
@@ -303,8 +344,8 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(job.snapshot(), status=202)
 
-    def _send_export(self, export_format: str) -> None:
-        body_text, content_type, filename = self.service.export(export_format)
+    def _send_export(self, export_format: str, view: ViewScope = CURRENT_VIEW) -> None:
+        body_text, content_type, filename = self.service.export(export_format, view)
         body = body_text.encode("utf-8")
         self._response_started = True
         self.send_response(200)
