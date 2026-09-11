@@ -163,6 +163,10 @@ def survey_run(
             ),
         ),
     ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", help=PROJECT_CHECK_HELP),
+    ] = None,
     hardware: Annotated[
         str | None,
         typer.Option(
@@ -212,6 +216,12 @@ def survey_run(
     ] = False,
 ) -> None:
     """Discover RF observations in a wideband recording and store them."""
+    # Before the recording is read. This command writes a `survey_runs` row
+    # under the campaign exactly as the two acquisition commands do, and it
+    # is how a day's recordings get filed afterwards -- which is precisely
+    # when the round may already have been closed.
+    _check_campaign_against_project(project, campaign)
+
     if (latitude is None) != (longitude is None):
         console.print("[bold red]--latitude and --longitude must be given together[/bold red]")
         raise typer.Exit(code=1)

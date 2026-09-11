@@ -106,7 +106,17 @@ def _load_mapping(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(path)
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        # A manifest that exists and cannot be read is a refusal with a
+        # reason, not an uncaught traceback out of `web serve`'s startup.
+        # Permissions are the way this happens: a campaign closed as root
+        # used to leave the file unreadable by the service user.
+        raise ProjectError(f"{path} could not be read: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ProjectError(f"{path} is not valid UTF-8: {exc}") from exc
+    try:
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise ProjectError(f"{path} is not valid YAML: {exc}") from exc
     if raw is None:
@@ -382,7 +392,14 @@ def set_campaign_status_text(text: str, status: str) -> str:
     if status not in CAMPAIGN_STATUSES:
         raise ProjectError(f"status {status!r} is not one of {list(CAMPAIGN_STATUSES)}")
 
-    lines = text.splitlines()
+    # `str.splitlines()` also breaks on \v, \f, \x1c-\x1e, \x85, \u2028
+    # and \u2029; rejoining with "\n" rewrote any label containing one of
+    # them, which is not "leaves every other byte alone". CRLF survives for
+    # the same reason: the \r stays on the line it belongs to.
+    lines = text.split("\n")
+    trailing_newline = bool(lines) and lines[-1] == ""
+    if trailing_newline:
+        lines.pop()
     replacement = f"status: {status}"
     for index, line in enumerate(lines):
         if _STATUS_LINE_RE.match(line):
@@ -397,7 +414,7 @@ def set_campaign_status_text(text: str, status: str) -> str:
             len(lines),
         )
         lines.insert(insert_at, replacement)
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + ("\n" if trailing_newline or lines else "")
 
 
 def validate_project_text(text: str, source: str | Path) -> ProjectManifest:

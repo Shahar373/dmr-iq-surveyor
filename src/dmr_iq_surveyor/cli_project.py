@@ -14,6 +14,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import quote
 
 import typer
 import yaml
@@ -584,7 +585,13 @@ def _runs_per_campaign(database: Path) -> dict[str | None, int]:
     if not database.is_file():
         return {}
     try:
-        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        # Quoted, because the path is going into a URI. A `#` in it starts a
+        # fragment: it truncated both the rest of the path AND `?mode=ro`, so
+        # a command documented as writing nothing opened a different file
+        # read-WRITE and created it. `%` was mishandled the same way.
+        connection = sqlite3.connect(
+            f"file:{quote(str(database))}?mode=ro", uri=True
+        )
     except sqlite3.Error:
         return {}
     try:
@@ -918,6 +925,17 @@ def campaign_new(
     # inside it have to agree byte for byte. Built from the validated id
     # rather than from what was typed.
     destination = manifest.campaign_path(resolved_id)
+    # The leaf is checked below; the DIRECTORY is checked here, because
+    # `write_manifest_atomically` resolves the path it is given and a
+    # symlinked `campaigns/` therefore sends the bytes somewhere else while
+    # every message still names the path inside the project.
+    if manifest.campaign_dir.is_symlink():
+        _fail(
+            f"{manifest.campaign_dir} is a symbolic link. A manifest written through it "
+            "would land outside the project while every message here named a path inside "
+            "it, so this is refused. Point the project at the real directory."
+        )
+        return
     text = render_campaign_manifest(
         campaign_id=resolved_id,
         project_id=manifest.project_id,

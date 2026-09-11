@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -430,15 +431,38 @@ def write_claim(
         raise
 
 
+# A manifest is configuration, not a secret -- the only secret in this
+# deployment is the API token, and that is named by path, never written into a
+# file like this. It has to be readable by whoever runs the service, which on
+# the Pi is not the root that `sudo fieldctl campaign …` writes it as.
+MANIFEST_MODE = 0o644
+
+
 def write_manifest_atomically(path: str | Path, text: str) -> Path:
     """Write a manifest so a reader never sees a half-written one.
 
     A temporary sibling, flushed and fsynced, then `os.replace`, which is
     atomic within a filesystem. A failure anywhere leaves the original exactly
     as it was and removes the temporary.
+
+    The replacement carries the original's mode and owner, and a new file gets
+    `MANIFEST_MODE`. `mkstemp` creates at 0600 owned by whoever is running,
+    and `os.replace` carries that onto the destination: a campaign closed with
+    `sudo` therefore became root-only, the service user could no longer read
+    the manifest it resolves at startup, and the next restart failed on a file
+    that had been readable a moment earlier.
     """
     destination = Path(path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
+    mode = MANIFEST_MODE
+    owner: tuple[int, int] | None = None
+    try:
+        existing = destination.stat()
+    except OSError:
+        pass
+    else:
+        mode = stat.S_IMODE(existing.st_mode)
+        owner = (existing.st_uid, existing.st_gid)
     handle, temporary = tempfile.mkstemp(
         dir=destination.parent, prefix=f"{destination.name}.", suffix=".tmp"
     )
@@ -447,6 +471,14 @@ def write_manifest_atomically(path: str | Path, text: str) -> Path:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        if owner is not None:
+            try:
+                os.chown(temporary, owner[0], owner[1])
+            except PermissionError:
+                # Not root, and not the owner: the mode still carries, which
+                # is what decides whether the service can read it.
+                pass
         os.replace(temporary, destination)
     except BaseException:
         Path(temporary).unlink(missing_ok=True)

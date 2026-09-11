@@ -48,6 +48,11 @@ from dmr_iq_surveyor.geo.store import (
     solution_history,
 )
 from dmr_iq_surveyor.live.session import LiveSession, LiveSettings, Position
+from dmr_iq_surveyor.project.manifest import (
+    CAMPAIGN_DIR_NAME,
+    ProjectError,
+    load_campaign_manifest,
+)
 from dmr_iq_surveyor.reference.store import list_sites
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, DriveViewSettings, run_survey
 from dmr_iq_surveyor.survey.profiles import (
@@ -72,6 +77,7 @@ from dmr_iq_surveyor.web.viewscope import (
     CAMPAIGN_PREFIX,
     CURRENT_VIEW,
     LEGACY_VIEW,
+    ReadOnlyViewError,
     ViewScope,
     parse_view_scope,
     refuse_if_read_only,
@@ -782,6 +788,41 @@ class FieldService:
             "counts": counts,
         }
 
+    def refuse_if_campaign_closed(self, action: str) -> None:
+        """Stop a write into a round that has been finished.
+
+        Read from the manifest on each attempt rather than remembered from
+        startup, because closing a campaign is something that happens to a
+        *running* service: `web serve` refuses to start on a closed campaign,
+        but a campaign closed underneath it kept accepting stops until the
+        next restart -- which then failed, at the side of a road.
+
+        Only reachable for a project deployment, which is the only case where
+        a manifest exists to consult. A manifest that cannot be read leaves
+        the service exactly as it behaved before this check: refusing here on
+        a missing file would take a working deployment down over a path that
+        moved, and the startup resolution already proved the campaign was
+        open when the service came up.
+        """
+        campaign = self.settings.capture_campaign_id
+        root = self.settings.project_root
+        if campaign is None or root is None:
+            return
+        try:
+            manifest = load_campaign_manifest(
+                Path(root) / CAMPAIGN_DIR_NAME / f"{campaign}.yaml",
+                expect_campaign_id=campaign,
+            )
+        except (ProjectError, FileNotFoundError, OSError):
+            return
+        if manifest.is_closed:
+            raise ReadOnlyViewError(
+                f"{action} is refused: campaign {campaign!r} is closed, so it accepts no "
+                "new stops. Its data stays readable and analysable. Switch this "
+                "deployment to an open campaign (`fieldctl campaign use <id>`) before "
+                "recording again"
+            )
+
     def state(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
         # One connection for the four questions this asks of the database.
         # Twenty phones refreshing at once is a real field state -- one
@@ -960,6 +1001,7 @@ class FieldService:
             "changing whether a stop counts",
             self.settings.capture_campaign_id,
         )
+        self.refuse_if_campaign_closed("changing whether a stop counts")
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
             if connection.execute(
@@ -997,6 +1039,7 @@ class FieldService:
         showing the round that is being recorded.
         """
         refuse_if_read_only(view, "deleting a stop", self.settings.capture_campaign_id)
+        self.refuse_if_campaign_closed("deleting a stop")
         connection = connect_geo_database(Path(self.settings.database_path))
         try:
             if connection.execute(
@@ -1040,6 +1083,7 @@ class FieldService:
         self, payload: dict[str, Any], view: ViewScope = CURRENT_VIEW
     ) -> Job:
         refuse_if_read_only(view, "recording a stop", self.settings.capture_campaign_id)
+        self.refuse_if_campaign_closed("recording a stop")
         if not self.settings.allow_capture:
             raise RuntimeError("captures are disabled on this server (--no-capture)")
 
@@ -1420,6 +1464,7 @@ class FieldService:
         before anyone drives anywhere with it.
         """
         refuse_if_read_only(view, "analysing a recording", self.settings.capture_campaign_id)
+        self.refuse_if_campaign_closed("analysing a recording")
         recording = Path(str(payload.get("recording", ""))).expanduser()
         if not recording.is_file():
             raise ValueError(f"no such recording: {recording}")
@@ -1679,6 +1724,7 @@ class FieldService:
         refuse_if_read_only(
             view, "holding for a stationary measurement", self.settings.capture_campaign_id
         )
+        self.refuse_if_campaign_closed("holding for a stationary measurement")
         job = self.jobs.active_job()
         if job is None or job.kind != "live":
             raise ValueError("no drive is running; a hold only makes sense mid-drive")
@@ -1703,6 +1749,7 @@ class FieldService:
         they complete, so an interrupted drive has already contributed
         everything it measured."""
         refuse_if_read_only(view, "starting a drive", self.settings.capture_campaign_id)
+        self.refuse_if_campaign_closed("starting a drive")
         if not self.settings.allow_capture:
             raise RuntimeError("captures are disabled on this server (--no-capture)")
         running = self.jobs.active_job()

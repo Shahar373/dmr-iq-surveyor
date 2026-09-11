@@ -139,16 +139,22 @@ def device_identity(device: Any) -> dict[str, str]:
     """
     identity: dict[str, str] = {}
 
-    info: Any = {}
+    info: dict[Any, Any] = {}
     try:
-        info = device.getHardwareInfo()
+        # `dict(...)` rather than an isinstance check. SoapySDR's Python
+        # bindings return a SWIG-wrapped `Kwargs` map, which is not a `dict`
+        # subclass -- `_soapy_probe.py` converts its enumerate results the
+        # same way for the same reason. An `isinstance(info, dict)` gate was
+        # therefore False on the real radio, and the serial and label this
+        # exists to record were silently dropped on every capture, where no
+        # test without hardware could see it.
+        info = dict(device.getHardwareInfo())
     except Exception:  # noqa: BLE001 -- an identity is never worth a failed capture
         info = {}
-    if isinstance(info, dict):
-        for key in (IDENTITY_SERIAL, IDENTITY_LABEL):
-            text = _identity_text(info.get(key))
-            if text is not None:
-                identity[key] = text
+    for key in (IDENTITY_SERIAL, IDENTITY_LABEL):
+        text = _identity_text(info.get(key))
+        if text is not None:
+            identity[key] = text
 
     if IDENTITY_LABEL not in identity:
         # SoapySDR's hardware key is the coarser answer -- the model rather
@@ -236,11 +242,14 @@ class SoapyIqDevice:
 
         self._channel = settings.channel
         self._device = SoapySDR.Device(device_args_string(settings.driver, settings.serial))
-        # Asked of the handle this capture is about to stream from, at the
-        # one moment the radio is certainly ours and certainly the one being
-        # recorded with.
-        self.observed_identity = device_identity(self._device)
         try:
+            # Asked of the handle this capture is about to stream from, at
+            # the one moment the radio is certainly ours and certainly the
+            # one being recorded with -- and INSIDE the guard below, because
+            # these are two fresh calls into the driver and a Ctrl-C landing
+            # in one of them would otherwise escape `open()` with the device
+            # still claimed and `close()` never run.
+            self.observed_identity = device_identity(self._device)
             self._configure(settings, SOAPY_SDR_RX)
             self._stream = self._device.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [self._channel])
             # activateStream returns an error code, it does NOT raise. If

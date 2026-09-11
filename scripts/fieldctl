@@ -49,11 +49,17 @@ die()  { printf 'fieldctl: %s\n' "$*" >&2; exit 1; }
 SCRATCH_FILES=()
 
 scratch_file() {
-    local path
+    # Assigns the path to the variable NAMED by $1 rather than printing it.
+    # Printing forced every caller to write `x="$(scratch_file)"`, and command
+    # substitution is a subshell: the registration below happened in a copy of
+    # the shell that was then thrown away, so SCRATCH_FILES was always empty
+    # and the cleanup trap was a no-op. The token's curl config outlived every
+    # Ctrl-C, which is the one thing this machinery exists to prevent.
+    local target="$1" path
     path="$(mktemp)" || die "could not create a temporary file"
     chmod 600 "$path"
     SCRATCH_FILES+=("$path")
-    printf '%s\n' "$path"
+    printf -v "$target" '%s' "$path"
 }
 
 remove_scratch_files() {
@@ -110,6 +116,14 @@ parse_env_file() {
         key="${line%%=*}"
         value="${line#*=}"
         key="${key//[[:space:]]/}"
+        # systemd skips whitespace before a value and chomps it after, and
+        # counts CR as a line terminator -- so `FIELD_CAMPAIGN=day1 ` and a
+        # file saved with CRLF both mean `day1` to the service. Keeping the
+        # whitespace made fieldctl report a campaign that differs invisibly
+        # from the one the service records under, and made `campaign use`
+        # treat a switch to that same campaign as a real change.
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
         [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
         ENV_VALUES["$key"]="$value"
         ENV_SOURCES["$key"]="$origin"
@@ -294,7 +308,7 @@ api_get() {
     [[ -r "$FIELD_TOKEN_FILE" ]] || return 1
 
     url="https://${host}:${FIELD_PORT}${path}"
-    config="$(scratch_file)"
+    scratch_file config
     {
         printf 'header = "X-Auth-Token: '
         tr -d '\r\n' < "$FIELD_TOKEN_FILE"
@@ -523,7 +537,7 @@ campaign_listing() {
     require_surveyor
     local -a arguments=(project campaign list --project "$FIELD_PROJECT" --json)
     if [[ -n "$FIELD_CAMPAIGN" ]]; then
-        arguments+=(--current "$FIELD_CAMPAIGN")
+        arguments+=(--current "$(canonical_campaign_id "$FIELD_CAMPAIGN")")
     fi
     "$FIELD_SURVEYOR_BIN" "${arguments[@]}"
 }
@@ -550,6 +564,19 @@ sys.exit(4)
 ' "$1" "$2" "$3"
 }
 
+canonical_campaign_id() {
+    # The comparison form of a campaign id: trimmed and lower-cased, which is
+    # exactly what `normalise_campaign_id` does to the value before the
+    # service records under it. Used ONLY for comparing -- the argv keeps the
+    # operator's spelling, so `print-command` stays identical to what systemd
+    # runs. Without this, `FIELD_CAMPAIGN=Day1` let `campaign close day1`
+    # close the very campaign the service was recording into.
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s\n' "${value,,}"
+}
+
 api_active_job() {
     # Print the first job that is not in a terminal state, or return 1.
     #
@@ -566,7 +593,16 @@ try:
     document = json.load(sys.stdin)
 except ValueError:
     sys.exit(2)
-jobs = document if isinstance(document, list) else document.get("jobs", [])
+if isinstance(document, list):
+    jobs = document
+elif isinstance(document, dict):
+    jobs = document.get("jobs", [])
+else:
+    # `null`, a bare number, a string: parsed as JSON and still not an answer
+    # about jobs. Exit 2 is "I could not read this", which the caller refuses
+    # on; reaching `.get` here raised and exited 1, which it read as "nothing
+    # is running".
+    sys.exit(2)
 if not isinstance(jobs, list):
     sys.exit(2)
 for job in jobs:
@@ -637,7 +673,7 @@ def write_atomically(path, text):
         owner = (info.st_uid, info.st_gid)
     handle, temporary = tempfile.mkstemp(dir=directory, prefix=os.path.basename(path) + ".", suffix=".tmp")
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="") as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
@@ -659,27 +695,54 @@ def write_atomically(path, text):
         raise
 
 
+def read_text_verbatim(path):
+    """Read without translating line endings.
+
+    The default `newline=None` turns CRLF and lone CR into "\n" on the way
+    in, so a backup of a CRLF file could never be restored byte for byte --
+    and for systemd a trailing CR is part of the value, not decoration."""
+    with open(path, encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
 def apply_settings(path, values):
     try:
-        with open(path, encoding="utf-8") as handle:
-            original = handle.read()
+        original = read_text_verbatim(path)
     except FileNotFoundError:
         original = ""
-    lines = original.splitlines()
+    # Split on "\n" alone. `str.splitlines()` also breaks on \r, \v, \f,
+    # \x1c-\x1e, \x85, \u2028 and \u2029, none of which systemd treats as
+    # a line break: rejoining with "\n" turned one of an operator's lines
+    # into two and silently truncated the value the service would read.
+    lines = original.split("\n")
     seen = set()
     for index, line in enumerate(lines):
+        # A CR before the newline belongs to the file's line endings, not to
+        # the key, and is put back on any line this rewrites.
+        bare = line[:-1] if line.endswith("\r") else line
+        ending = "\r" if line.endswith("\r") else ""
         for key in KEYS:
-            if line.startswith(key + "=") and key not in seen:
-                lines[index] = "%s=%s" % (key, values[key])
+            if bare.startswith(key + "="):
+                # EVERY occurrence, not just the first: systemd and this
+                # script both take the LAST assignment of a key, so rewriting
+                # only the first left the old value in force while reporting
+                # the new one.
+                lines[index] = "%s=%s%s" % (key, values[key], ending)
                 seen.add(key)
     # A key the file does not mention yet is appended rather than silently
     # dropped: this file is often created by this command, and a local
     # override that sets neither key is the normal starting point.
-    for key in (key for key in KEYS if key not in seen):
-        lines.append("%s=%s" % (key, values[key]))
-    # The one byte this may add: a file whose last line had no newline gets
-    # one, because the next append would otherwise join two settings.
-    return "\n".join(lines) + ("\n" if lines else "")
+    # `split("\n")` leaves a trailing "" for a file that ended with a
+    # newline; appending before it keeps that final newline where it was, and
+    # a file that did not end with one gains exactly the newline the next
+    # setting needs.
+    if lines and lines[-1] == "":
+        lines[-1:] = ["%s=%s" % (key, values[key]) for key in KEYS if key not in seen] + [""]
+    else:
+        lines.extend("%s=%s" % (key, values[key]) for key in KEYS if key not in seen)
+        if any(key not in seen for key in KEYS) or not lines:
+            lines.append("")
+    return "\n".join(lines)
 
 
 operation = sys.argv[1]
@@ -692,9 +755,8 @@ elif operation == "backup":
     destination = sys.argv[3]
     if not os.path.exists(path):
         raise SystemExit(3)
-    with open(path, encoding="utf-8") as handle:
-        content = handle.read()
-    with open(destination, "w", encoding="utf-8") as handle:
+    content = read_text_verbatim(path)
+    with open(destination, "w", encoding="utf-8", newline="") as handle:
         handle.write(content)
     os.chmod(destination, 0o600)
 elif operation == "restore":
@@ -706,15 +768,31 @@ elif operation == "restore":
         if os.path.exists(path):
             os.unlink(path)
     else:
-        with open(source, encoding="utf-8") as handle:
-            write_atomically(path, handle.read())
+        write_atomically(path, read_text_verbatim(source))
 else:
     raise SystemExit("unknown operation %r" % operation)
 PYEOF
 }
 
+service_state() {
+    systemctl is-active "$FIELD_UNIT" 2>/dev/null || true
+}
+
 service_is_active() {
-    [[ "$(systemctl is-active "$FIELD_UNIT" 2>/dev/null || true)" == "active" ]]
+    [[ "$(service_state)" == "active" ]]
+}
+
+service_is_settled() {
+    # `activating`, `deactivating` and `reloading` are neither running nor
+    # stopped, and a unit sits in `activating` for the whole of
+    # `fieldctl wait-network` -- up to FIELD_TAILSCALE_WAIT -- and through
+    # every restart backoff. Treating those as "not running" skipped the job
+    # check, the stop, the start and the verification, and still exited 0
+    # claiming the campaign had been switched.
+    case "$(service_state)" in
+        active|inactive|failed|"") return 0 ;;
+        *)                         return 1 ;;
+    esac
 }
 
 service_has_failed() {
@@ -736,7 +814,14 @@ require_root_for() {
     # root.
     local path="$1"
     shift
-    [[ "$(id -u 2>/dev/null || echo 0)" == "0" ]] && return 0
+    local uid
+    # An unreadable uid is NOT root: `|| echo 0` made a missing `id` open the
+    # gate, which is the one direction this check must never fail in.
+    uid="$(id -u 2>/dev/null || true)"
+    [[ "$uid" == "0" ]] && return 0
+    if [[ ! "$uid" =~ ^[0-9]+$ ]]; then
+        die "this process's user id could not be read, so it cannot be shown to be root. Run: sudo fieldctl $*"
+    fi
     die "writing ${path} needs root, and this process is not root. Run: sudo fieldctl $*"
 }
 
@@ -825,7 +910,7 @@ cmd_campaign_current() {
     if [[ -n "$FIELD_PROJECT" && -n "$FIELD_CAMPAIGN" ]]; then
         if listing="$(campaign_listing 2>/dev/null)"; then
             local scratch
-            scratch="$(scratch_file)"
+            scratch_file scratch
             printf '%s' "$listing" > "$scratch"
             status="$(campaign_row "$scratch" "$FIELD_CAMPAIGN" status 2>/dev/null || true)"
             manifest="$(campaign_row "$scratch" "$FIELD_CAMPAIGN" manifest 2>/dev/null || true)"
@@ -954,7 +1039,7 @@ cmd_campaign_close() {
     # campaign it is no longer allowed to write to, and it would not find out
     # until its next start -- which is a restart nobody planned, at the side
     # of a road.
-    if [[ "$target" == "$FIELD_CAMPAIGN" ]]; then
+    if [[ "$(canonical_campaign_id "$target")" == "$(canonical_campaign_id "$FIELD_CAMPAIGN")" ]]; then
         die "${target} is the campaign this deployment is recording into. Switch to another campaign first (\`fieldctl campaign use <other>\`), then close this one."
     fi
 
@@ -965,13 +1050,28 @@ cmd_campaign_close() {
     local listing manifest
     listing="$(campaign_listing)" || die "project ${FIELD_PROJECT} could not be read"
     local scratch
-    scratch="$(scratch_file)"
+    scratch_file scratch
     printf '%s' "$listing" > "$scratch"
     manifest="$(campaign_row "$scratch" "$target" manifest 2>/dev/null || true)"
     [[ -n "$manifest" ]] || die "${target} is not a campaign of project ${FIELD_PROJECT}"
     require_root_for "$manifest" campaign close "$target" --write
     campaign_lock
     "$FIELD_SURVEYOR_BIN" project campaign close --project "$FIELD_PROJECT" --campaign-id "$target" --write
+}
+
+abort_after_stop() {
+    # Something failed after the service was stopped and before the config was
+    # changed. The write is atomic, so the file on disk is whatever it was --
+    # there is nothing to restore, and restoring from a backup that may itself
+    # have failed is how an empty configuration gets installed. What must not
+    # happen is leaving the deployment stopped.
+    local message="$1" was_active="$2"
+    log "$message"
+    if (( was_active )); then
+        systemctl start "$FIELD_UNIT" \
+            || log "${FIELD_UNIT} did not start again; run \`fieldctl logs\`."
+    fi
+    exit 1
 }
 
 campaign_use_rollback() {
@@ -984,6 +1084,9 @@ campaign_use_rollback() {
         [[ "$backup" == "--absent" ]] || log "The previous contents are in ${backup}. Restore them by hand before starting the service."
         exit 1
     fi
+    # Restored, so the copy has done its job. Kept only when the restore
+    # failed, which is the one case the message above points an operator at.
+    [[ "$backup" == "--absent" ]] || rm -f "$backup"
     if (( was_active )); then
         systemctl start "$FIELD_UNIT" || log "ROLLBACK: the service did not start; run \`fieldctl logs\`."
         local deadline=$(( SECONDS + FIELD_TAILSCALE_WAIT + 15 )) state restored=""
@@ -1019,7 +1122,7 @@ cmd_campaign_use() {
     require_surveyor
 
     local listing_file status
-    listing_file="$(scratch_file)"
+    scratch_file listing_file
     campaign_listing > "$listing_file" || die "the campaign listing could not be read"
 
     if ! status="$(campaign_row "$listing_file" "$target" status)"; then
@@ -1032,11 +1135,14 @@ cmd_campaign_use() {
         *)          die "${target} reports status ${status}, which this build does not understand" ;;
     esac
 
-    if [[ "$target" == "$FIELD_CAMPAIGN" ]]; then
+    if [[ "$(canonical_campaign_id "$target")" == "$(canonical_campaign_id "$FIELD_CAMPAIGN")" ]]; then
         log "${target} is already the campaign this deployment records into. Nothing to do."
         return 0
     fi
 
+    if ! service_is_settled; then
+        die "${FIELD_UNIT} is $(service_state), neither running nor stopped. Switching now would skip the job check and the verification. Wait for it to settle, or \`fieldctl stop\` first, then run this again."
+    fi
     local was_active=0
     service_is_active && was_active=1
 
@@ -1079,9 +1185,18 @@ cmd_campaign_use() {
         if ! jobs="$(api_get /api/jobs)"; then
             die "the service is running but its API could not be reached, so it cannot be asked whether a capture is in progress. Refusing to restart it blind; check \`fieldctl status\`."
         fi
-        if active="$(printf '%s' "$jobs" | api_active_job)"; then
-            die "a job has not finished: ${active}. Restarting would abandon it. Wait for it, or cancel it in the app, then run this again."
-        fi
+        local looked=0
+        active="$(printf '%s' "$jobs" | api_active_job)" || looked=$?
+        case "$looked" in
+            0)  die "a job has not finished: ${active}. Restarting would abandon it. Wait for it, or cancel it in the app, then run this again." ;;
+            1)  ;;
+            # Anything else is "I could not read the job list" -- a truncated
+            # body, an error page, a response that is not the shape this
+            # understands. Treating that as "nothing is running" is how a
+            # capture gets abandoned by the command written to avoid exactly
+            # that, so an unreadable answer refuses like an unreachable one.
+            *)  die "the service answered its job list in a form this could not read, so it cannot be asked whether a capture is in progress. Refusing to restart it blind; check \`fieldctl status\` and the app." ;;
+        esac
         # Stopped BEFORE the file is touched, and after the job check, so
         # there is no window in which the app could start a capture against
         # the campaign that is about to stop being the current one.
@@ -1094,7 +1209,13 @@ cmd_campaign_use() {
     # that removed it on the way out would make that message a lie.
     local backup="--absent"
     if [[ -e "$ENV_LOCAL_FILE" ]]; then
-        backup="$(mktemp)"
+        # Not a scratch file -- a failed rollback's message points an operator
+        # at it -- so it needs its own guard: an unguarded command
+        # substitution here aborted the whole script under `set -e`, after the
+        # stop, with no message and no restart.
+        backup="$(mktemp)" || abort_after_stop \
+            "a temporary file for the backup could not be created; the campaign was not changed." \
+            "$was_active"
         chmod 600 "$backup"
         if ! local_env backup "$ENV_LOCAL_FILE" "$backup"; then
             # The file is untouched, so there is nothing to restore -- and
@@ -1102,20 +1223,20 @@ cmd_campaign_use() {
             # file would get installed as the configuration. But the service
             # is already stopped by now, and leaving the deployment down over
             # a failed copy is the worse outcome, so it is started again.
-            log "${ENV_LOCAL_FILE} could not be backed up; the campaign was not changed."
             rm -f "$backup"
-            if (( was_active )); then
-                systemctl start "$FIELD_UNIT" \
-                    || log "${FIELD_UNIT} did not start again; run \`fieldctl logs\`."
-            fi
-            exit 1
+            abort_after_stop \
+                "${ENV_LOCAL_FILE} could not be backed up; the campaign was not changed." \
+                "$was_active"
         fi
     fi
 
     if ! local_env set "$ENV_LOCAL_FILE" "$FIELD_PROJECT" "$target"; then
-        log "${ENV_LOCAL_FILE} could not be written."
-        campaign_use_rollback "$backup" "$was_active" "$previous"
-        exit 1
+        # The write is atomic: a failure leaves the file exactly as it was, so
+        # there is nothing to roll back. Rolling back anyway rewrote a file
+        # that was never damaged -- through the same call that had just failed
+        # -- and then exited with the service still stopped.
+        [[ "$backup" == "--absent" ]] || rm -f "$backup"
+        abort_after_stop "${ENV_LOCAL_FILE} could not be written; the campaign was not changed." "$was_active"
     fi
     log "Set FIELD_CAMPAIGN=${target} in ${ENV_LOCAL_FILE}."
 
@@ -1180,6 +1301,16 @@ assert_token_not_in_argv() {
         return 0
     fi
     [[ -r "$FIELD_TOKEN_FILE" ]] || return 0
+    # A token file that is empty, or that holds more than one line, makes
+    # `grep -f` match nothing or match the wrong thing -- and the check would
+    # then print a reassuring "clean" having compared against nothing. Say it
+    # was not checked instead.
+    local lines
+    lines="$(grep -c . "$FIELD_TOKEN_FILE" 2>/dev/null || echo 0)"
+    if [[ "$lines" != "1" ]]; then
+        printf 'argv     not checked -- %s does not hold exactly one line\n' "$FIELD_TOKEN_FILE"
+        return 0
+    fi
     argv="$(tr '\0' ' ' < "/proc/${pid}/cmdline")"
     # Compared without ever printing either side.
     if printf '%s' "$argv" | grep -qF -f <(tr -d '\r\n' < "$FIELD_TOKEN_FILE"); then

@@ -145,6 +145,17 @@ def _scalar_mapping(values: Any) -> dict[str, Any]:
     }
 
 
+def scalar_identity(values: Any) -> dict[str, Any]:
+    """The identity a device reported, keeping only what a reading can be.
+
+    The public name for the filter both write paths apply: the capture path
+    reads it out of a capture report, the live drive reads it off the open
+    device, and neither may hand the store a value it will refuse -- a drive
+    that built such a blob lost every bin, not one reading.
+    """
+    return _scalar_mapping(values)
+
+
 def _known(values: Any) -> dict[str, Any]:
     """Keep only the values that are actually known, and usable.
 
@@ -341,7 +352,7 @@ def hardware_from_capture_manifest(manifest: Any) -> dict[str, Any]:
         identity={
             "driver": settings.get("driver"),
             "serial": settings.get("serial"),
-            **_scalar_mapping(manifest.get("device_identity")),
+            **scalar_identity(manifest.get("device_identity")),
         },
         applied=applied_bucket(manifest.get("device_settings_applied")),
         requested=requested_bucket(
@@ -717,5 +728,6 @@ __all__ = [
     "normalise_hardware",
     "receiver_settings",
     "requested_bucket",
+    "scalar_identity",
     "with_declared",
 ]
