@@ -938,6 +938,42 @@ interrupt after the commit therefore leaves the mark standing:
 > relabelled -- but until `geo solve --campaign <id>` has run again, the round
 > has no current conclusion rather than a stale one wearing that name.
 
+### Where that is enforced
+
+In the read layer, not in the command that wrote the mark. A mark only its
+writer consults is a comment: the round goes on serving its old mode, region
+and next stop to everything that did not think to ask.
+
+`latest_solutions`, `latest_solutions_by_campaign` and `latest_plan` are the
+three accessors that answer *what is current*, and every consumer reaches a
+stored conclusion through one of them -- `geo sites`, `geo plan`, the exports,
+the digest, the map, the site overview and the field app alike. So the
+predicate lives there, once:
+
+| what | under a superseded campaign |
+|---|---|
+| `latest_solutions` | no rows: the round has no current conclusion |
+| `latest_plan` | `None`; no next stop is offered |
+| the map, scoped | no mode and no region drawn |
+| the map, `all` | the round's geometry is **not** drawn |
+| `site_overview` | the round is still listed, each entry carrying `superseded_at` |
+| `/api/plan` | `analysis_status: superseded`, with the time and the reason |
+
+The overview keeps the row on purpose. It is true as *history* -- it is what
+that round concluded from the stops it had -- and dropping it would lose the
+record. What it stops being is an answer, so nothing draws it: a polygon on a
+map reads as a current claim about where a transmitter is, however carefully
+the popup beside it is worded.
+
+The API distinction matters as much as the geometry. An empty plan panel
+saying *"no solve has run yet"* sends the operator to a button they have
+already pressed; `analysis_status: superseded` with the timestamp says the
+solve ran and its conclusions were withdrawn when the membership changed.
+
+A solve clears the mark only after every solution **and** the plan are stored,
+so one that dies half-way leaves the mark standing and the old analysis
+hidden.
+
 `input_run_ids_json` on the solve that follows contains only runs from the
 target campaign, because the scope is a join through `survey_runs` and
 membership has already moved.
@@ -946,6 +982,18 @@ Nothing here touches a solution carrying `campaign_id IS NULL`. Those mean
 *this solve read the whole database*, they are `Historical whole-database
 analysis`, and they are neither relabelled nor removed by a curation that had
 nothing to do with them.
+
+`campaign_assignments` deliberately carries **no foreign key** to
+`survey_runs`. It began with `ON DELETE CASCADE`, which meant deleting a stop
+also deleted the record that somebody had once filed it into a round --
+destroying the evidence at exactly the moment it is most worth having. The run
+id is plain text, so the audit row outlives the run it describes.
+
+The write runs under `project_binding`, so the claim is checked inside the
+single `sqlite3.connect` in the codebase and **before** any schema statement.
+Asserting it after `connect_geo_database` returned would already have migrated
+whatever file was at that path -- including one swapped in between the
+read-only preflight and the write.
 
 The two tables are additive and arrive by opening the database, so an existing
 database upgrades in place with no manual step and no data loss.

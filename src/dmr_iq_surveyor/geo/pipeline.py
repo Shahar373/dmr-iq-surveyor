@@ -980,6 +980,12 @@ def build_map_geojson(
         )
 
     for solution in solutions:
+        # A round curated since its solve is listed in the overview and is not
+        # drawn. Its region and mode describe a membership that no longer
+        # exists, and a polygon on a map reads as a current claim about where
+        # a transmitter is no matter what the popup says beside it.
+        if solution.get("superseded_at"):
+            continue
         # Which boundary drew this, on the feature itself. A region and a mode
         # outlive the session that produced them and get looked at beside
         # other rounds' answers, so "whose is this" has to travel with them
@@ -1116,6 +1122,11 @@ def site_overview(
                         "area_km2_90": row["area_km2_90"],
                         "solved_at": row["solved_at"],
                         "solve_batch_id": row["solve_batch_id"],
+                        # True as history, not offered as a conclusion. The
+                        # map skips these; a reader listing them has to say
+                        # which they are.
+                        "superseded_at": row.get("superseded_at"),
+                        "superseded_reason": row.get("superseded_reason", ""),
                     }
                     for row in per_campaign.get(site_id, ())
                 ],

@@ -54,6 +54,7 @@ from dmr_iq_surveyor.project.manifest import (
     load_campaign_manifest,
 )
 from dmr_iq_surveyor.reference.store import list_sites
+from dmr_iq_surveyor.survey.curation import superseded_analysis
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH, DriveViewSettings, run_survey
 from dmr_iq_surveyor.survey.profiles import (
     HardwareProfile,
@@ -95,6 +96,14 @@ _LIVE_BIN_LIMIT = 400
 
 class PositionStale(RuntimeError):
     """The marked position is old enough that it must be confirmed."""
+
+
+# Whether what a view is showing is this round's live conclusion, or a stored
+# one that a membership change has withdrawn. Named rather than left to an
+# absent field, because "no plan" and "a plan that no longer applies" send an
+# operator to two different buttons.
+ANALYSIS_CURRENT = "current"
+ANALYSIS_SUPERSEDED = "superseded"
 
 POSITION_SOURCE_BROWSER = "browser_gps"
 POSITION_SOURCE_MANUAL = "user"
@@ -880,6 +889,10 @@ class FieldService:
             "campaign_id": None,
             "unscoped_solve": False,
             "analysis_label": None,
+            # Always present, so a client never has to infer "why is this
+            # empty" from the absence of a field.
+            "analysis_status": ANALYSIS_CURRENT,
+            "superseded_at": None,
             "plan": {},
             "geojson": {"type": "FeatureCollection", "features": []},
         }
@@ -898,11 +911,35 @@ class FieldService:
                     "inside it. Switch to a single campaign to see its plan"
                 ),
             }
+        scope = self._read_scope(view)
         with self._reading(connection) as reader:
-            stored = latest_plan(reader, scope=self._read_scope(view))
+            stored = latest_plan(reader, scope=scope)
+            mark = (
+                superseded_analysis(reader, scope.campaign_id)
+                if scope.campaign_id is not None
+                else None
+            )
         if stored is None:
+            if mark is not None:
+                # Not "no solve has run": one has, and its conclusions were
+                # withdrawn when the round's membership changed. Saying the
+                # former would send the operator looking for a solve button
+                # they have already pressed.
+                return {
+                    **empty,
+                    "analysis_status": ANALYSIS_SUPERSEDED,
+                    "superseded_at": mark.superseded_at,
+                    "reason": (
+                        "this round's stored plan was drawn before its membership "
+                        f"changed ({mark.reason}), so it is no longer offered as its "
+                        "next stop. Re-solve the campaign to draw one from the stops "
+                        "it holds now"
+                    ),
+                }
             return {**empty, "reason": "no solve has run yet"}
         return {
+            "analysis_status": ANALYSIS_CURRENT,
+            "superseded_at": None,
             "status": stored["status"],
             "reason": stored["reason"],
             "solve_batch_id": stored["solve_batch_id"],

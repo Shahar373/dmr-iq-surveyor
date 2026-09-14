@@ -834,3 +834,346 @@ def test_the_dry_run_does_not_migrate_an_older_database(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert path.read_bytes() == before_bytes, "the dry run wrote the new tables"
     assert path.stat().st_mtime_ns == before_mtime
+
+
+# -- the invalidation is enforced, not merely recorded -------------------------
+
+
+def _solved_target(tmp_path: Path) -> tuple[Path, Path]:
+    """A project whose target campaign already holds a solution and a plan.
+
+    Built by actually solving, so the stored rows are the ones the real
+    pipeline writes rather than hand-made approximations of them.
+    """
+    from fixtures.geo_scenario import Transmitter, build_database, seed_run
+
+    from dmr_iq_surveyor.geo.pipeline import materialise_measurements, solve_all_sites
+    from dmr_iq_surveyor.survey.scope import CampaignScope
+
+    manifest = _project(tmp_path / "proj")
+    _campaign(tmp_path / "proj")
+    database = tmp_path / "proj" / "db.sqlite3"
+    # The site-30 control channel from the shared registry, with stops spread
+    # around it, so the solve reaches `ok` and actually stores a region -- a
+    # fixture that solved to `insufficient_evidence` would prove nothing about
+    # withdrawing a region.
+    transmitters = [
+        Transmitter(867_762_500.0, 32.050, 34.800, reference_level_db=25.0,
+                    path_loss_exponent=3.4)
+    ]
+    connection = build_database(database)
+    try:
+        for index, (lat, lon) in enumerate(
+            [(32.070, 34.770), (32.075, 34.775), (32.080, 34.790), (32.030, 34.820)]
+        ):
+            seed_run(
+                connection,
+                run_id=f"r{index}",
+                latitude=lat,
+                longitude=lon,
+                transmitters=transmitters,
+                site_id=f"stop_{index}",
+                capture_start_utc=f"2026-08-01T1{index}:00:00+00:00",
+                campaign_id="day1" if index < 3 else None,
+            )
+        connection.commit()
+        write_claim(connection, project_id="p25_central_il", analyzer=ANALYZER)
+    finally:
+        connection.close()
+    clear_binding()
+
+    materialise_measurements(database_path=database, scope=CampaignScope("day1"))
+    solve_all_sites(database_path=database, scope=CampaignScope("day1"))
+    clear_binding()
+    return manifest, database
+
+
+def _stored_counts(database: Path) -> tuple[int, int]:
+    connection = sqlite3.connect(database)
+    try:
+        solutions = connection.execute(
+            "SELECT COUNT(*) FROM geo_solutions WHERE campaign_id = 'day1'"
+        ).fetchone()[0]
+        plans = connection.execute(
+            "SELECT COUNT(*) FROM geo_plans WHERE campaign_id = 'day1'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    return int(solutions), int(plans)
+
+
+def test_a_superseded_campaign_serves_no_current_solution_or_plan(tmp_path: Path) -> None:
+    """The guarantee, at the read layer rather than in the prose.
+
+    Before this was enforced, `assign-runs` wrote the mark and every accessor
+    ignored it, so the round went on serving a mode, a region and a next stop
+    drawn from a membership it no longer had.
+    """
+    from dmr_iq_surveyor.geo.store import latest_plan, latest_solutions
+    from dmr_iq_surveyor.survey.scope import CampaignScope
+
+    manifest, database = _solved_target(tmp_path)
+    before_solutions, before_plans = _stored_counts(database)
+    assert before_solutions > 0 and before_plans > 0, "the fixture solved nothing"
+
+    result = _assign(manifest, "--run-id", "r3", "--write", "--reason", "the fourth stop")
+    assert result.exit_code == 0, result.output
+
+    connection = connect_geo_database(database)
+    try:
+        scope = CampaignScope("day1")
+        assert latest_solutions(connection, scope=scope) == [], (
+            "a stale solution is still served as this round's current answer"
+        )
+        assert latest_plan(connection, scope=scope) is None, (
+            "a stale next-stop plan is still served"
+        )
+    finally:
+        connection.close()
+    clear_binding()
+
+    # Withdrawn from the answer, kept as history.
+    assert _stored_counts(database) == (before_solutions, before_plans)
+
+
+def test_a_superseded_campaign_draws_no_region_on_the_map(tmp_path: Path) -> None:
+    from dmr_iq_surveyor.geo.pipeline import build_map_geojson
+    from dmr_iq_surveyor.survey.scope import CampaignScope
+
+    manifest, database = _solved_target(tmp_path)
+    before = build_map_geojson(database_path=database, scope=CampaignScope("day1"))
+    clear_binding()
+    drawn = [f for f in before["features"] if f["properties"].get("kind") != "measurement"]
+    assert drawn, "the fixture drew no estimate or region to begin with"
+
+    _assign(manifest, "--run-id", "r3", "--write", "--reason", "the fourth stop")
+
+    after = build_map_geojson(database_path=database, scope=CampaignScope("day1"))
+    clear_binding()
+    still = [f for f in after["features"] if f["properties"].get("kind") != "measurement"]
+    assert still == [], "a stale region is still drawn on the map"
+
+
+def test_the_all_view_does_not_draw_a_superseded_region(tmp_path: Path) -> None:
+    """It stays in the overview, labelled. It is not drawn as a valid result."""
+    from dmr_iq_surveyor.geo.pipeline import build_map_geojson, site_overview
+
+    manifest, database = _solved_target(tmp_path)
+    _assign(manifest, "--run-id", "r3", "--write", "--reason", "the fourth stop")
+
+    drawn = build_map_geojson(database_path=database, group_by_campaign=True)
+    clear_binding()
+    geometry = [f for f in drawn["features"] if f["properties"].get("kind") != "measurement"]
+    assert geometry == [], "the All view drew a superseded region as a valid conclusion"
+
+    overview = site_overview(database_path=database, group_by_campaign=True)
+    clear_binding()
+    listed = [
+        entry
+        for site in overview
+        for entry in site["solutions"]
+        if entry["campaign_id"] == "day1"
+    ]
+    assert listed, "the superseded round vanished from the overview instead of being marked"
+    assert all(entry["superseded_at"] for entry in listed), (
+        "the overview lists the round without saying its analysis was withdrawn"
+    )
+
+
+def test_the_api_says_superseded_rather_than_no_solve_has_run(tmp_path: Path) -> None:
+    """"No solve has run" would send the operator to a button they already pressed."""
+    from dmr_iq_surveyor.web.service import ANALYSIS_SUPERSEDED, FieldService, FieldSettings
+
+    manifest, database = _solved_target(tmp_path)
+    _assign(manifest, "--run-id", "r3", "--write", "--reason", "the fourth stop")
+
+    service = FieldService(
+        FieldSettings(
+            database_path=database,
+            output_root=tmp_path / "out",
+            recordings_dir=tmp_path / "rec",
+            campaign_id="day1",
+        )
+    )
+    payload = service.plan()
+    clear_binding()
+
+    assert payload["analysis_status"] == ANALYSIS_SUPERSEDED
+    assert payload["superseded_at"], "the API reports no time for the withdrawal"
+    assert "no solve has run yet" not in payload["reason"]
+    assert "membership" in payload["reason"]
+
+
+def test_a_completed_solve_restores_the_campaign_as_current(tmp_path: Path) -> None:
+    from dmr_iq_surveyor.geo.pipeline import solve_all_sites
+    from dmr_iq_surveyor.geo.store import latest_plan, latest_solutions
+    from dmr_iq_surveyor.survey.scope import CampaignScope
+
+    manifest, database = _solved_target(tmp_path)
+    _assign(manifest, "--run-id", "r3", "--write", "--reason", "the fourth stop")
+
+    solve_all_sites(database_path=database, scope=CampaignScope("day1"))
+    clear_binding()
+
+    connection = connect_geo_database(database)
+    try:
+        assert superseded_analysis(connection, "day1") is None
+        assert latest_solutions(connection, scope=CampaignScope("day1")), (
+            "the campaign has no current solution after a completed re-solve"
+        )
+        assert latest_plan(connection, scope=CampaignScope("day1")) is not None
+    finally:
+        connection.close()
+    clear_binding()
+
+
+def test_legacy_whole_database_analysis_is_unaffected_by_a_supersede(tmp_path: Path) -> None:
+    """`campaign_id IS NULL` is a different claim and is not withdrawn."""
+    from dmr_iq_surveyor.geo.store import latest_solutions
+    from dmr_iq_surveyor.survey.scope import UNASSIGNED_ONLY
+
+    manifest, database = _solved_target(tmp_path)
+    connection = connect_geo_database(database)
+    try:
+        connection.execute(
+            "INSERT INTO geo_solutions(solve_batch_id, p25_site_id, solved_at, method,"
+            " source_model, status, detection_count, non_detection_count, excluded_count,"
+            " level_metric, tool_version, campaign_id)"
+            " SELECT 'historic', p25_site_id, '2026-07-01T00:00:00+00:00', 'grid', 'single',"
+            " 'ok', 2, 1, 0, 'snr_db', '0.10.0', NULL FROM p25_sites LIMIT 1"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    clear_binding()
+
+    _assign(manifest, "--run-id", "r3", "--write", "--reason", "the fourth stop")
+
+    connection = connect_geo_database(database)
+    try:
+        legacy = latest_solutions(connection, scope=UNASSIGNED_ONLY)
+    finally:
+        connection.close()
+    clear_binding()
+    assert legacy, "the historical whole-database analysis was withdrawn too"
+    assert all(row["campaign_id"] is None for row in legacy)
+
+
+# -- the audit trail outlives the run -----------------------------------------
+
+
+def test_the_assignment_audit_survives_deleting_the_run(tmp_path: Path) -> None:
+    """An audit trail that a delete erases is not an audit trail."""
+    from dmr_iq_surveyor.survey.store import delete_survey_run
+
+    manifest, database = _workspace(tmp_path)
+    _assign(manifest, "--run-id", "legacy1", "--write", "--reason", "filed, then deleted")
+    assert len(_audit(database)) == 1
+
+    connection = connect_geo_database(database)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        delete_survey_run(connection, "legacy1")
+        connection.commit()
+    finally:
+        connection.close()
+    clear_binding()
+
+    rows = _audit(database)
+    assert len(rows) == 1, "deleting the run destroyed the record that it was assigned"
+    assert rows[0][0] == "legacy1"
+
+
+# -- the write connection is bound --------------------------------------------
+
+
+def test_a_foreign_database_swapped_in_before_the_write_is_not_migrated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The claim is checked inside the connect, before any schema statement.
+
+    The read-only preflight refuses a foreign file outright, so the window
+    this guards is the narrow one it cannot see: the file being replaced
+    between the preflight and the write. Asserting the claim *after*
+    `connect_geo_database` returned would already have run four layers of DDL
+    against whatever was at that path by then. Bound, the check happens inside
+    the single `sqlite3.connect` and nothing is written at all.
+    """
+    manifest, database = _workspace(tmp_path)
+    foreign_tables = {"somebody_elses"}
+
+    real_connect = connect_geo_database
+    swapped: dict[str, Any] = {}
+
+    def _swap_then_connect(path: Any) -> Any:
+        if not swapped:
+            swapped["done"] = True
+            Path(path).unlink()
+            replacement = sqlite3.connect(path)
+            try:
+                replacement.execute("CREATE TABLE somebody_elses (id INTEGER PRIMARY KEY)")
+                replacement.commit()
+            finally:
+                replacement.close()
+            swapped["fingerprint"] = _fingerprint(Path(path))
+        return real_connect(path)
+
+    monkeypatch.setattr("dmr_iq_surveyor.cli_project.connect_geo_database", _swap_then_connect)
+
+    result = _assign(manifest, "--run-id", "legacy1", "--write", "--reason", "swapped underneath")
+
+    assert swapped, "the write path never opened the database, so nothing was exercised"
+    assert result.exit_code == 1
+    assert _fingerprint(database) == swapped["fingerprint"], (
+        "the swapped-in database was written to"
+    )
+    connection = sqlite3.connect(database)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        connection.close()
+    assert tables == foreign_tables, f"schema was applied to a foreign file: {tables}"
+
+
+def test_a_foreign_database_is_refused_outright(tmp_path: Path) -> None:
+    """The preflight's own refusal, before the write path is reached at all."""
+    manifest = _project(tmp_path / "proj")
+    _campaign(tmp_path / "proj")
+    foreign = tmp_path / "proj" / "db.sqlite3"
+    connection = sqlite3.connect(foreign)
+    try:
+        connection.execute("CREATE TABLE somebody_elses (id INTEGER PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+    before = _fingerprint(foreign)
+
+    result = _assign(manifest, "--run-id", "whatever", "--write", "--reason", "wrong file")
+
+    assert result.exit_code == 1
+    assert _fingerprint(foreign) == before, "a foreign database was migrated"
+
+
+def test_a_rebuild_failure_reports_readably_rather_than_as_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, database = _workspace(tmp_path)
+
+    def _explode(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("the rebuild fell over")
+
+    monkeypatch.setattr("dmr_iq_surveyor.geo.pipeline.materialise_within", _explode)
+
+    result = _assign(manifest, "--run-id", "legacy1", "--write", "--reason", "will fail")
+
+    assert result.exit_code == 1
+    flat = result.output.replace("\n", "")
+    assert "Nothing was assigned" in flat
+    assert "rolled back" in flat
+    assert isinstance(result.exception, SystemExit), (
+        f"a raw traceback reached the operator: {result.exception!r}"
+    )
+    assert _campaign_of(database, "legacy1") is None

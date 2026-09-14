@@ -226,6 +226,29 @@ def superseded_analysis(
     )
 
 
+def superseded_campaigns(connection: sqlite3.Connection) -> dict[str, SupersededAnalysis]:
+    """Every campaign whose stored conclusions predate a membership change.
+
+    One query rather than one per campaign, because the read layer asks this
+    on every solution and plan lookup. A database whose migration has not run
+    has no marks, which is what an empty mapping says.
+    """
+    try:
+        rows = connection.execute(
+            "SELECT campaign_id, superseded_at, reason FROM campaign_analysis_state"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {
+        str(row["campaign_id"]): SupersededAnalysis(
+            campaign_id=str(row["campaign_id"]),
+            superseded_at=str(row["superseded_at"]),
+            reason=str(row["reason"]),
+        )
+        for row in rows
+    }
+
+
 def mark_analysis_superseded(
     connection: sqlite3.Connection,
     *,
@@ -517,6 +540,7 @@ __all__ = [
     "normalise_campaign_id",
     "select_by_time_range",
     "stored_analysis_counts",
+    "superseded_campaigns",
     "superseded_analysis",
     "undated_unassigned_runs",
     "validate_selection",

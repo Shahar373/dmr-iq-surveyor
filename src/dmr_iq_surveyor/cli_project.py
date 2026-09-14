@@ -23,6 +23,7 @@ from rich.console import Console
 from rich.table import Table
 
 from dmr_iq_surveyor.geo.store import connect_geo_database
+from dmr_iq_surveyor.project.binding import project_binding
 from dmr_iq_surveyor.project.claim import (
     Claim,
     assert_claim,
@@ -1350,25 +1351,43 @@ def campaign_assign_runs(
     finally:
         connection.close()
 
-    # Only now, with every refusal already made against a connection that
-    # could not have written anyway, is a writable one opened.
-    connection = connect_geo_database(database)
+    # Bound, not merely checked afterwards. The binding sits on the single
+    # `sqlite3.connect` in the codebase, so the claim is verified inside the
+    # connect itself and BEFORE the schema layers run any DDL. Asserting after
+    # `connect_geo_database` returned would already have migrated whatever
+    # file was at that path -- including a foreign one swapped in between the
+    # read-only preflight and this open.
     try:
-        try:
-            assert_claim(
-                connection, project_id=manifest.project_id, analyzer=manifest.analyzer
-            )
-            outcome = apply_assignment(
-                connection,
-                campaign_id=resolved_id,
-                run_ids=[c.survey_run_id for c in plan.moving],
-                reason=reason.strip(),
-            )
-        except (CurationError, ProjectError) as exc:
-            _fail(f"Nothing was assigned: {exc}")
-            return
-    finally:
-        connection.close()
+        with project_binding(
+            project_id=manifest.project_id,
+            analyzer=manifest.analyzer,
+            database=database,
+        ):
+            connection = connect_geo_database(database)
+            try:
+                outcome = apply_assignment(
+                    connection,
+                    campaign_id=resolved_id,
+                    run_ids=[c.survey_run_id for c in plan.moving],
+                    reason=reason.strip(),
+                )
+            finally:
+                connection.close()
+    except typer.Exit:
+        # A deliberate exit is already the message it means to be. `typer.Exit`
+        # is a RuntimeError, so without this the broad handler below would
+        # catch it and re-report a clean refusal as a failed rebuild.
+        raise
+    except (CurationError, ProjectError, sqlite3.Error) as exc:
+        _fail(f"Nothing was assigned: {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001 - see below
+        # The rollback in `apply_assignment` has already run, so the database
+        # is as it was. What the operator needs from here is that sentence,
+        # not a traceback: a rebuild can fail for reasons this command cannot
+        # enumerate, and every one of them leaves the same recoverable state.
+        _fail(f"Nothing was assigned: the rebuild failed and was rolled back ({exc})")
+        return
 
     console.print(
         f"\n[green]Assigned[/green] {len(outcome['assigned'])} run(s) to {resolved_id} "

@@ -140,9 +140,14 @@ CREATE TABLE IF NOT EXISTS run_comparisons (
     not_comparable_reason TEXT,
     created_at TEXT NOT NULL
 );
+-- Deliberately carries no foreign key to `survey_runs`. This is an audit
+-- trail, and `ON DELETE CASCADE` made deleting a stop also delete the record
+-- that somebody had once filed it into a round -- destroying the evidence at
+-- exactly the moment it becomes most worth having. The id is kept as plain
+-- text so the row outlives the run it describes.
 CREATE TABLE IF NOT EXISTS campaign_assignments (
     campaign_assignment_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    survey_run_id TEXT NOT NULL REFERENCES survey_runs(survey_run_id) ON DELETE CASCADE,
+    survey_run_id TEXT NOT NULL,
     previous_campaign_id TEXT,
     campaign_id TEXT NOT NULL,
     assigned_at TEXT NOT NULL,
