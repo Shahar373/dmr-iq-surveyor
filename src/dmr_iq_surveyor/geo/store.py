@@ -260,15 +260,16 @@ def run_exclusion(connection: sqlite3.Connection, survey_run_id: str) -> str | N
     return str(row["reason"]) if row is not None else None
 
 
-def replace_run_measurements(
+def write_run_measurements(
     connection: sqlite3.Connection, survey_run_id: str, rows: list[dict[str, Any]]
 ) -> int:
-    """Replace every measurement derived from one survey run.
+    """Replace one run's measurements without ending the caller's transaction.
 
-    Deleting first means re-running after a corrected reference import (a
-    frequency added, an ambiguity resolved) leaves no stale rows behind --
-    the same reason `inventory.replace_run` and `import_survey_run` work
-    this way.
+    The committing wrapper below is what every existing caller uses. This
+    half exists for the one caller that may not commit here: campaign
+    curation rewrites membership and the measurements derived from it as a
+    single unit, and a commit in the middle of that would publish a
+    reassignment whose measurements had not been rebuilt yet.
     """
     connection.execute("DELETE FROM geo_measurements WHERE survey_run_id = ?", (survey_run_id,))
     created = datetime.now(UTC).isoformat()
@@ -312,8 +313,22 @@ def replace_run_measurements(
                 created,
             ),
         )
-    connection.commit()
     return len(rows)
+
+
+def replace_run_measurements(
+    connection: sqlite3.Connection, survey_run_id: str, rows: list[dict[str, Any]]
+) -> int:
+    """Replace every measurement derived from one survey run, and commit.
+
+    Deleting first means re-running after a corrected reference import (a
+    frequency added, an ambiguity resolved) leaves no stale rows behind --
+    the same reason `inventory.replace_run` and `import_survey_run` work
+    this way.
+    """
+    written = write_run_measurements(connection, survey_run_id, rows)
+    connection.commit()
+    return written
 
 
 def fetch_site_measurements(

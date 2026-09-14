@@ -48,13 +48,14 @@ from dmr_iq_surveyor.geo.store import (
     fetch_site_measurements,
     latest_solutions,
     latest_solutions_by_campaign,
-    replace_run_measurements,
     store_plan,
     store_solution,
+    write_run_measurements,
 )
 from dmr_iq_surveyor.inspection import write_json
 from dmr_iq_surveyor.reference.p25_sites import load_p25_site_csv
 from dmr_iq_surveyor.reference.store import import_snapshot, list_sites
+from dmr_iq_surveyor.survey.curation import clear_analysis_superseded
 from dmr_iq_surveyor.survey.pipeline import DEFAULT_DATABASE_PATH
 from dmr_iq_surveyor.survey.provenance import Reading, receiver_settings
 from dmr_iq_surveyor.survey.scope import (
@@ -156,53 +157,79 @@ def materialise_measurements(
     resolved.validate()
     connection = connect_geo_database(_database(database_path))
     try:
-        predicate, parameters = scope.where("survey_runs")
-        every_run = [
-            str(row["survey_run_id"])
-            for row in connection.execute(
-                "SELECT survey_run_id FROM survey_runs"
-                + (f" WHERE {predicate}" if predicate else "")
-                + " ORDER BY COALESCE(capture_start_utc, imported_at) ASC",
-                parameters,
-            )
-        ]
-        # A run the caller named that is outside the campaign is refused
-        # rather than dropped: a rebuild that silently skipped a stop the
-        # operator asked for would report success over work it never did.
-        run_ids = scope.narrow(connection, run_ids)
-        if run_ids is None:
-            run_ids = every_run
-        # The reference gain and noise floor are the CAMPAIGN's, whichever
-        # runs are being rebuilt. Taking them from the requested subset made
-        # the field app's one-run-at-a-time rebuild compare each stop with
-        # itself, so a stop recorded at the wrong gain was never flagged
-        # until someone ran a full `geo measurements` by hand.
-        #
-        # With a campaign given, "the campaign" now means that campaign
-        # rather than the whole file: a second round recorded at a different
-        # gain no longer drags the first round's reference with it.
-        campaign_readings = _campaign_gain_readings(connection, every_run)
-        gain_sources = _campaign_gain_sources(campaign_readings)
-        campaign_gains = {
-            run_id: _as_gain(reading.value)
-            for run_id, reading in campaign_readings.items()
-        }
-        reference_gain = _modal_gain(campaign_gains)
-        campaign_noise = _campaign_noise_floors(connection, every_run)
-        reference_noise = _median_noise_floor(campaign_noise)
-        gains = {run_id: campaign_gains.get(run_id) for run_id in run_ids}
-        noise_floors = {run_id: campaign_noise.get(run_id) for run_id in run_ids}
-        per_run: list[dict[str, Any]] = []
-        total: list[dict[str, Any]] = []
-        for run_id in run_ids:
-            rows = build_run_measurements(connection, run_id, resolved)
-            _flag_gain_drift(rows, gains.get(run_id), reference_gain)
-            _flag_noise_floor_shift(rows, noise_floors.get(run_id), reference_noise)
-            replace_run_measurements(connection, run_id, rows)
-            per_run.append({"survey_run_id": run_id, **summarise(rows)})
-            total.extend(rows)
+        report = materialise_within(
+            connection, run_ids=run_ids, settings=resolved, scope=scope
+        )
+        connection.commit()
     finally:
         connection.close()
+    return report
+
+
+def materialise_within(
+    connection: Any,
+    *,
+    run_ids: Sequence[str] | None = None,
+    settings: MeasurementSettings | None = None,
+    scope: CampaignScope = WHOLE_DATABASE,
+) -> dict[str, Any]:
+    """The rebuild above, on a connection the caller owns and does not commit.
+
+    Campaign curation moves runs between campaigns and rebuilds the
+    measurements whose reference gain and noise floor that move changed, and
+    both have to land together: a commit between them would publish a
+    membership the measurements did not yet reflect. So the work is here,
+    where a caller already inside `BEGIN IMMEDIATE` can run it, and the
+    entry point above is that same work plus the open, the commit and the
+    close it always did.
+    """
+    resolved = settings or MeasurementSettings()
+    resolved.validate()
+    predicate, parameters = scope.where("survey_runs")
+    every_run = [
+        str(row["survey_run_id"])
+        for row in connection.execute(
+            "SELECT survey_run_id FROM survey_runs"
+            + (f" WHERE {predicate}" if predicate else "")
+            + " ORDER BY COALESCE(capture_start_utc, imported_at) ASC",
+            parameters,
+        )
+    ]
+    # A run the caller named that is outside the campaign is refused
+    # rather than dropped: a rebuild that silently skipped a stop the
+    # operator asked for would report success over work it never did.
+    run_ids = scope.narrow(connection, run_ids)
+    if run_ids is None:
+        run_ids = every_run
+    # The reference gain and noise floor are the CAMPAIGN's, whichever
+    # runs are being rebuilt. Taking them from the requested subset made
+    # the field app's one-run-at-a-time rebuild compare each stop with
+    # itself, so a stop recorded at the wrong gain was never flagged
+    # until someone ran a full `geo measurements` by hand.
+    #
+    # With a campaign given, "the campaign" now means that campaign
+    # rather than the whole file: a second round recorded at a different
+    # gain no longer drags the first round's reference with it.
+    campaign_readings = _campaign_gain_readings(connection, every_run)
+    gain_sources = _campaign_gain_sources(campaign_readings)
+    campaign_gains = {
+        run_id: _as_gain(reading.value)
+        for run_id, reading in campaign_readings.items()
+    }
+    reference_gain = _modal_gain(campaign_gains)
+    campaign_noise = _campaign_noise_floors(connection, every_run)
+    reference_noise = _median_noise_floor(campaign_noise)
+    gains = {run_id: campaign_gains.get(run_id) for run_id in run_ids}
+    noise_floors = {run_id: campaign_noise.get(run_id) for run_id in run_ids}
+    per_run: list[dict[str, Any]] = []
+    total: list[dict[str, Any]] = []
+    for run_id in run_ids:
+        rows = build_run_measurements(connection, run_id, resolved)
+        _flag_gain_drift(rows, gains.get(run_id), reference_gain)
+        _flag_noise_floor_shift(rows, noise_floors.get(run_id), reference_noise)
+        write_run_measurements(connection, run_id, rows)
+        per_run.append({"survey_run_id": run_id, **summarise(rows)})
+        total.extend(rows)
     drifted = sorted(
         run_id
         for run_id, gain in gains.items()
@@ -833,7 +860,15 @@ def solve_all_sites(
             geojson=plan_to_geojson(plan),
             campaign_id=stored_campaign_id,
         )
+        # This solve read the membership as it stands, so whatever a curation
+        # marked superseded is now current again. Clearing it here rather than
+        # in the curation command means any route back to a fresh solve --
+        # `geo solve`, the field app, a rebuild -- lifts the mark, and only a
+        # solve that actually finished ever does.
+        if stored_campaign_id is not None:
+            clear_analysis_superseded(connection, stored_campaign_id)
         measurement_summary = summarise(fetch_all_measurements(connection, scope=scope))
+        connection.commit()
     finally:
         connection.close()
 
