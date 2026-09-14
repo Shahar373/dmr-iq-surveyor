@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import quote
@@ -22,8 +23,10 @@ from rich.console import Console
 from rich.table import Table
 
 from dmr_iq_surveyor.geo.store import connect_geo_database
+from dmr_iq_surveyor.project.binding import project_binding
 from dmr_iq_surveyor.project.claim import (
     Claim,
+    assert_claim,
     inspect_database,
     open_read_only,
     read_claim,
@@ -520,7 +523,7 @@ def _adopt(
     console.print(
         "[bold]Adoption assigns this whole database to the project[/bold], every table and every "
         "historical run. It assigns no run to a campaign: `campaign_id` stays NULL until a run is "
-        "recorded under one."
+        "recorded under one, or until `project campaign assign-runs` is told to file it."
     )
 
     if existing is not None and (
@@ -1012,3 +1015,387 @@ def campaign_new(
 
 
 __all__ = ["campaign_app", "console", "project_app"]
+
+
+def _parse_bound(value: str, *, flag: str) -> str:
+    """One end of a time range, as the ISO-8601 string the column holds.
+
+    `capture_start_utc` is stored as an offset-aware `isoformat()`, and every
+    query in the tree compares it as text. So the bound is parsed to prove it
+    is a real instant, then rendered back the same way the column was written
+    -- comparing a hand-typed `Z` against a stored `+00:00` is a string
+    comparison that silently means something else.
+
+    A bound without an offset is refused rather than assumed to be UTC. The
+    column is UTC, but a naive bound is as likely to be the operator's local
+    wall clock, and guessing wrong shifts the window by hours.
+    """
+    from datetime import datetime
+
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        _fail(
+            f"{flag} {value!r} is not an ISO-8601 timestamp. Write it as "
+            "2026-09-11T00:00:00+00:00 (or ...Z)"
+        )
+        raise
+    if parsed.tzinfo is None:
+        _fail(
+            f"{flag} {value!r} has no UTC offset. Capture times are stored in UTC, "
+            "and a bound without an offset would be read as UTC while probably "
+            "having been typed as local time. Write it as "
+            f"{text}+00:00 if that is what was meant"
+        )
+    return parsed.astimezone(UTC).isoformat()
+
+
+def _candidate_table(candidates: list[Any], *, title: str) -> Table:
+    table = Table(title=title)
+    table.add_column("run id")
+    table.add_column("captured (UTC)")
+    table.add_column("source")
+    table.add_column("site")
+    table.add_column("GPS")
+    table.add_column("gain")
+    for candidate in candidates:
+        table.add_row(
+            candidate.survey_run_id,
+            f"{candidate.capture_start_utc or 'unknown'} ({candidate.capture_time_source})",
+            candidate.source_basename,
+            candidate.site_id or "none",
+            (
+                f"{candidate.gps_latitude:.5f}, {candidate.gps_longitude:.5f}"
+                f" ({candidate.gps_source})"
+                if candidate.has_position
+                else f"none ({candidate.gps_source})"
+            ),
+            (
+                f"{candidate.gain:g} ({candidate.gain_source})"
+                if candidate.gain is not None
+                else "not recorded"
+            ),
+        )
+    return table
+
+
+@campaign_app.command("assign-runs")
+def campaign_assign_runs(
+    project: ProjectOption,
+    campaign_id: Annotated[
+        str, typer.Option("--campaign-id", help="The campaign to assign the runs to")
+    ],
+    run_id: Annotated[
+        list[str] | None,
+        typer.Option("--run-id", help="A survey run to assign (repeatable)"),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option(
+            "--since",
+            help=(
+                "Start of the capture-time range, inclusive, ISO-8601 with an offset. "
+                "Requires --until"
+            ),
+        ),
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option(
+            "--until",
+            help=(
+                "End of the capture-time range, exclusive, ISO-8601 with an offset. "
+                "Requires --since"
+            ),
+        ),
+    ] = None,
+    reason: Annotated[
+        str | None,
+        typer.Option("--reason", help="Why these runs belong to this round. Required to write"),
+    ] = None,
+    write: Annotated[
+        bool,
+        typer.Option("--write", help="Actually assign. Without it this only reports"),
+    ] = False,
+) -> None:
+    """Assign historical runs that declare no campaign to one that exists.
+
+    There is no backfill and no inference. A run is selected because its id
+    was typed or because its recorded capture time falls in a range that was
+    typed; never because its filename, its site, its date or its position
+    looked like they belonged together. Nothing is ever moved out of a
+    campaign it already declares.
+
+    Reports and changes nothing without `--write`, and a dry run leaves the
+    database byte for byte as it found it.
+    """
+    from dmr_iq_surveyor.survey.curation import (
+        CurationError,
+        apply_assignment,
+        build_plan,
+        fetch_runs,
+        select_by_time_range,
+        superseded_analysis,
+        undated_unassigned_runs,
+        validate_selection,
+    )
+    from dmr_iq_surveyor.survey.provenance import ProvenanceError, normalise_campaign_id
+
+    by_id = bool(run_id)
+    by_range = since is not None or until is not None
+    if by_id and by_range:
+        _fail(
+            "choose one way of selecting runs: --run-id, or --since with --until. "
+            "Naming runs and also giving a range asks two different questions, and "
+            "the answer to neither is their union"
+        )
+        return
+    if not by_id and not by_range:
+        _fail(
+            "name the runs to assign: --run-id (repeatable), or --since with --until. "
+            "There is deliberately no --all"
+        )
+        return
+    if by_range and (since is None or until is None):
+        _fail("--since and --until are given together; a range needs both ends")
+        return
+
+    try:
+        manifest = resolve_project(project)
+        campaign = resolve_campaign(manifest, campaign_id)
+        resolved_id = normalise_campaign_id(campaign_id)
+    except (ProjectError, ProvenanceError, FileNotFoundError) as exc:
+        _fail(str(exc))
+        return
+    if resolved_id is None:
+        _fail("--campaign-id must not be empty")
+        return
+    if campaign.is_closed:
+        _fail(
+            f"campaign {campaign.campaign_id!r} is closed ({campaign.path}), so its "
+            "membership is settled. Closing a round says the evidence in it is final, "
+            "and quietly adding stops afterwards would change conclusions already "
+            "reported from it. Re-open the manifest deliberately if that is meant"
+        )
+        return
+
+    start_bound = _parse_bound(since, flag="--since") if since is not None else None
+    end_bound = _parse_bound(until, flag="--until") if until is not None else None
+    if start_bound is not None and end_bound is not None and start_bound >= end_bound:
+        _fail(
+            f"--since {start_bound} is not before --until {end_bound}. The range is "
+            "half-open, [since, until), so an empty or inverted one selects nothing"
+        )
+        return
+
+    database = manifest.database
+    if not database.is_file():
+        _fail(
+            f"{database} does not exist. This command reads and writes an existing "
+            "project database; it never creates one"
+        )
+        return
+
+    # The report is built through a connection that structurally cannot write.
+    # `connect_geo_database` applies the schema, and a command documented as
+    # writing nothing must not be the reason a table appeared -- the same
+    # reason adoption inspects through `mode=ro` before it claims anything.
+    connection = open_read_only(database)
+    try:
+        # The claim is checked before anything is read, and again by the
+        # binding on every later open. A database that is not this project's
+        # must not have its membership rewritten from this project's manifest.
+        try:
+            assert_claim(
+                connection, project_id=manifest.project_id, analyzer=manifest.analyzer
+            )
+        except ProjectError as exc:
+            _fail(f"Project database refused: {exc}")
+            return
+
+        if by_id:
+            requested = list(dict.fromkeys(run_id or []))
+            found = fetch_runs(connection, requested)
+            try:
+                validate_selection(
+                    connection,
+                    campaign_id=resolved_id,
+                    requested_ids=requested,
+                    found=found,
+                )
+            except CurationError as exc:
+                _fail(str(exc))
+                return
+            selected = [found[key] for key in requested if key in found]
+        else:
+            assert start_bound is not None and end_bound is not None
+            selected = select_by_time_range(
+                connection, start_utc=start_bound, end_utc=end_bound
+            )
+
+        plan = build_plan(
+            connection,
+            project_id=manifest.project_id,
+            campaign_id=resolved_id,
+            database=str(database),
+            selected=selected,
+        )
+
+        header = Table(title="Assignment")
+        header.add_column("what")
+        header.add_column("value")
+        header.add_row("project", f"{manifest.project_id} ({manifest.path})")
+        header.add_row("target campaign", f"{resolved_id} ({campaign.path})")
+        header.add_row("database", str(database))
+        header.add_row(
+            "selection",
+            f"{len(run_id or [])} run id(s)"
+            if by_id
+            else f"capture time in [{start_bound}, {end_bound})",
+        )
+        header.add_row("runs to assign", str(len(plan.moving)))
+        header.add_row("already in target", str(len(plan.already_in_target)))
+        header.add_row(
+            "target holds now",
+            f"{plan.target_run_count} run(s) -> {plan.target_run_count + len(plan.moving)}",
+        )
+        header.add_row(
+            "unassigned holds now",
+            f"{plan.unassigned_run_count} run(s) -> "
+            f"{plan.unassigned_run_count - len(plan.moving)}",
+        )
+        console.print(header)
+
+        if by_range:
+            undated = undated_unassigned_runs(connection)
+            if undated:
+                console.print(
+                    f"[yellow]{len(undated)} unassigned run(s) have no capture time "
+                    "and no range can select them[/yellow]: "
+                    f"{', '.join(c.survey_run_id for c in undated[:8])}"
+                    f"{', ...' if len(undated) > 8 else ''}. Assign them by --run-id "
+                    "if they belong to this round."
+                )
+
+        if plan.moving:
+            console.print(_candidate_table(plan.moving, title="Runs that would be assigned"))
+        if plan.already_in_target:
+            console.print(
+                f"[green]{len(plan.already_in_target)} run(s) are already in "
+                f"{resolved_id}[/green] and would not be touched: "
+                f"{', '.join(c.survey_run_id for c in plan.already_in_target)}"
+            )
+        for warning in plan.warnings:
+            console.print(f"[yellow]Warning:[/yellow] {warning}")
+
+        recompute = Table(title="Derived analysis")
+        recompute.add_column("what")
+        recompute.add_column("effect")
+        recompute.add_row(
+            "measurements",
+            f"rebuilt for all {plan.target_run_count + len(plan.moving)} run(s) of "
+            f"{resolved_id}, and for the {plan.unassigned_run_count - len(plan.moving)} "
+            "run(s) left unassigned -- both populations' reference gain and noise "
+            "floor change",
+        )
+        recompute.add_row(
+            "stored solutions",
+            f"{plan.stored_solution_count} carry this campaign's stamp; they are kept "
+            "as history and marked superseded, never shown as current again until a "
+            "fresh solve",
+        )
+        recompute.add_row(
+            "stored plans",
+            f"{plan.stored_plan_count} carry this campaign's stamp; same treatment",
+        )
+        recompute.add_row(
+            "historical whole-database analysis",
+            "untouched -- solutions with campaign_id NULL are not this campaign's and "
+            "are neither relabelled nor removed",
+        )
+        console.print(recompute)
+
+        existing_mark = superseded_analysis(connection, resolved_id)
+        if existing_mark is not None:
+            console.print(
+                f"[yellow]This campaign's stored analysis is already marked "
+                f"superseded[/yellow] ({existing_mark.superseded_at}). Run "
+                f"`dmr-surveyor geo solve --campaign {resolved_id}` to draw its "
+                "conclusions again."
+            )
+
+        if not plan.moving:
+            console.print(
+                "\n[yellow]Nothing to assign.[/yellow] No selected run declares no "
+                "campaign, so there is no membership to change and nothing is "
+                "recorded."
+            )
+            return
+
+        if not write:
+            console.print(
+                "\n[yellow]Nothing was written.[/yellow] Re-run with --write and "
+                "--reason to assign these runs and rebuild the analysis."
+            )
+            return
+
+        if reason is None or not reason.strip():
+            _fail(
+                "--reason is required to write. A membership change is the one thing "
+                "in this database that no measurement explains, so the record of it "
+                "has to carry why it was made"
+            )
+            return
+
+    finally:
+        connection.close()
+
+    # Bound, not merely checked afterwards. The binding sits on the single
+    # `sqlite3.connect` in the codebase, so the claim is verified inside the
+    # connect itself and BEFORE the schema layers run any DDL. Asserting after
+    # `connect_geo_database` returned would already have migrated whatever
+    # file was at that path -- including a foreign one swapped in between the
+    # read-only preflight and this open.
+    try:
+        with project_binding(
+            project_id=manifest.project_id,
+            analyzer=manifest.analyzer,
+            database=database,
+        ):
+            connection = connect_geo_database(database)
+            try:
+                outcome = apply_assignment(
+                    connection,
+                    campaign_id=resolved_id,
+                    run_ids=[c.survey_run_id for c in plan.moving],
+                    reason=reason.strip(),
+                )
+            finally:
+                connection.close()
+    except typer.Exit:
+        # A deliberate exit is already the message it means to be. `typer.Exit`
+        # is a RuntimeError, so without this the broad handler below would
+        # catch it and re-report a clean refusal as a failed rebuild.
+        raise
+    except (CurationError, ProjectError, sqlite3.Error) as exc:
+        _fail(f"Nothing was assigned: {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001 - see below
+        # The rollback in `apply_assignment` has already run, so the database
+        # is as it was. What the operator needs from here is that sentence,
+        # not a traceback: a rebuild can fail for reasons this command cannot
+        # enumerate, and every one of them leaves the same recoverable state.
+        _fail(f"Nothing was assigned: the rebuild failed and was rolled back ({exc})")
+        return
+
+    console.print(
+        f"\n[green]Assigned[/green] {len(outcome['assigned'])} run(s) to {resolved_id} "
+        "and rebuilt the measurements for both populations."
+    )
+    console.print(
+        f"[yellow]The stored solutions for {resolved_id} are marked superseded.[/yellow] "
+        f"Run `dmr-surveyor geo solve --campaign {resolved_id}` to draw this round's "
+        "conclusions from its new membership; until then nothing presents the old "
+        "ones as current."
+    )

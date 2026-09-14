@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from dmr_iq_surveyor.reference.store import connect_reference_database
+from dmr_iq_surveyor.survey.curation import superseded_campaigns
 from dmr_iq_surveyor.survey.scope import WHOLE_DATABASE, CampaignScope
 
 GEO_SCHEMA = """
@@ -168,6 +169,32 @@ def store_plan(
     connection.commit()
 
 
+def _not_superseded(connection: sqlite3.Connection, alias: str) -> tuple[str, tuple[Any, ...]]:
+    """A predicate excluding conclusions a membership change has invalidated.
+
+    THE enforcement point. `campaign_analysis_state` is written in the same
+    transaction as a curation's `UPDATE`, and until a solve clears it the
+    rows stamped with that campaign are not what the campaign concludes --
+    they were drawn from a membership that no longer exists. Applying it here,
+    on the three accessors that answer "what is current", is what makes the
+    guarantee behavioural rather than documentary: the CLI, the exports, the
+    digest, the map and the field app all read through these and all inherit
+    it without knowing the rule.
+
+    A superseded row is not deleted and not relabelled. It stays in the
+    history, where it is true; it just stops being served as the answer.
+    """
+    marks = superseded_campaigns(connection)
+    if not marks:
+        return "", ()
+    names = sorted(marks)
+    placeholders = ", ".join("?" for _ in names)
+    return (
+        f"({alias}.campaign_id IS NULL OR {alias}.campaign_id NOT IN ({placeholders}))",
+        tuple(names),
+    )
+
+
 def latest_plan(
     connection: sqlite3.Connection, *, scope: CampaignScope = WHOLE_DATABASE
 ) -> dict[str, Any] | None:
@@ -190,11 +217,15 @@ def latest_plan(
     drawn from the stops beside it.
     """
     predicate, parameters = scope.where("geo_plans")
+    # A plan whose campaign has been curated since is not this round's next
+    # stop: it was computed from stops that are no longer its membership.
+    fresh, fresh_parameters = _not_superseded(connection, "geo_plans")
+    clauses = [clause for clause in (predicate, fresh) if clause]
     row = connection.execute(
         "SELECT * FROM geo_plans "
-        + (f"WHERE {predicate} " if predicate else "")
+        + (f"WHERE {' AND '.join(clauses)} " if clauses else "")
         + "ORDER BY rowid DESC LIMIT 1",
-        parameters,
+        (*parameters, *fresh_parameters),
     ).fetchone()
     return dict(row) if row is not None else None
 
@@ -260,15 +291,16 @@ def run_exclusion(connection: sqlite3.Connection, survey_run_id: str) -> str | N
     return str(row["reason"]) if row is not None else None
 
 
-def replace_run_measurements(
+def write_run_measurements(
     connection: sqlite3.Connection, survey_run_id: str, rows: list[dict[str, Any]]
 ) -> int:
-    """Replace every measurement derived from one survey run.
+    """Replace one run's measurements without ending the caller's transaction.
 
-    Deleting first means re-running after a corrected reference import (a
-    frequency added, an ambiguity resolved) leaves no stale rows behind --
-    the same reason `inventory.replace_run` and `import_survey_run` work
-    this way.
+    The committing wrapper below is what every existing caller uses. This
+    half exists for the one caller that may not commit here: campaign
+    curation rewrites membership and the measurements derived from it as a
+    single unit, and a commit in the middle of that would publish a
+    reassignment whose measurements had not been rebuilt yet.
     """
     connection.execute("DELETE FROM geo_measurements WHERE survey_run_id = ?", (survey_run_id,))
     created = datetime.now(UTC).isoformat()
@@ -312,8 +344,22 @@ def replace_run_measurements(
                 created,
             ),
         )
-    connection.commit()
     return len(rows)
+
+
+def replace_run_measurements(
+    connection: sqlite3.Connection, survey_run_id: str, rows: list[dict[str, Any]]
+) -> int:
+    """Replace every measurement derived from one survey run, and commit.
+
+    Deleting first means re-running after a corrected reference import (a
+    frequency added, an ambiguity resolved) leaves no stale rows behind --
+    the same reason `inventory.replace_run` and `import_survey_run` work
+    this way.
+    """
+    written = write_run_measurements(connection, survey_run_id, rows)
+    connection.commit()
+    return written
 
 
 def fetch_site_measurements(
@@ -436,9 +482,17 @@ def latest_solutions(
     # solutions against another campaign's and then find none of them
     # current, reporting a site as unsolved that this campaign had solved.
     outer_predicate, parameters = scope.where("g")
-    condition = f" AND {outer_predicate}" if outer_predicate else ""
+    # Excluded from BOTH halves, for the same reason the scope is: narrowing
+    # only the outer one would let a superseded row win the "which is latest"
+    # subquery and then vanish, reporting a site as unsolved while a valid
+    # earlier conclusion sat unread behind it.
+    fresh, fresh_parameters = _not_superseded(connection, "g")
+    inner_fresh, inner_fresh_parameters = _not_superseded(connection, "inner_solution")
+    condition = "".join(f" AND {clause}" for clause in (outer_predicate, fresh) if clause)
     inner_predicate, inner_parameters = scope.where("inner_solution")
-    inner = f" AND {inner_predicate}" if inner_predicate else ""
+    inner = "".join(
+        f" AND {clause}" for clause in (inner_predicate, inner_fresh) if clause
+    )
     rows = connection.execute(
         f"""
         SELECT g.*, s.site_key, s.rfss, s.site, s.observation_status
@@ -451,7 +505,7 @@ def latest_solutions(
         ){condition}
         ORDER BY s.rfss, s.site
         """,
-        (*inner_parameters, *parameters),
+        (*inner_parameters, *inner_fresh_parameters, *parameters, *fresh_parameters),
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -473,6 +527,13 @@ def latest_solutions_by_campaign(
     averaged or re-solved -- these are the stored rows, grouped by the boundary
     each was computed under, which is the only honest way to show rounds that
     were never meant to be compared.
+
+    A round curated since its solve keeps its row here and carries
+    `superseded_at`. This is the history, and the row is true as history: it
+    is what that round concluded at the time. What it is not is a current
+    answer, so callers that draw geometry must not draw this one -- the map
+    skips it rather than putting last week's region over this week's
+    membership.
     """
     rows = connection.execute(
         """
@@ -488,7 +549,15 @@ def latest_solutions_by_campaign(
         ORDER BY s.rfss, s.site, g.campaign_id IS NOT NULL, g.campaign_id
         """
     ).fetchall()
-    return [dict(row) for row in rows]
+    marks = superseded_campaigns(connection)
+    annotated: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        mark = marks.get(item["campaign_id"]) if item["campaign_id"] else None
+        item["superseded_at"] = mark.superseded_at if mark is not None else None
+        item["superseded_reason"] = mark.reason if mark is not None else ""
+        annotated.append(item)
+    return annotated
 
 
 def solution_history(

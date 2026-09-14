@@ -210,7 +210,10 @@ different project or a different analyzer is refused, with both values shown.
 
 **What adoption means, precisely.** It assigns the whole database — every
 table, every historical run — to the project. It assigns no run to a campaign:
-`campaign_id` stays `NULL` on existing rows, and there is no backfill.
+`campaign_id` stays `NULL` on existing rows, and there is no backfill. Filing
+those runs afterwards is a separate, deliberate act —
+[`project campaign assign-runs`](#assigning-historical-runs-to-a-campaign) —
+never something adoption does on the way past.
 
 ## The guard
 
@@ -436,8 +439,12 @@ had needed to restore from. `campaign_id = 'g4'` is never true for a row
 holding `NULL`, so those runs were filtered out of one screen and nowhere
 else -- an unscoped `geo sites`, `geo plan`, `geo export` or
 `scripts/campaign_digest.py` read them the whole time. Every `DELETE` in the
-tree is keyed by run id, batch or site id; no statement anywhere assigns or
-clears a `campaign_id`; the connect path only adds columns.
+tree is keyed by run id, batch or site id; the connect path only adds columns;
+and at the time nothing anywhere assigned or cleared a `campaign_id` at all.
+One statement does now -- `project campaign assign-runs`, added by PR6 and
+described below -- and it is the only one: it never runs without an operator
+naming the runs, it refuses a run that already declares a campaign, and it
+clears nothing.
 
 So the two questions now have two answers:
 
@@ -589,20 +596,16 @@ Done:
    / All selector; no write or delete through a historical view. *The section
    above.* Accepted on the Pi:
    [`docs/validation/pr4-capture-campaign-and-view-scope.md`](validation/pr4-capture-campaign-and-view-scope.md).
-
-In progress:
-
 6. **PR5 -- campaign lifecycle and ops hardening.** `fieldctl campaign
    list/current/new/use/close`; an atomic `field.env.local` edit that checks
    for a running job, restarts and can roll back; the `field.env.local`
    parity fix; the receiver serial and label completed in observed hardware
    identity; the PR4 Pi acceptance written up formally. *The two sections
-   below.* **The implementation is merged. A follow-up fix to the switch's
-   recovery is open, and the Pi has not been updated: it is still running
-   PR4.**
+   below.* **The implementation and the follow-up fix to the switch's
+   recovery are both merged, and the Pi now runs `b6ff094`.**
 
-   The follow-up is the part an external run against stateful stubs found,
-   and every one of it is about the *service* rather than the file: a
+   The follow-up was the part an external run against stateful stubs found,
+   and every one of it was about the *service* rather than the file: a
    rollback that restored the configuration while the process kept running
    the new one, an interrupt after the stop that left the deployment not
    recording, a success check that compared the campaign but not the
@@ -610,39 +613,68 @@ In progress:
    deciding from the configuration file about a service that may have read a
    different one hours ago.
 
-   **Then, and only then, the Pi.** Update the checkout and the installed
-   copy of `fieldctl` -- they are two files, and the installed one is what
-   runs -- and take a short acceptance: declare a campaign, switch to it,
-   close a different one, check that the configuration and the API agree,
-   reboot, and record one short capture. Check what the running service is
-   actually set to, not what the manifest says it should be: frequency,
-   sample rate, duration and hardware profile. `fieldctl` passes the
-   `FIELD_*` values as explicit flags on every start, and an explicit flag
-   outranks a campaign manifest's `defaults.capture`, so a round can run at
-   settings its own manifest does not name. That precedence is not being
-   changed here; the acceptance exists to make it visible. This is the
-   operator's to run, from the Pi.
+   **The lifecycle half of the Pi acceptance passed.** On the updated
+   checkout and the updated installed copy of `fieldctl` -- they are two
+   files, and the installed one is what runs -- the operator declared a
+   campaign, switched the deployment to it, closed the previous round,
+   confirmed the configuration and the API agreed on both project and
+   campaign, and rebooted. The deployment came back recording into
+   `2026-09-11_g4_geolocation_validation`, which is the campaign in force
+   now and **still holds no runs**: it is a declared, open, empty round.
+
+   **The RF half did not run, and is deferred rather than passed.** None of
+   what passed above is evidence about the radio, and none of it should be
+   read as acceptance of one: no capture was recorded into the new
+   campaign, the settings the running service is actually set to were not
+   read back off a live capture, and the positive-detection step was not
+   attempted. The
+   reason is not the software -- it is that there is currently no access to
+   an external reception point where an 868 MHz signal can be expected, and
+   a capture taken where nothing is transmitting proves nothing about either
+   the receiver or the solver. See the two items below.
+
+In progress:
+
+7. **PR6 -- historical campaign curation.** An explicit assignment command
+   with a dry run, selecting by run id or by an explicit time range. No
+   automatic backfill, ever, and no campaign inferred from a filename, a
+   site, a date or a position. Derived analysis is **recomputed**, never
+   given a blind label -- a run moved into a campaign changes that
+   campaign's reference gain and noise floor, so its conclusions have to be
+   drawn again. *The section below.*
+
+Before the field work can happen, and deliberately not part of PR6:
+
+8. **Field geolocation validation.** Still ahead of PR7 in priority, and
+   still the thing that matters most: everything above this line is
+   bookkeeping around measurements; none of it shows that the measurements
+   locate anything. Two steps, in order: first prove that a stop yields
+   usable positive measurements at all -- a real detection on live,
+   continuous P25, at a known gain, with a level the solver can read as
+   distance -- and only then a campaign of 6-10 stops with the geometry the
+   planner asks for, checked against a transmitter whose location is known.
+   Until the first step passes, the second is a day of driving that cannot
+   fail informatively.
+
+   **Blocked on access, not on code.** The first step needs a reception
+   point, outside, where an 868 MHz signal can actually be expected, and
+   there is none available at the moment. It is deferred until there is.
+
+9. **The map's tiles return 403.** Observed on the Pi. OpenStreetMap tile
+   requests from the field app are being refused, so the operator gets the
+   markers over an empty background. It is a **separate blocker, and it
+   comes before the field test**: driving 6-10 stops from a page that cannot
+   draw a map is worse than not driving them. It is deliberately not fixed
+   as part of PR6 -- a tile source is not campaign curation, and folding an
+   unrelated network fix into a database-membership change would make both
+   harder to review.
 
 Planned, in order, and none of it started here:
 
-7. **Field geolocation validation.** Moved ahead of PR6 and PR7 deliberately.
-   Everything above this line is bookkeeping around measurements; none of it
-   shows that the measurements locate anything. Two steps, in order: first
-   prove that a stop yields usable positive measurements at all -- a real
-   detection on live, continuous P25, at a known gain, with a level the
-   solver can read as distance -- and only then a campaign of 6-10 stops
-   with the geometry the planner asks for, checked against a transmitter
-   whose location is known. Until the first step passes, the second is a
-   day of driving that cannot fail informatively.
-8. **PR6 -- historical campaign curation.** An explicit assignment command
-   with a dry run, selecting by run id or by time range. No automatic
-   backfill, ever. Derived analysis is **recomputed**, never given a blind
-   label -- a run moved into a campaign changes that campaign's reference
-   gain and noise floor, so its conclusions have to be drawn again.
-9. **PR7 -- rich analysis UI.** A campaign dashboard, full provenance per run,
-   campaign comparison, and detection / geometry / solution-confidence
-   measures.
-10. **Later only.** An analyzer abstraction for P25, VOR, ATIS, DMR and other
+10. **PR7 -- rich analysis UI.** A campaign dashboard, full provenance per run,
+    campaign comparison, and detection / geometry / solution-confidence
+    measures.
+11. **Later only.** An analyzer abstraction for P25, VOR, ATIS, DMR and other
     signal types. Not before the above.
 
 ## A campaign is open until it is closed
@@ -809,11 +841,169 @@ rather than by retyping what did not. It never overwrites an existing
 manifest, and declaring a campaign does not switch the deployment to it: that
 is `use`, and it is a separate, deliberate step.
 
+## Assigning historical runs to a campaign
+
+A run recorded before campaigns existed carries `campaign_id IS NULL`, and
+adoption deliberately left it that way. Filing those runs is an operator's
+judgement, so there is a command that takes it and nothing that guesses:
+
+```bash
+dmr-surveyor project campaign assign-runs \
+  --project p25 --campaign-id 2026-09-11_g4_geolocation_validation \
+  --run-id 20260801_100000 --run-id 20260801_113000 \
+  --reason "day one, coastal road" --write
+```
+
+`--run-id` is repeatable. The alternative is an explicit range:
+
+```bash
+  --since 2026-08-01T00:00:00+00:00 --until 2026-08-02T00:00:00+00:00
+```
+
+The two are mutually exclusive -- naming runs *and* giving a range asks two
+questions whose answer is not their union -- and **there is no `--all`**. A run
+is never selected because its filename, its site, its date or its position
+looked like they belonged together; only because its id was typed, or its
+recorded capture time falls in a range that was typed.
+
+The range reads `capture_start_utc` and nothing else, never `imported_at`,
+which says when a file was filed rather than when the RF was recorded. It is
+half-open, `[since, until)`, so two adjacent ranges partition a day without the
+stop on the boundary landing in both. Both bounds must carry a UTC offset: the
+column is UTC, but a bound typed without one is as likely to be local wall
+clock, and guessing wrong moves the window by hours. **A run whose capture time
+is missing is never swept in.** `capture_time_source` is `unknown` for those --
+the time is absent, not late -- and a range cannot say whether an absent time
+falls inside it, so the command lists them and leaves them for `--run-id`.
+
+### The dry run
+
+It reports and changes nothing without `--write`, and **a dry run leaves the
+database byte for byte as it was found**. It prints the project and the target,
+the count, and per run: the id, the capture time and where that time came from,
+the source basename, the site, the GPS state and the gain with the tier it
+rests on. Then what the assignment would do to the derived analysis, and
+warnings for mixed gain, missing hardware provenance, a missing capture time
+and a missing position. None of those becomes an inferred value; they stay
+visible as what is not known.
+
+### What `--write` refuses
+
+Before anything is written, and again under the write lock, because the answer
+can change between the two:
+
+- a run id that is not in the database -- a typo or the wrong database, and one
+  bad id refuses the whole batch rather than letting the rest through;
+- a run that already belongs to **another** campaign. There is no reassignment
+  here: moving a run would change two rounds' conclusions at once, and the one
+  it left may already have been reported on;
+- a target campaign that does not exist, and a target that is **closed** --
+  closing says the evidence in a round is final;
+- a database with no `project_meta` claim, or one claimed by another project.
+
+A run already in the target is a reported no-op, and writes no audit row: an
+entry for a move that did not happen is a false record in the one place meant
+to say what did.
+
+### One transaction, and what could not join it
+
+Every successful assignment appends to `campaign_assignments` -- the run, the
+previous campaign, the target, a UTC timestamp, the `--reason`, and the tool
+version. `--reason` is required to write, because a membership change is the
+one thing in this database that no measurement explains.
+
+The membership change, the rebuilt measurements and the audit rows are one
+`BEGIN IMMEDIATE`. They have to be, because a campaign's reference gain and
+noise-floor median are computed from the runs in it: moving one run changes the
+yardstick every *other* run in that campaign was measured against, and changes
+it again for the runs left unassigned. So both populations are rebuilt, not
+just the runs that moved. Rebuilding the unassigned population touches no
+solution -- `geo_measurements` is derived data keyed by run, and the historical
+whole-database solves are left exactly as they are.
+
+The solve **cannot** join that transaction, and this is deliberate rather than
+unfinished. `solve_all_sites` opens its own connections, the store helpers
+commit per run and per site, and the grid search is minutes of work the repo
+already documents as such. A write lock held across it would lock the field app
+out of its own database at the side of a road.
+
+So the transaction carries the *invalidation* instead of the recompute.
+`campaign_analysis_state` records that the target's stored conclusions predate
+its membership, written in the same commit as the runs that moved, and a
+completed solve for that campaign is what clears it. A failure, a crash or an
+interrupt after the commit therefore leaves the mark standing:
+
+> **A new membership is never paired with an old analysis presented as
+> current.** The stored solutions stay as history -- nothing is deleted or
+> relabelled -- but until `geo solve --campaign <id>` has run again, the round
+> has no current conclusion rather than a stale one wearing that name.
+
+### Where that is enforced
+
+In the read layer, not in the command that wrote the mark. A mark only its
+writer consults is a comment: the round goes on serving its old mode, region
+and next stop to everything that did not think to ask.
+
+`latest_solutions`, `latest_solutions_by_campaign` and `latest_plan` are the
+three accessors that answer *what is current*, and every consumer reaches a
+stored conclusion through one of them -- `geo sites`, `geo plan`, the exports,
+the digest, the map, the site overview and the field app alike. So the
+predicate lives there, once:
+
+| what | under a superseded campaign |
+|---|---|
+| `latest_solutions` | no rows: the round has no current conclusion |
+| `latest_plan` | `None`; no next stop is offered |
+| the map, scoped | no mode and no region drawn |
+| the map, `all` | the round's geometry is **not** drawn |
+| `site_overview` | the round is still listed, each entry carrying `superseded_at` |
+| `/api/plan` | `analysis_status: superseded`, with the time and the reason |
+
+The overview keeps the row on purpose. It is true as *history* -- it is what
+that round concluded from the stops it had -- and dropping it would lose the
+record. What it stops being is an answer, so nothing draws it: a polygon on a
+map reads as a current claim about where a transmitter is, however carefully
+the popup beside it is worded.
+
+The API distinction matters as much as the geometry. An empty plan panel
+saying *"no solve has run yet"* sends the operator to a button they have
+already pressed; `analysis_status: superseded` with the timestamp says the
+solve ran and its conclusions were withdrawn when the membership changed.
+
+A solve clears the mark only after every solution **and** the plan are stored,
+so one that dies half-way leaves the mark standing and the old analysis
+hidden.
+
+`input_run_ids_json` on the solve that follows contains only runs from the
+target campaign, because the scope is a join through `survey_runs` and
+membership has already moved.
+
+Nothing here touches a solution carrying `campaign_id IS NULL`. Those mean
+*this solve read the whole database*, they are `Historical whole-database
+analysis`, and they are neither relabelled nor removed by a curation that had
+nothing to do with them.
+
+`campaign_assignments` deliberately carries **no foreign key** to
+`survey_runs`. It began with `ON DELETE CASCADE`, which meant deleting a stop
+also deleted the record that somebody had once filed it into a round --
+destroying the evidence at exactly the moment it is most worth having. The run
+id is plain text, so the audit row outlives the run it describes.
+
+The write runs under `project_binding`, so the claim is checked inside the
+single `sqlite3.connect` in the codebase and **before** any schema statement.
+Asserting it after `connect_geo_database` returned would already have migrated
+whatever file was at that path -- including one swapped in between the
+read-only preflight and the write.
+
+The two tables are additive and arrive by opening the database, so an existing
+database upgrades in place with no manual step and no data loss.
+
 ## What this does not do
 
 - It does not move, rewrite or reinterpret any existing row.
-- It does not assign a historical run to a campaign, and there is no backfill.
-  That is PR6's subject, and it is deliberately not solved by a migration.
+- It does not backfill. A historical run is assigned only by `project campaign
+  assign-runs`, one an operator named and gave a reason for; no migration, no
+  inference from a filename, a site, a date or a position, and no `--all`.
 - It does not change the estimator. Campaign scoping decides *which* evidence
   is read; the mathematics that reads it is untouched.
 - It does not add an analyzer. There is still exactly one, and site attribution
