@@ -705,8 +705,10 @@ def web_serve(
         typer.Option(
             "--gnss-device",
             help=(
-                "A GNSS receiver plugged into this machine (NMEA over USB serial, e.g. a "
-                "u-blox VK-162): a device path such as /dev/ttyACM0, or 'auto' to find one. "
+                "A GNSS receiver on this machine (e.g. a u-blox VK-162): 'gpsd' (or "
+                "gpsd://host:port) to read it through a running gpsd, a serial device path "
+                "such as /dev/ttyACM0 to read NMEA directly, or 'auto' (gpsd when one is "
+                "running, else the first GNSS serial port). "
                 "Its fixes drive a live survey without the phone's GPS, so a drive no longer "
                 "needs HTTPS. Unset keeps positions phone-only, as before"
             ),

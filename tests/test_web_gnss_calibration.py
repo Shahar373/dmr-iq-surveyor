@@ -137,6 +137,8 @@ def test_calibration_applies_in_an_empty_campaign_and_records_why(tmp_path: Path
         assert service.settings.lna_state == recommended["lna_state"]
         assert service.gain_origin and service.gain_origin.startswith("calibration")
         assert "lna_state:" in result["site_profile_yaml"]
+        # No hardware profile here, so the site profile is where it is kept.
+        assert result["persist_to"]["kind"] == "site_profile"
 
         # The evidence is kept on disk, and the state the phone polls shows it.
         report = json.loads(Path(result["report_path"]).read_text())
@@ -225,3 +227,15 @@ def _insert_run(database: Path, *, campaign_id: str) -> None:
         connection.commit()
     finally:
         connection.close()
+
+
+def test_with_a_hardware_profile_the_gain_is_kept_there(tmp_path: Path) -> None:
+    service = _service(tmp_path, hardware_profile="/etc/dmr-field/hardware/rsp.yaml")
+    try:
+        result = _calibrate(service, SimulatedReceiver(signal_db=-75.0))["result"]
+        persist = result["persist_to"]
+        assert persist["kind"] == "hardware_profile"
+        assert persist["profile"] == "/etc/dmr-field/hardware/rsp.yaml"
+        assert "if_gain_reduction_db:" in persist["yaml"] and "lna_state:" in persist["yaml"]
+    finally:
+        service.close()

@@ -20,13 +20,26 @@ plain file and, when it is a terminal, put into raw mode with `termios`.
 What is *not* inferred: NMEA RMC/GGA carry no accuracy in metres. HDOP and
 the satellite count are reported as what they are, and `accuracy_m` stays
 `None` rather than being invented from HDOP with an assumed range error.
+
+**Sharing the receiver with gpsd.** A serial port has one reader. On a Pi
+where gpsd already owns the puck -- because another application on the same
+machine uses it, or because chrony takes the time from it -- opening the port
+here fails with EBUSY, and *succeeding* would be worse: two readers splitting
+one byte stream each see corrupted sentences, and gpsd's clients (the clock
+among them) lose their source. So the reader is also a plain gpsd JSON client
+(`gpsd` or `gpsd://host:port`), and `auto` uses gpsd whenever one is listening
+on the standard port, opening the serial port only when none is. In gpsd mode
+`accuracy_m` is gpsd's own horizontal error estimate (`eph`, or the larger of
+`epx`/`epy`), reported as gpsd's estimate.
 """
 
 from __future__ import annotations
 
 import glob
+import json
 import os
 import select
+import socket
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -36,6 +49,10 @@ from typing import Any, Protocol
 
 GNSS_SOURCE_USB = "usb_gnss"
 AUTO_DEVICE = "auto"
+GPSD_SCHEME = "gpsd"
+GPSD_DEFAULT_HOST = "127.0.0.1"
+GPSD_DEFAULT_PORT = 2947
+_GPSD_WATCH = b'?WATCH={"enable":true,"json":true};\n'
 
 # Where a USB GNSS puck shows up on Linux. The by-id links are stable across
 # reboots and replugs; ttyACM*/ttyUSB* are the fallbacks for a kernel or image
@@ -210,10 +227,40 @@ class FixAssembler:
         return self._gga
 
 
-def resolve_device(path: str) -> str | None:
-    """`auto` to the first GNSS-looking serial port present, else `path`."""
+def parse_gpsd_address(device: str) -> tuple[str, int] | None:
+    """`gpsd` / `gpsd://host` / `gpsd://host:port` to (host, port); else None."""
+    if device == GPSD_SCHEME:
+        return GPSD_DEFAULT_HOST, GPSD_DEFAULT_PORT
+    prefix = GPSD_SCHEME + "://"
+    if not device.startswith(prefix):
+        return None
+    rest = device[len(prefix):].strip("/")
+    host, _, port = rest.partition(":")
+    try:
+        return (host or GPSD_DEFAULT_HOST, int(port) if port else GPSD_DEFAULT_PORT)
+    except ValueError as exc:
+        raise ValueError(f"bad gpsd address {device!r}") from exc
+
+
+def gpsd_listening(
+    host: str = GPSD_DEFAULT_HOST, port: int = GPSD_DEFAULT_PORT, timeout: float = 0.5
+) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def resolve_device(path: str, *, gpsd_probe: Callable[[], bool] = gpsd_listening) -> str | None:
+    """`auto` to gpsd if one is running, else the first GNSS-looking serial
+    port present; anything else is returned as given."""
     if path != AUTO_DEVICE:
         return path
+    if gpsd_probe():
+        # gpsd owns the receiver. Opening the port as well would either fail
+        # (EBUSY) or split its byte stream with gpsd -- never both work.
+        return f"{GPSD_SCHEME}://{GPSD_DEFAULT_HOST}:{GPSD_DEFAULT_PORT}"
     for pattern in _AUTO_PATTERNS:
         matches = sorted(glob.glob(pattern))
         if matches:
@@ -279,6 +326,107 @@ class SerialLineSource:
             pass
 
 
+class GpsdLineSource:
+    """A gpsd JSON stream: connect, ask for JSON reports, yield lines.
+
+    Read timeouts yield `None` rather than ending the stream, because gpsd
+    with no device attached sends nothing at all, and that is not a
+    disconnection.
+    """
+
+    def __init__(self, host: str, port: int, *, read_timeout_s: float = 1.0) -> None:
+        self.path = f"{GPSD_SCHEME}://{host}:{port}"
+        self._socket = socket.create_connection((host, port), timeout=5.0)
+        self._socket.settimeout(read_timeout_s)
+        self._socket.sendall(_GPSD_WATCH)
+
+    def lines(self) -> Iterator[str | None]:
+        pending = b""
+        while True:
+            try:
+                chunk = self._socket.recv(65536)
+            except TimeoutError:
+                yield None
+                continue
+            if not chunk:
+                raise OSError(f"{self.path}: gpsd closed the connection")
+            pending += chunk
+            while b"\n" in pending:
+                raw, pending = pending.split(b"\n", 1)
+                yield raw.decode("utf-8", errors="replace")
+            if len(pending) > 1 << 20:
+                raise OSError(f"{self.path}: no line end in 1 MiB; not gpsd")
+
+    def close(self) -> None:
+        try:
+            self._socket.close()
+        except OSError:
+            pass
+
+
+def default_opener(path: str) -> LineSource:
+    address = parse_gpsd_address(path)
+    if address is not None:
+        return GpsdLineSource(*address)
+    return SerialLineSource(path)
+
+
+def _finite(value: Any, low: float, high: float) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if low <= number <= high else None
+
+
+def parse_gpsd_tpv(message: dict[str, Any]) -> GnssFix | None:
+    """A gpsd TPV report to a fix, or None when it carries no usable position.
+
+    Mode 0/1 is no fix. (0, 0) is a receiver that has not locked, not a
+    position in the Gulf of Guinea.
+    """
+    if message.get("class") != "TPV":
+        return None
+    mode = _finite(message.get("mode"), 0, 3)
+    if mode is None or mode < 2:
+        return None
+    latitude = _finite(message.get("lat"), -90.0, 90.0)
+    longitude = _finite(message.get("lon"), -180.0, 180.0)
+    if latitude is None or longitude is None or (latitude == 0.0 and longitude == 0.0):
+        return None
+    accuracy = _finite(message.get("eph"), 0.0, 1e6)
+    if accuracy is None:
+        parts = [
+            value for value in (
+                _finite(message.get("epx"), 0.0, 1e6), _finite(message.get("epy"), 0.0, 1e6)
+            ) if value is not None
+        ]
+        accuracy = max(parts) if parts else None
+    altitude = _finite(message.get("altMSL", message.get("alt")), -1e4, 1e5)
+    return GnssFix(
+        latitude=latitude,
+        longitude=longitude,
+        speed_mps=_finite(message.get("speed"), 0.0, 1000.0),
+        course_deg=_finite(message.get("track"), 0.0, 360.0),
+        satellites=None,
+        hdop=None,
+        altitude_m=altitude,
+        time_utc=str(message.get("time") or ""),
+        accuracy_m=accuracy,
+    )
+
+
+def parse_gpsd_sky(message: dict[str, Any]) -> tuple[int | None, float | None] | None:
+    """A gpsd SKY report to (satellites used, HDOP), or None."""
+    if message.get("class") != "SKY":
+        return None
+    used = _finite(message.get("uSat"), 0, 999)
+    satellites = message.get("satellites")
+    if used is None and isinstance(satellites, list):
+        used = sum(1 for sat in satellites if isinstance(sat, dict) and sat.get("used") is True)
+    return (int(used) if used is not None else None, _finite(message.get("hdop"), 0.0, 99.99))
+
+
 @dataclass(slots=True)
 class GnssStatus:
     configured: str
@@ -318,7 +466,7 @@ class GnssReader:
     ) -> None:
         self._configured = device
         self._on_fix = on_fix
-        self._opener = opener or SerialLineSource
+        self._opener = opener or default_opener
         self._clock = clock
         self._retry_s = retry_s
         self._lock = threading.Lock()
@@ -377,7 +525,12 @@ class GnssReader:
             try:
                 self._source = self._opener(path)
             except OSError as exc:
-                self._set(state=STATE_ERROR, device=path, error=f"cannot open {path}: {exc}")
+                hint = ""
+                if getattr(exc, "errno", None) == 16:  # EBUSY
+                    hint = (" -- another program (usually gpsd) holds the receiver; use "
+                            "--gnss-device gpsd (or auto) to read it through gpsd")
+                self._set(state=STATE_ERROR, device=path,
+                          error=f"cannot open {path}: {exc}{hint}")
                 self._stop.wait(self._retry_s)
                 continue
             with self._lock:
@@ -404,6 +557,9 @@ class GnssReader:
             if self._stop.is_set():
                 return
             if line is None:
+                continue
+            if line.lstrip().startswith("{"):
+                self._consume_gpsd(line)
                 continue
             try:
                 sentence = parse_nmea(line)
@@ -439,12 +595,66 @@ class GnssReader:
                 self._set(error=f"fix consumer failed: {type(exc).__name__}: {exc}")
 
 
+    def _consume_gpsd(self, line: str) -> None:
+        try:
+            message = json.loads(line)
+        except ValueError:
+            with self._lock:
+                self._status.bad_sentences += 1
+            return
+        if not isinstance(message, dict):
+            return
+        now = self._clock()
+        with self._lock:
+            self._status.last_sentence_at = now
+            self._status.sentences += 1
+        kind = message.get("class")
+        if kind == "DEVICES":
+            devices = message.get("devices")
+            if isinstance(devices, list) and not devices:
+                self._set(state=STATE_SEARCHING,
+                          error="gpsd is running but has no GNSS device (is it plugged in?)")
+            return
+        if kind == "SKY":
+            parsed = parse_gpsd_sky(message)
+            if parsed is not None:
+                with self._lock:
+                    used, hdop = parsed
+                    if used is not None:
+                        self._status.satellites = used
+                    if hdop is not None:
+                        self._status.hdop = hdop
+            return
+        if kind != "TPV":
+            return
+        fix = parse_gpsd_tpv(message)
+        if fix is None:
+            self._set(state=STATE_NO_FIX, error="")
+            return
+        with self._lock:
+            fix.satellites = self._status.satellites
+            fix.hdop = self._status.hdop
+            self._status.state = STATE_FIX
+            self._status.error = ""
+            self._status.fixes += 1
+            self._status.last_fix_at = now
+            self._status.last_fix = fix.to_dict()
+        try:
+            self._on_fix(fix)
+        except Exception as exc:  # noqa: BLE001 - a consumer bug must not kill the reader
+            self._set(error=f"fix consumer failed: {type(exc).__name__}: {exc}")
+
+
 __all__ = [
     "AUTO_DEVICE",
     "FixAssembler",
     "GNSS_SOURCE_USB",
     "GnssFix",
     "GnssReader",
+    "GpsdLineSource",
+    "parse_gpsd_address",
+    "parse_gpsd_sky",
+    "parse_gpsd_tpv",
     "NmeaError",
     "SerialLineSource",
     "parse_nmea",
