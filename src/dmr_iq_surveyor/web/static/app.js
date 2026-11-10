@@ -401,7 +401,13 @@ function initMap() {
   const settings = state.settings;
   map = L.map("map", { zoomControl: false }).setView(settings.map_center, settings.map_zoom);
   L.control.zoom({ position: "topright" }).addTo(map);
-  L.tileLayer(settings.tile_url, { attribution: settings.tile_attribution, maxZoom: 19 }).addTo(map);
+  // Through the Pi when it proxies tiles: OSM blocks browser requests with no
+  // Referer, and this app sends none so the token cannot leak. The Pi fetches
+  // and caches them instead (web/tiles.py), which also keeps them offline.
+  const tileUrl = state.tilesViaPi
+    ? "/tiles/{z}/{x}/{y}.png" + (TOKEN ? "?token=" + encodeURIComponent(TOKEN) : "")
+    : settings.tile_url;
+  L.tileLayer(tileUrl, { attribution: settings.tile_attribution, maxZoom: 19 }).addTo(map);
   layers.regions90 = L.layerGroup().addTo(map);
   layers.regions50 = L.layerGroup().addTo(map);
   layers.measurements = L.layerGroup().addTo(map);
@@ -1849,6 +1855,7 @@ async function refreshState() {
   state.plan = payload.plan || null;
   state.scope = payload.scope || null;
   state.gainOrigin = payload.gain_origin || null;
+  state.tilesViaPi = Boolean(payload.tiles_via_pi);
   renderScope();
   renderPosition();
   renderSites();

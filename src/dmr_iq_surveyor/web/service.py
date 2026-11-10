@@ -85,6 +85,7 @@ from dmr_iq_surveyor.web.devices import STATE_CHECKING as DEVICE_STATE_CHECKING
 from dmr_iq_surveyor.web.devices import DeviceMonitor
 from dmr_iq_surveyor.web.jobs import Job, JobCancelled, JobRegistry
 from dmr_iq_surveyor.web.recordings import disk_status, enforce_retention, purge_recordings
+from dmr_iq_surveyor.web.tiles import TileCache, proxiable
 from dmr_iq_surveyor.web.viewscope import (
     CAMPAIGN_PREFIX,
     CURRENT_VIEW,
@@ -327,6 +328,12 @@ class FieldSettings:
     gnss_device: str | None = None
     tile_url: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
     tile_attribution: str = "(c) OpenStreetMap contributors"
+    # Serve tiles through the Pi (`/tiles/...`, web/tiles.py) instead of the
+    # phone fetching `tile_url` itself. OSM refuses browser requests with no
+    # Referer, and the app deliberately sends none so the token cannot leak;
+    # the proxy also caches, so tiles seen at home work offline in the field.
+    # Only applies to an http(s) `tile_url`; False restores direct fetching.
+    tile_proxy: bool = True
     map_center: tuple[float, float] = (32.0853, 34.7818)
     map_zoom: int = 11
     token: str | None = None
@@ -465,6 +472,13 @@ class FieldService:
         # The radio a calibration opens. A seam for tests, exactly like the
         # one `LiveSession` takes; in the field it is the real SDRplay.
         self.calibration_device_factory: Callable[[], IqDevice] = SoapyIqDevice
+        # The map-tile proxy (web/tiles.py), when the tile source is one the
+        # Pi can fetch. None means the phone fetches `tile_url` directly.
+        self.tile_cache: TileCache | None = None
+        if settings.tile_proxy and proxiable(settings.tile_url):
+            self.tile_cache = TileCache(
+                Path(settings.output_root).expanduser().resolve() / "tiles", settings.tile_url
+            )
         self._gnss: GnssReader | None = None
         if settings.gnss_device:
             self._gnss = GnssReader(settings.gnss_device, self._accept_gnss_fix)
@@ -903,6 +917,7 @@ class FieldService:
                 "validation_note": VALIDATION_NOTE,
             },
             "gain_origin": self.gain_origin,
+            "tiles_via_pi": self.tile_cache is not None,
             "calibration": self.last_calibration(),
             "gnss": self.gnss_status(),
         }
