@@ -239,3 +239,18 @@ def test_with_a_hardware_profile_the_gain_is_kept_there(tmp_path: Path) -> None:
         assert "if_gain_reduction_db:" in persist["yaml"] and "lna_state:" in persist["yaml"]
     finally:
         service.close()
+
+
+def test_a_stop_position_can_be_taken_from_the_pi_gps(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    try:
+        record = service.set_position(
+            {"latitude": 32.08169, "longitude": 34.90615, "source": "usb_gnss"}
+        )
+        assert record["source"] == "usb_gnss"
+        assert service.set_position({"latitude": 32.0, "longitude": 34.8})["source"] == "user"
+        assert service.set_position(
+            {"latitude": 32.0, "longitude": 34.8, "source": "device"}
+        )["source"] == "browser_gps"
+    finally:
+        service.close()

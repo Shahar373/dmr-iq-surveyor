@@ -119,6 +119,7 @@ ANALYSIS_SUPERSEDED = "superseded"
 
 POSITION_SOURCE_BROWSER = "browser_gps"
 POSITION_SOURCE_MANUAL = "user"
+POSITION_SOURCE_USB_GNSS = "usb_gnss"
 
 
 def slugify(value: str, fallback: str) -> str:
@@ -524,11 +525,10 @@ class FieldService:
                 float(payload["altitude_m"]) if payload.get("altitude_m") is not None else None
             ),
             "label": str(payload.get("label") or "").strip(),
-            "source": (
-                POSITION_SOURCE_BROWSER
-                if payload.get("source") == "device"
-                else POSITION_SOURCE_MANUAL
-            ),
+            "source": {
+                "device": POSITION_SOURCE_BROWSER,
+                "usb_gnss": POSITION_SOURCE_USB_GNSS,
+            }.get(payload.get("source"), POSITION_SOURCE_MANUAL),
             "set_at": datetime.now(UTC).isoformat(),
         }
         self._position_path.parent.mkdir(parents=True, exist_ok=True)
