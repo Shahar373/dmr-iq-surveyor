@@ -19,6 +19,22 @@ Neither changes how a bin is measured, stored or solved.
 
 ## 0. Once, on the Pi
 
+### If gpsd already owns the receiver (shared Pi)
+
+A serial port has one reader. When gpsd holds the VK-162 -- for example because another
+application on the same Pi reads its GPS through gpsd, or chrony takes the time from it -- read
+it **through gpsd** rather than opening the port:
+
+```bash
+echo 'FIELD_GNSS_DEVICE=gpsd' | sudo tee -a /etc/dmr-field/field.env.local && fieldctl restart
+```
+
+`auto` does the same by itself whenever gpsd is listening on 127.0.0.1:2947. Opening the port
+directly next to gpsd fails with `Device or resource busy`, and the status says so and names this
+setting. Nothing here stops, reconfigures or competes with gpsd, so its other clients keep working.
+
+### If nothing else uses the receiver
+
 ```bash
 sudo usermod -aG dialout "$USER"     # the GPS is a serial port owned by dialout; log in again
 ls -l /dev/serial/by-id/             # the VK-162 shows up as ...u-blox_7...-if00

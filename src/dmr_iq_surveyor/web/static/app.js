@@ -1420,7 +1420,14 @@ function showCalibrationResult(result) {
   box.append(el("div", "hint", result.reason || ""));
   if (result.apply_reason) box.append(el("div", "hint", result.apply_reason));
   for (const warning of result.warnings || []) box.append(el("div", "hint", "⚠ " + warning));
-  if (result.site_profile_yaml) {
+  const persist = result.persist_to;
+  if (persist && persist.yaml) {
+    const where = persist.kind === "hardware_profile" ? "the hardware profile" : "the site profile";
+    box.append(el("div", "hint",
+      `Until it is written to ${where} (${persist.profile}), a restart brings the old gain back. ` +
+      "Put these lines there:"));
+    box.append(el("pre", null, persist.yaml));
+  } else if (result.site_profile_yaml) {
     box.append(el("div", "hint", "To keep it after a restart, put this in the site profile:"));
     box.append(el("pre", null, result.site_profile_yaml));
   }

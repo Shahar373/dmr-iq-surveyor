@@ -2231,11 +2231,25 @@ class FieldService:
             "origin": self.gain_origin,
         }
         recommended = result.recommended
+        usable = recommended is not None and result.status == CALIBRATION_OK
         report["site_profile_yaml"] = (
             f"gain_mode: manual\ngain: {recommended.if_gain_reduction_db:g}\n"
             f"lna_state: {recommended.lna_state}\n"
-            if recommended is not None and result.status == CALIBRATION_OK
-            else None
+            if usable else None
+        )
+        # Where the gain has to be written to survive a restart. A hardware
+        # profile outranks the site profile at startup (cli_web), so when the
+        # campaign names one, editing the site profile would change nothing
+        # and the next restart would quietly bring the old gain back.
+        hardware = self.settings.hardware_profile
+        report["persist_to"] = (
+            {"kind": "hardware_profile", "profile": hardware,
+             "yaml": (f"gain_mode: manual\nif_gain_reduction_db: "
+                      f"{recommended.if_gain_reduction_db:g}\nlna_state: {recommended.lna_state}\n")}
+            if usable and hardware else
+            {"kind": "site_profile", "profile": self.settings.site_profile,
+             "yaml": report["site_profile_yaml"]}
+            if usable else None
         )
         directory = Path(self.settings.output_root).expanduser().resolve() / "calibration"
         directory.mkdir(parents=True, exist_ok=True)

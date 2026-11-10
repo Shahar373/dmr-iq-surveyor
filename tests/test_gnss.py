@@ -176,3 +176,115 @@ def test_a_port_that_cannot_be_opened_is_an_error_state_not_an_exception() -> No
         assert "dialout" in reader.status()["error"]
     finally:
         reader.stop()
+
+
+# -- through gpsd ----------------------------------------------------------------
+
+import json  # noqa: E402
+import socket  # noqa: E402
+import threading  # noqa: E402
+
+from dmr_iq_surveyor.capture.gnss import (  # noqa: E402
+    parse_gpsd_address,
+    parse_gpsd_sky,
+    parse_gpsd_tpv,
+)
+
+TPV = {"class": "TPV", "mode": 3, "lat": 32.0687, "lon": 34.8094, "speed": 13.9,
+       "track": 90.5, "eph": 4.2, "altMSL": 41.0, "time": "2026-11-10T16:00:00.000Z"}
+SKY = {"class": "SKY", "uSat": 8, "nSat": 12, "hdop": 0.9}
+
+
+def test_gpsd_addresses() -> None:
+    assert parse_gpsd_address("gpsd") == ("127.0.0.1", 2947)
+    assert parse_gpsd_address("gpsd://10.0.0.5") == ("10.0.0.5", 2947)
+    assert parse_gpsd_address("gpsd://localhost:3000") == ("localhost", 3000)
+    assert parse_gpsd_address("/dev/ttyACM0") is None
+
+
+def test_gpsd_tpv_and_sky_parse() -> None:
+    fix = parse_gpsd_tpv(TPV)
+    assert fix is not None and fix.latitude == 32.0687 and fix.accuracy_m == 4.2
+    assert fix.speed_mps == 13.9 and fix.altitude_m == 41.0
+    assert parse_gpsd_tpv({**TPV, "mode": 1}) is None, "mode 1 is no fix"
+    assert parse_gpsd_tpv({**TPV, "lat": 0.0, "lon": 0.0}) is None, "(0, 0) is not a position"
+    assert parse_gpsd_tpv({**TPV, "eph": None, "epx": 3.0, "epy": 5.0}).accuracy_m == 5.0
+    assert parse_gpsd_sky(SKY) == (8, 0.9)
+    listed = {"class": "SKY", "satellites": [{"used": True}, {"used": False}, {"used": True}]}
+    assert parse_gpsd_sky(listed) == (2, None)
+
+
+def test_auto_prefers_gpsd_when_it_is_running() -> None:
+    assert resolve_device(AUTO_DEVICE, gpsd_probe=lambda: True) == "gpsd://127.0.0.1:2947"
+
+
+class _FakeGpsd:
+    """A TCP server that answers ?WATCH with gpsd-style JSON lines."""
+
+    def __init__(self, messages: list[dict]) -> None:
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(1)
+        self.port = self.server.getsockname()[1]
+        self.watch_received = threading.Event()
+        self._messages = messages
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        connection, _ = self.server.accept()
+        with connection:
+            request = connection.recv(1024)
+            if b"?WATCH" in request:
+                self.watch_received.set()
+            for message in self._messages:
+                connection.sendall((json.dumps(message) + "\n").encode())
+            time.sleep(5)
+
+    def close(self) -> None:
+        self.server.close()
+
+
+def test_reader_takes_fixes_from_gpsd_without_touching_the_port() -> None:
+    gpsd = _FakeGpsd([{"class": "VERSION", "release": "3.25"},
+                      {"class": "DEVICES", "devices": [{"path": "/dev/dmr-gps"}]},
+                      SKY, {"class": "TPV", "mode": 1}, TPV])
+    fixes: list[GnssFix] = []
+    reader = GnssReader(f"gpsd://127.0.0.1:{gpsd.port}", fixes.append)
+    reader.start()
+    try:
+        _wait(lambda: fixes)
+        assert gpsd.watch_received.is_set()
+        assert fixes[0].latitude == 32.0687 and fixes[0].satellites == 8
+        status = reader.status()
+        assert status["state"] == "fix" and status["hdop"] == 0.9
+        assert status["device"] == f"gpsd://127.0.0.1:{gpsd.port}"
+    finally:
+        reader.stop()
+        gpsd.close()
+
+
+def test_gpsd_without_a_device_is_searching_not_an_error() -> None:
+    gpsd = _FakeGpsd([{"class": "DEVICES", "devices": []}])
+    reader = GnssReader(f"gpsd://127.0.0.1:{gpsd.port}", lambda fix: None)
+    reader.start()
+    try:
+        # "searching" is also the state before the first connect, so wait for
+        # the reason gpsd gave rather than for the state alone.
+        _wait(lambda: "no GNSS device" in reader.status()["error"])
+        assert reader.status()["state"] == "searching"
+    finally:
+        reader.stop()
+        gpsd.close()
+
+
+def test_a_busy_port_names_gpsd_as_the_way_out() -> None:
+    def opener(path: str) -> _FakeSource:
+        raise OSError(16, "Device or resource busy")
+
+    reader = GnssReader("/dev/ttyACM0", lambda fix: None, opener=opener, retry_s=0.05)
+    reader.start()
+    try:
+        _wait(lambda: reader.status()["state"] == "error")
+        assert "--gnss-device gpsd" in reader.status()["error"]
+    finally:
+        reader.stop()
