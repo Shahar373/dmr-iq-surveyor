@@ -570,3 +570,19 @@ def test_status_warns_about_a_campaign_with_no_project(tmp_path: Path) -> None:
 
     assert "WARNING" in result.stdout
     assert "FIELD_CAMPAIGN is set but FIELD_PROJECT is not" in result.stdout
+
+
+def test_a_configured_gnss_device_reaches_the_argv_and_empty_stays_absent(
+    tmp_path: Path,
+) -> None:
+    argv = _argv(tmp_path, FIELD_GNSS_DEVICE="/dev/ttyACM0")
+    assert argv[argv.index("--gnss-device") + 1] == "/dev/ttyACM0"
+
+    assert "--gnss-device" not in _argv(_fresh(tmp_path, "empty"), FIELD_GNSS_DEVICE="")
+    assert "--gnss-device" not in _argv(_fresh(tmp_path, "unset"))
+
+
+def _fresh(root: Path, name: str) -> Path:
+    directory = root / name
+    directory.mkdir()
+    return directory

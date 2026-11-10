@@ -700,6 +700,18 @@ def web_serve(
         ),
     ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", help="Log every HTTP request")] = False,
+    gnss_device: Annotated[
+        str | None,
+        typer.Option(
+            "--gnss-device",
+            help=(
+                "A GNSS receiver plugged into this machine (NMEA over USB serial, e.g. a "
+                "u-blox VK-162): a device path such as /dev/ttyACM0, or 'auto' to find one. "
+                "Its fixes drive a live survey without the phone's GPS, so a drive no longer "
+                "needs HTTPS. Unset keeps positions phone-only, as before"
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Serve the field app.
 
@@ -854,7 +866,13 @@ def web_serve(
             map_center=(map_latitude, map_longitude),
             map_zoom=map_zoom,
             token=resolved_token,
+            gnss_device=gnss_device,
         )
+        if gnss_device:
+            console.print(
+                f"[bold]GNSS[/bold] reading positions from {gnss_device} "
+                "(the reader retries until the receiver is present and has a fix)"
+            )
 
         space = disk_status(
             settings.recordings_dir,

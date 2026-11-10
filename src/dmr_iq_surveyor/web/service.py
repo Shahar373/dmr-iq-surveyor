@@ -22,6 +22,17 @@ from typing import Any
 
 from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.core import CaptureSettings, run_capture
+from dmr_iq_surveyor.capture.device import DeviceSettings, IqDevice, SoapyIqDevice
+from dmr_iq_surveyor.capture.gaincal import (
+    STATUS_OK as CALIBRATION_OK,
+)
+from dmr_iq_surveyor.capture.gaincal import (
+    CalibrationCancelled,
+    CalibrationSettings,
+    StepMeasurement,
+    run_calibration,
+)
+from dmr_iq_surveyor.capture.gnss import GNSS_SOURCE_USB, GnssFix, GnssReader
 from dmr_iq_surveyor.capture.probe import (
     DEFAULT_PROBE_TIMEOUT_SECONDS,
     ProbeRunner,
@@ -72,7 +83,7 @@ from dmr_iq_surveyor.survey.scope import CampaignScope, stored_analysis_label
 from dmr_iq_surveyor.survey.store import delete_survey_run
 from dmr_iq_surveyor.web.devices import STATE_CHECKING as DEVICE_STATE_CHECKING
 from dmr_iq_surveyor.web.devices import DeviceMonitor
-from dmr_iq_surveyor.web.jobs import Job, JobRegistry
+from dmr_iq_surveyor.web.jobs import Job, JobCancelled, JobRegistry
 from dmr_iq_surveyor.web.recordings import disk_status, enforce_retention, purge_recordings
 from dmr_iq_surveyor.web.viewscope import (
     CAMPAIGN_PREFIX,
@@ -307,6 +318,13 @@ class FieldSettings:
     # pass down a street replaces its measurement instead of adding a
     # near-identical one beside it.
     live_anchor: tuple[float, float] | None = None
+    # A GNSS receiver plugged into the Pi itself (NMEA over USB serial), by
+    # device path or `auto`. Unset is every deployment before it existed:
+    # positions come only from the phone's browser, exactly as before. Set,
+    # its fixes feed the same slot the phone's do, and while it has a fresh
+    # fix a phone fix is not allowed to interleave with it -- two receivers
+    # a few metres apart alternating would smear every window's midpoint.
+    gnss_device: str | None = None
     tile_url: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
     tile_attribution: str = "(c) OpenStreetMap contributors"
     map_center: tuple[float, float] = (32.0853, 34.7818)
@@ -343,7 +361,7 @@ class FieldSettings:
 # probed at all: enumerating a device a capture already has reports it as
 # missing, which is what once sent an operator off to diagnose working
 # hardware (see the note in start_capture below).
-DEVICE_HOLDING_JOB_KINDS = frozenset({"capture", "live"})
+DEVICE_HOLDING_JOB_KINDS = frozenset({"capture", "live", "calibration"})
 
 # How fresh a device reading has to be before opening the device for real,
 # and how long a caller will wait for one. The wait is deliberately longer
@@ -435,6 +453,22 @@ class FieldService:
         # every two-second poll from the phone.
         self._live_cc_index: list[tuple[float, str]] = []
         self._live_cc_tolerance_hz: float = 6_250.0
+        # Which receiver the fix in `_live_fix` came from.
+        self._live_fix_source: str | None = None
+        # The Pi's own GNSS receiver, when one is configured. Started here so
+        # it has a fix by the time the operator opens the Drive tab: a cold
+        # u-blox 7 can take a minute or more to its first fix.
+        # Where the gain in force came from, when it was changed in this
+        # process. `None` is the startup resolution (`cli_web` prints that one).
+        self.gain_origin: str | None = None
+        self._last_calibration: dict[str, Any] | None = None
+        # The radio a calibration opens. A seam for tests, exactly like the
+        # one `LiveSession` takes; in the field it is the real SDRplay.
+        self.calibration_device_factory: Callable[[], IqDevice] = SoapyIqDevice
+        self._gnss: GnssReader | None = None
+        if settings.gnss_device:
+            self._gnss = GnssReader(settings.gnss_device, self._accept_gnss_fix)
+            self._gnss.start()
 
     # -- operator position -------------------------------------------------
 
@@ -662,6 +696,8 @@ class FieldService:
     def close(self) -> None:
         """Release background workers. Called when the server shuts down."""
         self.devices.close()
+        if self._gnss is not None:
+            self._gnss.stop()
 
     @contextlib.contextmanager
     def _reading(self, connection: sqlite3.Connection | None) -> Any:
@@ -866,6 +902,9 @@ class FieldService:
                 "maturity": GEOLOCATION_MATURITY,
                 "validation_note": VALIDATION_NOTE,
             },
+            "gain_origin": self.gain_origin,
+            "calibration": self.last_calibration(),
+            "gnss": self.gnss_status(),
         }
 
     def geojson(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
@@ -1590,24 +1629,52 @@ class FieldService:
             raise ValueError("latitude and longitude are required numbers") from exc
         if not -90.0 <= latitude <= 90.0 or not -180.0 <= longitude <= 180.0:
             raise ValueError("latitude or longitude is out of range")
+        if self._gnss_has_fresh_fix():
+            # The Pi's own receiver is in charge while it has a fix. Answered,
+            # not refused: the phone keeps posting harmlessly, and takes over
+            # by itself if the USB receiver loses its fix.
+            with self._live_lock:
+                running = self._live_job_id
+                bins = len(self._live_bins)
+            return {"accepted": False, "ignored": "usb_gnss_in_use",
+                    "fix_count": self._live_fix_count,
+                    "drive_running": running is not None, "bins": bins}
         accuracy = payload.get("accuracy_m")
+        speed = payload.get("speed_mps")
+        return self._store_live_fix(
+            latitude,
+            longitude,
+            accuracy_m=float(accuracy) if accuracy is not None else None,
+            speed_mps=float(speed) if speed is not None else None,
+            source="phone",
+        )
+
+    def _store_live_fix(
+        self,
+        latitude: float,
+        longitude: float,
+        *,
+        accuracy_m: float | None,
+        speed_mps: float | None,
+        source: str,
+    ) -> dict[str, Any]:
         fix = Position(
             latitude=latitude,
             longitude=longitude,
-            accuracy_m=float(accuracy) if accuracy is not None else None,
+            accuracy_m=accuracy_m,
             at=time.monotonic(),
         )
         point = {
             "latitude": latitude,
             "longitude": longitude,
             "accuracy_m": fix.accuracy_m,
-            "speed_mps": (
-                float(payload["speed_mps"]) if payload.get("speed_mps") is not None else None
-            ),
+            "speed_mps": speed_mps,
+            "source": source,
             "at": datetime.now(UTC).isoformat(),
         }
         with self._live_lock:
             self._live_fix = fix
+            self._live_fix_source = source
             self._live_fix_wall = point["at"]
             self._live_fix_count += 1
             self._live_trail.append(point)
@@ -1617,6 +1684,36 @@ class FieldService:
             bins = len(self._live_bins)
         return {"accepted": True, "fix_count": self._live_fix_count,
                 "drive_running": running is not None, "bins": bins}
+
+    def _accept_gnss_fix(self, fix: GnssFix) -> None:
+        """A fix from the Pi's own receiver, on the reader's thread.
+
+        Timestamped on arrival by `_store_live_fix`, on this machine's
+        monotonic clock -- the GNSS time-of-day is correct but is not the
+        clock the live session measures staleness against.
+        """
+        if not (-90.0 <= fix.latitude <= 90.0 and -180.0 <= fix.longitude <= 180.0):
+            return
+        self._store_live_fix(
+            fix.latitude,
+            fix.longitude,
+            accuracy_m=fix.accuracy_m,
+            speed_mps=fix.speed_mps,
+            source=GNSS_SOURCE_USB,
+        )
+
+    def _gnss_has_fresh_fix(self) -> bool:
+        if self._gnss is None:
+            return False
+        with self._live_lock:
+            fix, source = self._live_fix, self._live_fix_source
+        if fix is None or source != GNSS_SOURCE_USB:
+            return False
+        return time.monotonic() - fix.at <= self.settings.live_max_position_age_seconds
+
+    def gnss_status(self) -> dict[str, Any] | None:
+        """The Pi's GNSS receiver as the operator needs to see it, or None."""
+        return self._gnss.status() if self._gnss is not None else None
 
     def _live_position(self) -> Position | None:
         with self._live_lock:
@@ -1703,6 +1800,9 @@ class FieldService:
             }
             payload["pull_over"] = self._pull_over_hint(running)
         payload["position_age_seconds"] = self.live_position_age_seconds()
+        with self._live_lock:
+            payload["position_source"] = self._live_fix_source
+        payload["gnss"] = self.gnss_status()
         payload["job"] = job.snapshot() if job is not None else None
         return payload
 
@@ -1804,6 +1904,13 @@ class FieldService:
         age = self.live_position_age_seconds()
         limit = self.settings.live_max_position_age_seconds
         if age is None:
+            if self._gnss is not None:
+                gnss = self._gnss.status()
+                raise ValueError(
+                    f"no GPS fix has arrived yet: the USB GPS is {gnss['state']}"
+                    + (f" ({gnss['error']})" if gnss["error"] else "")
+                    + "; give it a clear view of the sky, or share the phone's location"
+                )
             raise ValueError(
                 "no GPS fix has arrived yet; start location sharing in the browser first "
                 "(it needs HTTPS -- run the app with --tls)"
@@ -1983,6 +2090,213 @@ class FieldService:
             "elapsed_seconds": round(time.monotonic() - started, 1),
             "solutions": len(report["solutions"]),
         }
+
+    # -- gain calibration --------------------------------------------------
+
+    def calibration_targets(self, center_hz: float, sample_rate_hz: float) -> list[float]:
+        """Registry frequencies this tuning can actually see.
+
+        Reference data used only to say *which* channel's SNR to compare
+        settings by -- it changes nothing about what the detector looks for.
+        Kept inside the inner 80% of the capture, where `measure_block`
+        reads, and off the DC spike at the tuned centre.
+        """
+        registry = connect_geo_database(Path(self.settings.database_path))
+        try:
+            frequencies = {
+                float(channel["frequency_hz"])
+                for site_row in list_sites(registry)
+                for channel in site_row.get("channels", [])
+                if channel.get("frequency_hz") is not None
+            }
+        finally:
+            registry.close()
+        half = 0.4 * sample_rate_hz
+        return sorted(
+            value for value in frequencies
+            if 12_500.0 <= abs(value - center_hz) <= half
+        )
+
+    def start_gain_calibration(
+        self, payload: dict[str, Any], view: ViewScope = CURRENT_VIEW
+    ) -> Job:
+        """Step the receiver through a gain ladder and choose a fixed gain.
+
+        Writes no survey run and no measurement. What it may change is the
+        gain this server hands to the next stop or drive -- and only where
+        that cannot mix two gains inside one campaign (`_apply_calibration`).
+        """
+        refuse_if_read_only(view, "calibrating gain", self.settings.capture_campaign_id)
+        if not self.settings.allow_capture:
+            raise RuntimeError("captures are disabled on this server (--no-capture)")
+        running = self.jobs.active_job()
+        if running is not None:
+            raise RuntimeError(
+                f"a {running.kind} job is already running "
+                f"({running.stage or 'starting'}: {running.message or 'no detail yet'}); "
+                "wait for it to finish or cancel it first"
+            )
+        center = float(payload.get("center_frequency_hz") or self.settings.center_frequency_hz)
+        rate = float(payload.get("sample_rate_hz") or self.settings.sample_rate_hz)
+        lna = payload.get("lna_state")
+        current_lna = int(lna) if lna is not None else int(self.settings.lna_state)
+        given = payload.get("target_frequencies_hz")
+        if given:
+            targets = [float(value) for value in given]
+        else:
+            targets = self.calibration_targets(center, rate)
+
+        with self._device_transition_lock:
+            self.require_device_ready()
+            with self._claiming_device():
+
+                def work(job: Job) -> dict[str, Any]:
+                    return self._run_gain_calibration(
+                        job, center_hz=center, sample_rate_hz=rate,
+                        targets=targets, current_lna=current_lna,
+                    )
+
+                return self.jobs.submit(
+                    kind="calibration",
+                    label=f"gain calibration at {center / 1e6:.4f} MHz",
+                    work=work,
+                )
+
+    def _run_gain_calibration(
+        self,
+        job: Job,
+        *,
+        center_hz: float,
+        sample_rate_hz: float,
+        targets: list[float],
+        current_lna: int,
+    ) -> dict[str, Any]:
+        settings = CalibrationSettings()
+        job.emit(
+            "calibrate",
+            "stay still: stepping the receiver through "
+            f"{len(settings.ladder(current_lna))} gain settings"
+            + (f", judging by {len(targets)} target channel(s)" if targets else
+               ", judging by the noise floor (no target channel in this tuning)"),
+            progress=0.01,
+        )
+
+        def progress(done: int, total: int, step: StepMeasurement) -> None:
+            if step.error:
+                detail = f"skipped ({step.error})"
+            else:
+                snr = step.best_target_snr_db()
+                detail = (
+                    f"peak {step.peak_dbfs:.1f} dBFS"
+                    + (" CLIPPING" if step.clip_fraction else "")
+                    + f", floor {step.noise_floor_db:.1f} dB"
+                    + (f", target SNR {snr:.1f} dB" if snr is not None else "")
+                )
+            job.emit(
+                "calibrate",
+                f"step {done}/{total}: LNA {step.lna_state}, IFGR "
+                f"{step.if_gain_reduction_db:g} dB -- {detail}",
+                progress=0.02 + 0.93 * done / total,
+                extra={"step": step.to_dict()},
+            )
+
+        base = DeviceSettings(
+            driver=self.settings.driver,
+            sample_rate_hz=sample_rate_hz,
+            center_frequency_hz=center_hz,
+            if_gain_reduction_db=float(self.settings.if_gain_reduction_db),
+            lna_state=current_lna,
+        )
+        try:
+            result = run_calibration(
+                self.calibration_device_factory(),
+                base,
+                targets_hz=targets,
+                current_lna_state=current_lna,
+                settings=settings,
+                progress=progress,
+                cancelled=lambda: job.cancelled,
+            )
+        except CalibrationCancelled as exc:
+            raise JobCancelled("gain calibration cancelled; the gain was not changed") from exc
+
+        report = result.to_dict()
+        applied, apply_reason = self._apply_calibration(result.status, result.recommended)
+        report["applied"] = applied
+        report["apply_reason"] = apply_reason
+        report["campaign_id"] = self.settings.capture_campaign_id
+        report["in_force"] = {
+            "if_gain_reduction_db": self.settings.if_gain_reduction_db,
+            "lna_state": self.settings.lna_state,
+            "origin": self.gain_origin,
+        }
+        recommended = result.recommended
+        report["site_profile_yaml"] = (
+            f"gain_mode: manual\ngain: {recommended.if_gain_reduction_db:g}\n"
+            f"lna_state: {recommended.lna_state}\n"
+            if recommended is not None and result.status == CALIBRATION_OK
+            else None
+        )
+        directory = Path(self.settings.output_root).expanduser().resolve() / "calibration"
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        path = directory / f"gain_{stamp}.json"
+        path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+        report["report_path"] = str(path)
+        with self._live_lock:
+            self._last_calibration = report
+        if recommended is not None:
+            job.emit(
+                "calibrate",
+                f"recommended IF gain reduction {recommended.if_gain_reduction_db:g} dB, "
+                f"LNA state {recommended.lna_state} -- "
+                + ("applied" if applied else "NOT applied")
+                + f": {apply_reason}",
+                progress=0.99,
+            )
+        return report
+
+    def _apply_calibration(self, status: str, recommended: Any) -> tuple[bool, str]:
+        """Put a calibrated gain in force, unless that would mix gains.
+
+        The method compares levels between places, so a campaign is only
+        meaningful at one gain. Changing it is therefore allowed only while
+        the campaign being written holds no runs yet; otherwise the result is
+        kept as a recommendation and the operator decides (a new campaign, or
+        the site profile edited by hand).
+        """
+        if status != CALIBRATION_OK or recommended is None:
+            return False, "the calibration did not produce a usable setting"
+        current = (float(self.settings.if_gain_reduction_db), int(self.settings.lna_state))
+        wanted = (float(recommended.if_gain_reduction_db), int(recommended.lna_state))
+        if current == wanted:
+            return True, "the gain in force is already this setting"
+        campaign = self.settings.capture_campaign_id
+        with self._reading(None) as reader:
+            if campaign is None:
+                row = reader.execute(
+                    "SELECT COUNT(*) AS n FROM survey_runs WHERE campaign_id IS NULL"
+                ).fetchone()
+            else:
+                row = reader.execute(
+                    "SELECT COUNT(*) AS n FROM survey_runs WHERE campaign_id = ?", (campaign,)
+                ).fetchone()
+        runs = int(row["n"]) if row is not None else 0
+        if runs:
+            where = f"campaign {campaign!r}" if campaign else "the unassigned runs"
+            return False, (
+                f"{where} already holds {runs} run(s) at IF gain reduction {current[0]:g} dB, "
+                f"LNA state {current[1]}; measuring the rest at another gain would make their "
+                "levels incomparable. Start a new campaign to use this setting"
+            )
+        self.settings.if_gain_reduction_db = wanted[0]
+        self.settings.lna_state = wanted[1]
+        self.gain_origin = f"calibration {datetime.now(UTC).isoformat(timespec='seconds')}"
+        return True, "the campaign has no runs yet, so the new gain applies to everything in it"
+
+    def last_calibration(self) -> dict[str, Any] | None:
+        with self._live_lock:
+            return self._last_calibration
 
     def _take_pending_runs(self) -> list[str]:
         with self._live_lock:

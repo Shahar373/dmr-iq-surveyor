@@ -132,6 +132,15 @@
       is the reason this mode exists on a Pi.
     </p>
     <div id="drive-insecure" class="notice error" hidden></div>
+    <!-- Shown only when the server was started with --gnss-device: a GNSS
+         receiver on the Pi itself. While it has a fix it places the drive,
+         and the phone's GPS below is only a fallback. -->
+    <div class="row" id="drive-usb-row" hidden>
+      <div class="field grow">
+        <label>USB GPS (on the Pi)</label>
+        <div id="drive-usb-gps" class="readout">waiting…</div>
+      </div>
+    </div>
     <div class="row">
       <div class="field grow">
         <label>Phone GPS</label>
@@ -141,6 +150,28 @@
     <div class="row buttons">
       <button id="drive-share" class="primary">Share my location</button>
     </div>
+
+    <hr>
+
+    <!-- Gain calibration. Done once, parked, before the first drive of a
+         campaign: the receiver is stepped through a ladder of gain settings
+         and the least sensitive one that still gives the best SNR is chosen. -->
+    <div class="field"><label>Receiver gain</label></div>
+    <div id="cal-gain" class="readout">–</div>
+    <div class="row buttons">
+      <button id="cal-start" class="primary">Calibrate gain</button>
+      <button id="cal-cancel" class="danger" hidden>Cancel</button>
+    </div>
+    <p class="hint">
+      Park where 469 MHz is heard, ideally the strongest place you expect to drive through, and
+      stay still for about a minute. The gain is only changed while this campaign has no
+      measurements yet — a campaign must be measured at one gain.
+    </p>
+    <div id="cal-box" hidden>
+      <div class="progress"><div id="cal-bar" class="bar"></div></div>
+      <div id="cal-stage" class="readout"></div>
+    </div>
+    <div id="cal-result" class="notice" hidden></div>
 
     <hr>
 

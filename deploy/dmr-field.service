@@ -54,8 +54,9 @@ Type=exec
 User=@FIELD_USER@
 Group=@FIELD_GROUP@
 # libusb reaches the RSP1A through /dev/bus/usb, whose udev rules grant
-# plugdev.
-SupplementaryGroups=plugdev
+# plugdev. A USB GNSS receiver (FIELD_GNSS_DEVICE) is a /dev/ttyACM* or
+# /dev/ttyUSB* serial port, which udev gives to dialout.
+SupplementaryGroups=plugdev dialout
 
 # fieldctl passes every path as an absolute one, because band and site names
 # resolve relative to the current directory (survey/profiles.py) and so does

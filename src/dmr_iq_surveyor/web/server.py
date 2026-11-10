@@ -216,6 +216,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"stops": self.service.stops(view)})
             elif path == "/api/live":
                 self._send_json(self.service.live_status())
+            elif path == "/api/calibration":
+                self._send_json({"calibration": self.service.last_calibration()})
+            elif path == "/api/gnss":
+                self._send_json({"gnss": self.service.gnss_status()})
             elif path == "/api/export":
                 self._send_export((query.get("format") or ["geojson"])[0], view)
             elif path.startswith("/api/history/"):
@@ -268,6 +272,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._start(lambda: self.service.start_solve(payload, view))
             elif path == "/api/live/start":
                 self._start(lambda: self.service.start_live(payload, view))
+            elif path == "/api/calibrate/gain":
+                self._start(lambda: self.service.start_gain_calibration(payload, view))
             elif path == "/api/live/solve":
                 self._send_json(self.service.request_live_solve(view))
             elif path == "/api/live/hold":
