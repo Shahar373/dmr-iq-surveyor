@@ -29,6 +29,7 @@ from dmr_iq_surveyor import __version__
 from dmr_iq_surveyor.capture.probe import ProbeRunner
 from dmr_iq_surveyor.web.jobs import Job
 from dmr_iq_surveyor.web.service import FieldService, FieldSettings, PositionStale
+from dmr_iq_surveyor.web.tiles import TileError
 from dmr_iq_surveyor.web.tls import HANDSHAKE_TIMEOUT_SECONDS, Certificate, build_context
 from dmr_iq_surveyor.web.viewscope import (
     CURRENT_VIEW,
@@ -188,6 +189,14 @@ class _Handler(BaseHTTPRequestHandler):
         # Static assets are served without a token: the page has to load
         # before it can read the token out of its own URL and send it on
         # every API call. Nothing under /static is sensitive.
+        if path.startswith("/tiles/"):
+            # Same token as the API: the proxy fetches from the internet on
+            # the caller's behalf, so it is not an open relay.
+            if not self._authorised(query):
+                self._send_error_json(401, "missing or invalid token")
+                return
+            self._serve_tile(path)
+            return
         if not path.startswith("/api/"):
             self._serve_static("/index.html" if path == "/" else path)
             return
@@ -419,6 +428,29 @@ class _Handler(BaseHTTPRequestHandler):
                     return
         except (BrokenPipeError, ConnectionResetError):
             return
+
+    def _serve_tile(self, path: str) -> None:
+        cache = self.service.tile_cache
+        parts = path[len("/tiles/"):].split("/")
+        if cache is None or len(parts) != 3 or not parts[2].endswith(".png"):
+            self._send_error_json(404, f"not found: {path}")
+            return
+        try:
+            z, x, y = int(parts[0]), int(parts[1]), int(parts[2][:-4])
+            body = cache.get(z, x, y)
+        except ValueError:
+            self._send_error_json(404, f"not found: {path}")
+            return
+        except TileError as exc:
+            self._send_error_json(exc.status, str(exc))
+            return
+        self._response_started = True
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_static(self, path: str) -> None:
         relative = path.lstrip("/") or "index.html"

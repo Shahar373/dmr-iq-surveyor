@@ -605,6 +605,19 @@ def web_serve(
     tile_attribution: Annotated[
         str, typer.Option("--tile-attribution", help="Attribution shown on the map")
     ] = "(c) OpenStreetMap contributors",
+    tile_proxy: Annotated[
+        bool,
+        typer.Option(
+            "--tile-proxy/--no-tile-proxy",
+            help=(
+                "Serve an http(s) --tile-url through this machine, with a disk cache under "
+                "<output>/tiles. OSM blocks browser tile requests without a Referer, which "
+                "this app never sends (it would leak the token); the cache also keeps "
+                "viewed areas available offline. --no-tile-proxy lets the phone fetch "
+                "tiles directly, as before"
+            ),
+        ),
+    ] = True,
     token: Annotated[
         str | None,
         typer.Option(
@@ -865,6 +878,7 @@ def web_serve(
             solve_resolution_m=solve_resolution,
             tile_url=tile_url,
             tile_attribution=tile_attribution,
+            tile_proxy=tile_proxy,
             map_center=(map_latitude, map_longitude),
             map_zoom=map_zoom,
             token=resolved_token,
