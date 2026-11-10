@@ -333,6 +333,29 @@ class SoapyIqDevice:
             )
         self._device.setGain(rx, channel, name, value)
 
+    def set_gain(self, if_gain_reduction_db: float, lna_state: int) -> None:
+        """Retune both manual gain elements on an open, streaming device.
+
+        Used by gain calibration (`capture/gaincal.py`) to step through
+        settings without re-initialising the SDRplay API at every step.
+        Out-of-range values are refused, exactly as at open.
+        """
+        from SoapySDR import SOAPY_SDR_RX
+
+        assert self._device is not None, "set_gain called before open()"
+        available = set(self._device.listGains(SOAPY_SDR_RX, self._channel))
+        if GAIN_ELEMENT_RF in available:
+            self._set_named_gain(SOAPY_SDR_RX, self._channel, GAIN_ELEMENT_RF, float(lna_state))
+        if GAIN_ELEMENT_IF not in available:
+            raise RuntimeError(f"device exposes no {GAIN_ELEMENT_IF!r} gain element")
+        self._set_named_gain(
+            SOAPY_SDR_RX, self._channel, GAIN_ELEMENT_IF, float(if_gain_reduction_db)
+        )
+        self.applied_settings["gains"] = {
+            name: float(self._device.getGain(SOAPY_SDR_RX, self._channel, name))
+            for name in sorted(available)
+        }
+
     def read_stream_chunk(self, max_frames: int) -> np.ndarray:
         assert self._buffer is not None, "read_stream_chunk called before open()"
         frames = min(max_frames, self._mtu)

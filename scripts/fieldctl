@@ -274,6 +274,8 @@ load_env() {
     # them -- which is exactly the file every existing Pi already has.
     : "${FIELD_PROJECT:=}"
     : "${FIELD_CAMPAIGN:=}"
+    # Empty means positions come from the phone only, as before it existed.
+    : "${FIELD_GNSS_DEVICE:=}"
     : "${FIELD_CENTER_FREQUENCY:=867406250}"
     : "${FIELD_SAMPLE_RATE:=5000000}"
     : "${FIELD_DURATION:=90}"
@@ -377,6 +379,9 @@ build_argv() {
     fi
     if [[ -n "$FIELD_CAMPAIGN" ]]; then
         ARGV+=( --campaign "$FIELD_CAMPAIGN" )
+    fi
+    if [[ -n "$FIELD_GNSS_DEVICE" ]]; then
+        ARGV+=( --gnss-device "$FIELD_GNSS_DEVICE" )
     fi
 }
 

@@ -58,6 +58,17 @@ class _Handler(BaseHTTPRequestHandler):
         super().setup()
         self._response_started = False
 
+    def handle_one_request(self) -> None:
+        # Per REQUEST, not per connection. `setup()` runs once for a whole
+        # HTTP/1.1 keep-alive connection, so a flag reset only there stayed
+        # set after the first response, and every later request on the same
+        # socket was answered by closing it. A browser then silently resends
+        # the request on a new connection -- which ran every POST twice: a
+        # second job start answered 409 "already running" while the first
+        # ran, and each phone fix was stored twice.
+        self._response_started = False
+        super().handle_one_request()
+
     # -- plumbing ----------------------------------------------------------
 
     @property
@@ -205,6 +216,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"stops": self.service.stops(view)})
             elif path == "/api/live":
                 self._send_json(self.service.live_status())
+            elif path == "/api/calibration":
+                self._send_json({"calibration": self.service.last_calibration()})
+            elif path == "/api/gnss":
+                self._send_json({"gnss": self.service.gnss_status()})
             elif path == "/api/export":
                 self._send_export((query.get("format") or ["geojson"])[0], view)
             elif path.startswith("/api/history/"):
@@ -257,6 +272,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._start(lambda: self.service.start_solve(payload, view))
             elif path == "/api/live/start":
                 self._start(lambda: self.service.start_live(payload, view))
+            elif path == "/api/calibrate/gain":
+                self._start(lambda: self.service.start_gain_calibration(payload, view))
             elif path == "/api/live/solve":
                 self._send_json(self.service.request_live_solve(view))
             elif path == "/api/live/hold":

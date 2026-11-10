@@ -565,6 +565,14 @@ when you ask for it — bins are written the whole time either way, and a solve 
 map catches up with them, at the cost of CPU the receiver is competing for. Stopping the drive runs
 a final solve. Set `live_solve_every_bins` above zero to have it happen on its own.
 
+**A GPS on the Pi, and a calibrated gain.** `web serve --gnss-device auto` (or
+`FIELD_GNSS_DEVICE` for the service) reads a USB GNSS receiver such as a u-blox VK-162 directly, so
+a drive no longer depends on the phone's GPS or on HTTPS; the phone becomes the fallback. The
+Drive tab's **Calibrate gain** button steps the receiver through a gain ladder with a progress bar
+and picks the least sensitive setting that still gives the best SNR, applying it only while the
+campaign has no measurements yet. See
+[`docs/FIELD-DRIVE-USB-GPS-AND-GAIN.md`](docs/FIELD-DRIVE-USB-GPS-AND-GAIN.md).
+
 **Driving alone.** While a drive runs the tab shows three large numbers — bins, sites heard in the
 last bin, GPS age — and speaks the events a driver cannot look down for: drive started, GPS lost
 and back, every fifth bin, a stop suggestion, "done, you can drive" after a hold, drive stopped. The

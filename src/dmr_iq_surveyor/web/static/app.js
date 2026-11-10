@@ -43,6 +43,14 @@ const live = {
   pullOverBin: null,
   wakeLock: null,
   lastSpoken: { text: "", at: 0 },
+  // The Pi's own GNSS receiver, as last reported by the server (null when the
+  // server was started without --gnss-device).
+  gnss: null,
+  positionSource: null,
+  usbAnnouncedFix: false,
+  // Gain calibration in progress, if any.
+  calJobId: null,
+  calStream: null,
 };
 
 /* --------------------------------------------------------------- driving aids */
@@ -765,6 +773,7 @@ const MUTATING_CONTROLS = [
   "#record", "#purge", "#resolve",
   "#use-gps", "#save-position", "#pick-on-map",
   "#drive-share", "#drive-start", "#drive-solve", "#drive-hold",
+  "#cal-start",
 ];
 
 /* The view is the outer authority on every mutating control: a job callback
@@ -1228,6 +1237,17 @@ function checkSecureContext() {
     notice.hidden = true;
     return true;
   }
+  if (usbGnssConfigured()) {
+    // The Pi has its own GPS, so the phone's is only a fallback: plain HTTP
+    // costs that fallback and nothing else.
+    notice.hidden = false;
+    notice.className = "notice";
+    notice.textContent =
+      "Not a secure context, so the phone will not share its GPS. The drive uses the " +
+      "USB GPS on the Pi instead; it has no fallback if that receiver loses its fix.";
+    $("#drive-share").disabled = true;
+    return false;
+  }
   notice.hidden = false;
   notice.textContent =
     "This page is not a secure context, so the browser will not share GPS and a drive " +
@@ -1317,6 +1337,190 @@ function stopLocationSharing() {
   renderDriveGps();
 }
 
+/* ------------------------------------------------------- USB GNSS on the Pi */
+
+function usbGnssConfigured() {
+  return Boolean(state.settings && state.settings.gnss_device);
+}
+
+function usbFixFresh(gnss) {
+  return Boolean(gnss && gnss.state === "fix" && gnss.fix_age_s !== null && gnss.fix_age_s <= 5);
+}
+
+function renderGnss(gnss) {
+  live.gnss = gnss || null;
+  const row = $("#drive-usb-row");
+  if (!row) return;
+  row.hidden = !gnss;
+  if (!gnss) return;
+  const readout = $("#drive-usb-gps");
+  const words = {
+    fix: "fix",
+    no_fix: "no fix yet — needs a clear view of the sky",
+    searching: "not found",
+    error: "error",
+    stopped: "stopped",
+  };
+  let text = words[gnss.state] || gnss.state;
+  if (gnss.state === "fix" && gnss.last_fix) {
+    const fix = gnss.last_fix;
+    text = `${fix.latitude.toFixed(5)}, ${fix.longitude.toFixed(5)}`;
+    if (fix.speed_mps !== null && fix.speed_mps !== undefined) {
+      text += ` · ${Math.round(fix.speed_mps * 3.6)} km/h`;
+    }
+    text += ` · ${gnss.fix_age_s} s ago`;
+  }
+  const quality = [];
+  if (gnss.satellites !== null && gnss.satellites !== undefined) quality.push(`${gnss.satellites} sats`);
+  if (gnss.hdop !== null && gnss.hdop !== undefined) quality.push(`HDOP ${gnss.hdop}`);
+  if (quality.length) text += ` · ${quality.join(", ")}`;
+  if (gnss.error) text += ` · ${gnss.error}`;
+  if (gnss.device) text += ` · ${gnss.device}`;
+  readout.textContent = text;
+  // Said once when the Pi's receiver first gets a fix: a solo driver waiting
+  // in a car park should not have to keep looking at the phone for it.
+  if (usbFixFresh(gnss) && !live.usbAnnouncedFix) {
+    live.usbAnnouncedFix = true;
+    speak("USB GPS has a fix.");
+  }
+  if (!liveRunning() && !viewReadOnly) {
+    setEnabled("#drive-start", window.isSecureContext || usbFixFresh(gnss));
+  }
+}
+
+function liveRunning() {
+  return Boolean(live.jobId);
+}
+
+/* ------------------------------------------------------- gain calibration */
+
+function renderGain() {
+  const settings = state.settings;
+  if (!settings) return;
+  const origin = state.gainOrigin ? ` (from ${state.gainOrigin})` : "";
+  $("#cal-gain").textContent =
+    `IF gain reduction ${settings.if_gain_reduction_db} dB · LNA state ${settings.lna_state}${origin}`;
+}
+
+function showCalibrationResult(result) {
+  const box = $("#cal-result");
+  if (!result) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  box.className = "notice" + (result.status === "ok" && result.applied ? "" : " error");
+  box.replaceChildren();
+  const recommended = result.recommended;
+  const headline = recommended
+    ? `Recommended: IF gain reduction ${recommended.if_gain_reduction_db} dB, LNA state ` +
+      `${recommended.lna_state} — ${result.applied ? "applied" : "NOT applied"}.`
+    : "No usable setting was found.";
+  box.append(el("div", null, headline));
+  box.append(el("div", "hint", result.reason || ""));
+  if (result.apply_reason) box.append(el("div", "hint", result.apply_reason));
+  for (const warning of result.warnings || []) box.append(el("div", "hint", "⚠ " + warning));
+  if (result.site_profile_yaml) {
+    box.append(el("div", "hint", "To keep it after a restart, put this in the site profile:"));
+    box.append(el("pre", null, result.site_profile_yaml));
+  }
+}
+
+async function startCalibration() {
+  const button = $("#cal-start");
+  button.disabled = true;
+  try {
+    const job = await api(scoped("/api/calibrate/gain"), {
+      method: "POST",
+      body: JSON.stringify({
+        center_frequency_hz: Number($("#center").value) * 1e6,
+        sample_rate_hz: Number($("#rate").value) * 1e6,
+        lna_state: Number($("#lna").value),
+      }),
+    });
+    holdScreenAwake();
+    speak("Calibrating gain. Stay still for about a minute.", { urgent: true });
+    watchCalibration(job.job_id);
+  } catch (error) {
+    setEnabled("#cal-start", true);
+    alert("Could not start the calibration: " + error.message);
+  }
+}
+
+function watchCalibration(jobId, cursor = 0) {
+  live.calJobId = jobId;
+  $("#cal-box").hidden = false;
+  $("#cal-cancel").hidden = false;
+  $("#cal-start").disabled = true;
+  if (!cursor) $("#cal-result").hidden = true;
+  if (live.calStream) live.calStream.close();
+  const query = new URLSearchParams({ cursor: String(cursor) });
+  if (TOKEN) query.set("token", TOKEN);
+  const stream = new EventSource("/api/jobs/" + jobId + "/events?" + query.toString());
+  live.calStream = stream;
+  let seen = cursor;
+  stream.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    if (data.stage === "closed") {
+      stream.close();
+      finishCalibration(jobId);
+      return;
+    }
+    seen += 1;
+    $("#cal-bar").style.width = Math.round((data.progress || 0) * 100) + "%";
+    $("#cal-stage").textContent = data.message || data.stage;
+  };
+  stream.onerror = async () => {
+    stream.close();
+    if (live.calJobId !== jobId) return;
+    try {
+      const job = await api("/api/jobs/" + jobId);
+      if (job.status === "running" || job.status === "pending") {
+        setTimeout(() => { if (live.calJobId === jobId) watchCalibration(jobId, seen); }, 2000);
+        return;
+      }
+    } catch (_) {
+      setTimeout(() => { if (live.calJobId === jobId) watchCalibration(jobId, seen); }, 4000);
+      return;
+    }
+    finishCalibration(jobId);
+  };
+}
+
+async function finishCalibration(jobId) {
+  live.calJobId = null;
+  live.calStream = null;
+  $("#cal-cancel").hidden = true;
+  setEnabled("#cal-start", true);
+  releaseScreen();
+  try {
+    const job = await api("/api/jobs/" + jobId);
+    if (job.status === "succeeded") {
+      const result = job.result || {};
+      $("#cal-bar").style.width = "100%";
+      showCalibrationResult(result);
+      await refreshState();
+      if (result.applied) {
+        // The Record tab's inputs are what a stop and a drive send, so they
+        // must show the gain now in force.
+        $("#ifgr").value = state.settings.if_gain_reduction_db;
+        $("#lna").value = state.settings.lna_state;
+        speak("Calibration done. Gain set. You can drive.", { urgent: true });
+      } else {
+        speak("Calibration done. Gain not changed. Check the screen.", { urgent: true });
+      }
+    } else if (job.status === "cancelled") {
+      $("#cal-stage").textContent = "cancelled — the gain was not changed";
+      speak("Calibration cancelled.");
+    } else {
+      $("#cal-stage").textContent = "failed: " + (job.error || "unknown error");
+      speak("Calibration failed.", { urgent: true });
+    }
+  } catch (error) {
+    $("#cal-stage").textContent = "could not read the result: " + error.message;
+  }
+}
+
 async function startDrive() {
   // Disabled on the way IN, not once the POST answers, for the same reason
   // Record does this: the server probes the SDR before it replies, and on a
@@ -1324,12 +1528,16 @@ async function startDrive() {
   // to land.
   const button = $("#drive-start");
   button.disabled = true;
-  if (live.watchId === null) startLocationSharing();
+  // With a fresh fix from the Pi's own receiver the phone's GPS is not
+  // needed at all; asking for it would only prompt a permission dialog.
+  const usbReady = usbFixFresh(live.gnss);
+  if (!usbReady && live.watchId === null && window.isSecureContext) startLocationSharing();
   // The server refuses a drive until a fix has reached it, and sharing was
   // possibly switched on a moment ago by the line above. Waiting here for the
   // first fix spares the driver a "no GPS fix yet" alert and a second tap.
   const waitUntil = Date.now() + 15000;
-  while (!live.lastFix && live.watchId !== null && !live.gpsError && Date.now() < waitUntil) {
+  while (!usbReady && !live.lastFix && live.watchId !== null && !live.gpsError &&
+         Date.now() < waitUntil) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   if (live.lastFix && live.posting) {
@@ -1445,7 +1653,9 @@ function renderLive(payload) {
   $("#drive-stop").hidden = !running;
   $("#drive-solve").hidden = !running;
   setEnabled("#drive-solve", !payload.solving);
-  if (!running) setEnabled("#drive-start", window.isSecureContext);
+  if (!running) setEnabled("#drive-start", window.isSecureContext || usbFixFresh(payload.gnss));
+  live.positionSource = payload.position_source || null;
+  renderGnss(payload.gnss);
   if (running && payload.job_id) live.jobId = payload.job_id;
 
   const status = $("#drive-status");
@@ -1484,6 +1694,8 @@ function renderLive(payload) {
     $("#hud-sites").textContent = last ? String(last.observations) : "–";
     const gpsCell = $("#hud-gps").parentElement;
     $("#hud-gps").textContent = gpsStale ? "LOST" : `${Math.round(gpsAge)}s`;
+    gpsCell.querySelector(".hud-label").textContent =
+      payload.position_source === "usb_gnss" ? "USB GPS" : "GPS";
     gpsCell.classList.toggle("bad", gpsStale);
     gpsCell.classList.toggle("ok", !gpsStale);
 
@@ -1629,6 +1841,7 @@ async function refreshState() {
   state.stops = payload.stops || [];
   state.plan = payload.plan || null;
   state.scope = payload.scope || null;
+  state.gainOrigin = payload.gain_origin || null;
   renderScope();
   renderPosition();
   renderSites();
@@ -1665,6 +1878,11 @@ async function refreshState() {
   }
 
   renderDeviceStatus(payload.device);
+  renderGain();
+  renderGnss(payload.gnss);
+  if (payload.calibration && !live.calJobId && $("#cal-result").hidden) {
+    showCalibrationResult(payload.calibration);
+  }
   // Last, after every renderer that has an opinion about a button: the view
   // decides what may be used, and it decides it after they have all spoken.
   applyViewLock();
@@ -1695,6 +1913,7 @@ async function pollDeviceState() {
     try {
       const payload = await api("/api/state", { timeoutMs: STATE_TIMEOUT_MS });
       renderDeviceStatus(payload.device);
+      renderGnss(payload.gnss);
     } catch (_) {
       /* the next tick tries again -- a dropped link here is not fatal */
     }
@@ -1760,6 +1979,10 @@ function wireUi() {
   $("#drive-solve").addEventListener("click", solveNow);
   $("#drive-hold").addEventListener("click", requestHold);
   $("#drive-stop").addEventListener("click", stopDrive);
+  $("#cal-start").addEventListener("click", startCalibration);
+  $("#cal-cancel").addEventListener("click", async () => {
+    if (live.calJobId) await api("/api/jobs/" + live.calJobId + "/cancel", { method: "POST" });
+  });
   for (const [id, format] of [["#export-kml", "kml"], ["#export-gpx", "gpx"]]) {
     $(id).addEventListener("click", () => {
       const query = new URLSearchParams({ format });
@@ -1881,7 +2104,8 @@ async function boot() {
     const running = (payload.jobs || []).find(
       (job) => job.status === "running" || job.status === "pending"
     );
-    if (running) watchJob(running.job_id);
+    if (running && running.kind === "calibration") watchCalibration(running.job_id);
+    else if (running) watchJob(running.job_id);
     // A drive survives the phone locking, the browser being closed, or a
     // reload: it is running on the Pi. Rejoining it is the difference between
     // a lost drive and a paused screen.
