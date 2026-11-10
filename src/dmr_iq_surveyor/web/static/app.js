@@ -417,6 +417,7 @@ function initMap() {
   layers.bins = L.layerGroup().addTo(map);
   layers.track = L.layerGroup().addTo(map);
   layers.position = L.layerGroup().addTo(map);
+  layers.here = L.layerGroup().addTo(map);
 
   map.on("click", (event) => {
     // The lock disarms pick mode, but the handler refuses on its own too:
@@ -445,7 +446,9 @@ function renderPosition() {
   layers.position.clearLayers();
   L.circleMarker([position.latitude, position.longitude], {
     radius: 9, color: "#1f6feb", weight: 3, fillColor: "#1f6feb", fillOpacity: 0.35,
-  }).addTo(layers.position).bindPopup("<b>You are here</b>");
+  }).addTo(layers.position).bindPopup(
+    "<b>Marked stop position</b><br>where the next recorded stop is filed — not a live fix"
+  );
   if (position.accuracy_m) {
     L.circle([position.latitude, position.longitude], {
       radius: position.accuracy_m, color: "#1f6feb", weight: 1, opacity: 0.5, fillOpacity: 0.06,
@@ -777,7 +780,7 @@ async function showHistory(siteKey, target) {
  * from, so the buttons go quiet with the rest. */
 const MUTATING_CONTROLS = [
   "#record", "#purge", "#resolve",
-  "#use-gps", "#save-position", "#pick-on-map",
+  "#use-gps", "#use-pi-gps", "#save-position", "#pick-on-map",
   "#drive-share", "#drive-start", "#drive-solve", "#drive-hold",
   "#cal-start",
 ];
@@ -1358,7 +1361,10 @@ function renderGnss(gnss) {
   const row = $("#drive-usb-row");
   if (!row) return;
   row.hidden = !gnss;
-  if (!gnss) return;
+  if (!gnss) {
+    renderHere(null);
+    return;
+  }
   const readout = $("#drive-usb-gps");
   const words = {
     fix: "fix",
@@ -1383,6 +1389,12 @@ function renderGnss(gnss) {
   if (gnss.error) text += ` · ${gnss.error}`;
   if (gnss.device) text += ` · ${gnss.device}`;
   readout.textContent = text;
+  renderHere(gnss);
+  const piButton = $("#use-pi-gps");
+  if (piButton) {
+    piButton.hidden = false;
+    setEnabled("#use-pi-gps", usbFixFresh(gnss));
+  }
   // Said once when the Pi's receiver first gets a fix: a solo driver waiting
   // in a car park should not have to keep looking at the phone for it.
   if (usbFixFresh(gnss) && !live.usbAnnouncedFix) {
@@ -1392,6 +1404,39 @@ function renderGnss(gnss) {
   if (!liveRunning() && !viewReadOnly) {
     setEnabled("#drive-start", window.isSecureContext || usbFixFresh(gnss));
   }
+}
+
+/* The receiver's live position from the Pi's own GPS, drawn apart from the
+ * marked stop position: the marked one is where the next recording is filed
+ * and stays put until changed, this one moves with the car. Mixing them up
+ * is what made a hand-placed mark read as "you are here". */
+function renderHere(gnss) {
+  if (!map || !layers.here) return;
+  layers.here.clearLayers();
+  if (!usbFixFresh(gnss) || !gnss.last_fix) return;
+  const fix = gnss.last_fix;
+  L.circleMarker([fix.latitude, fix.longitude], {
+    radius: 7, color: "#0b7a5f", weight: 3, fillColor: "#12b886", fillOpacity: 0.9,
+  }).addTo(layers.here).bindPopup("<b>Live position</b><br>USB GPS on the Pi");
+  if (fix.accuracy_m) {
+    L.circle([fix.latitude, fix.longitude], {
+      radius: fix.accuracy_m, color: "#0b7a5f", weight: 1, opacity: 0.5, fillOpacity: 0.06,
+    }).addTo(layers.here);
+  }
+  if (!state.hereCentred) {
+    state.hereCentred = true;
+    map.setView([fix.latitude, fix.longitude], Math.max(map.getZoom(), 13));
+  }
+}
+
+function usePiGps() {
+  const gnss = live.gnss;
+  if (!usbFixFresh(gnss) || !gnss.last_fix) {
+    alert("The USB GPS on the Pi has no fresh fix yet.");
+    return;
+  }
+  const fix = gnss.last_fix;
+  savePosition(fix.latitude, fix.longitude, fix.accuracy_m, "usb_gnss");
 }
 
 function liveRunning() {
@@ -1956,6 +2001,7 @@ function wireUi() {
   });
 
   $("#use-gps").addEventListener("click", useDeviceGps);
+  $("#use-pi-gps").addEventListener("click", usePiGps);
   $("#pick-on-map").addEventListener("click", () => {
     state.picking = !state.picking;
     $("#pick-on-map").classList.toggle("armed", state.picking);
@@ -1966,7 +2012,8 @@ function wireUi() {
       alert("Set a position first, with the phone's GPS or by tapping the map.");
       return;
     }
-    savePosition(position.latitude, position.longitude, position.accuracy_m, position.source === "browser_gps" ? "device" : "manual");
+    const kept = { browser_gps: "device", usb_gnss: "usb_gnss" }[position.source] || "manual";
+    savePosition(position.latitude, position.longitude, position.accuracy_m, kept);
   });
   $("#view-scope").addEventListener("change", async (event) => {
     const chosen = event.target.value;
