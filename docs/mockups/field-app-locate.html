@@ -1,0 +1,527 @@
+<title>איכון משדר</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rubik:wght@500;600;700&family=Assistant:wght@400;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap">
+<style>
+/* Layout: one screen. Portrait = map on top, sheet below. Landscape/tablet = sheet on the
+   right (RTL start), map fills the rest. The map is the instrument; the sheet holds one task. */
+:root {
+  --bg: #eef1f3;
+  --sheet: #ffffff;
+  --fg: #142026;
+  --muted: #5a6a73;
+  --line: #d6dde1;
+  --accent: #0b6e66;
+  --accent-fg: #ffffff;
+  --ok: #1f8a4c;
+  --off: #8a979e;
+  --bad: #c2362b;
+  --warn: #b86e00;
+  --map: #e4e9e6;
+  --road: #ffffff;
+  --road-major: #f6d98a;
+  --region: #d9822b;
+  --mock: #6b4fa0;
+  --font-display: "Rubik", "Assistant", system-ui, sans-serif;
+  --font-body: "Assistant", "Rubik", system-ui, sans-serif;
+  --font-num: "IBM Plex Mono", ui-monospace, monospace;
+  --radius: 14px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1518; --sheet: #151f23; --fg: #e3eaed; --muted: #93a3ab; --line: #26343a;
+    --accent: #3fb8a9; --accent-fg: #06201d; --ok: #46c27a; --off: #6d7c83; --bad: #ef6a5e;
+    --warn: #e9a23b; --map: #1a2428; --road: #2a373d; --road-major: #5a4c26; --region: #f0a050;
+    --mock: #b49ae0; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1518; --sheet: #151f23; --fg: #e3eaed; --muted: #93a3ab; --line: #26343a;
+  --accent: #3fb8a9; --accent-fg: #06201d; --ok: #46c27a; --off: #6d7c83; --bad: #ef6a5e;
+  --warn: #e9a23b; --map: #1a2428; --road: #2a373d; --road-major: #5a4c26; --region: #f0a050;
+  --mock: #b49ae0; color-scheme: dark;
+}
+
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 16px;
+  direction: rtl; overflow: hidden;
+}
+.num { font-family: var(--font-num); direction: ltr; unicode-bidi: isolate; font-variant-numeric: tabular-nums; }
+button { font: inherit; color: inherit; cursor: pointer; }
+button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+.app { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+
+/* Mockup-only strip: jump between screens. Not part of the proposed UI. */
+.mockbar {
+  display: flex; gap: 6px; align-items: center; overflow-x: auto;
+  padding-block: 6px; padding-left: max(12px, env(safe-area-inset-left, 0px)); padding-right: max(12px, env(safe-area-inset-right, 0px));
+  border-bottom: 1px dashed var(--mock); font-size: 13px; color: var(--mock);
+}
+.mockbar b { white-space: nowrap; font-weight: 700; }
+.mockbar button { border: 1px solid var(--mock); background: transparent; color: var(--mock); border-radius: 999px; padding: 2px 10px; white-space: nowrap; }
+.mockbar button[aria-current="true"] { background: var(--mock); color: var(--sheet); }
+
+/* Map */
+.mapwrap { position: relative; min-height: 0; background: var(--map); overflow: hidden; }
+.mapwrap svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.road { stroke: var(--road); fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.road.major { stroke: var(--road-major); }
+.route { stroke: var(--accent); stroke-width: 3; fill: none; opacity: .35; stroke-dasharray: 2 6; stroke-linecap: round; }
+.bin { stroke: var(--sheet); stroke-width: 1.5; }
+.r90 { fill: var(--region); fill-opacity: .14; stroke: var(--region); stroke-width: 2; stroke-dasharray: 6 4; }
+.r50 { fill: var(--region); fill-opacity: .30; stroke: var(--region); stroke-width: 2; }
+.mode { fill: var(--region); stroke: var(--sheet); stroke-width: 2; }
+.plan { fill: var(--accent); fill-opacity: .10; stroke: var(--accent); stroke-width: 2.5; stroke-dasharray: 3 5; }
+.maplabel { font-family: var(--font-body); font-size: 12px; font-weight: 700; fill: var(--fg); paint-order: stroke; stroke: var(--map); stroke-width: 4px; }
+.suspect { fill: none; stroke: var(--warn); stroke-width: 2.5; }
+.car { fill: var(--accent); stroke: var(--sheet); stroke-width: 2; }
+
+.mapnote {
+  position: absolute; inset-inline-start: max(10px, env(safe-area-inset-right, 0px)); bottom: 10px;
+  font-size: 12px; color: var(--muted); background: var(--sheet); border: 1px solid var(--line);
+  padding: 2px 8px; border-radius: 999px; opacity: .92;
+}
+.hud {
+  position: absolute; top: 10px; inset-inline: max(10px, env(safe-area-inset-right, 0px)) max(10px, env(safe-area-inset-left, 0px));
+  display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 8px;
+}
+.hud > div { background: var(--sheet); border: 1px solid var(--line); border-radius: 12px; padding: 8px 10px; min-width: 0; box-shadow: 0 2px 8px rgb(0 0 0 / .08); }
+.hud .v { font-family: var(--font-display); font-weight: 700; font-size: 22px; line-height: 1.1; white-space: nowrap; }
+.hud .l { font-size: 12px; color: var(--muted); }
+.hud .heard .v { color: var(--ok); }
+.hud .silent .v { color: var(--off); }
+.hud .lost .v { color: var(--bad); }
+.stale-region { position: absolute; bottom: 10px; inset-inline-end: max(10px, env(safe-area-inset-left, 0px)); font-size: 12px; background: var(--sheet); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
+
+/* Sheet */
+.sheet {
+  background: var(--sheet); border-top: 1px solid var(--line); border-radius: 18px 18px 0 0;
+  max-height: 62vh; overflow-y: auto; overflow-x: hidden; min-height: 0;
+  padding-block: 16px calc(16px + env(safe-area-inset-bottom, 0px));
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.screen { display: grid; gap: 14px; }
+.screen > * { min-width: 0; }
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+h1 { font-family: var(--font-display); font-weight: 700; font-size: 24px; margin: 0; text-wrap: balance; }
+h2 { font-family: var(--font-display); font-weight: 600; font-size: 18px; margin: 0; }
+.hint { color: var(--muted); font-size: 14px; margin: 0; line-height: 1.45; max-width: 60ch; }
+.iconbtn { border: 1px solid var(--line); background: transparent; border-radius: 12px; width: 44px; height: 44px; display: grid; place-items: center; flex: none; }
+.iconbtn svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; }
+
+.freq {
+  display: flex; align-items: baseline; gap: 10px; border: 2px solid var(--line); border-radius: var(--radius);
+  padding: 10px 14px; background: var(--bg); direction: ltr;
+}
+.freq:focus-within { border-color: var(--accent); }
+.freq input { border: 0; outline: none; background: transparent; color: var(--fg); padding: 0; width: 100%; flex: 1; min-width: 0; font-family: var(--font-num); font-size: 40px; font-weight: 600; letter-spacing: .02em; }
+.freq span { font-family: var(--font-num); color: var(--muted); font-size: 18px; }
+
+.chips { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; }
+.chip { border: 1px solid var(--line); background: var(--sheet); border-radius: 12px; padding: 8px 12px; text-align: start; display: grid; gap: 2px; flex: none; }
+.chip .f { font-family: var(--font-num); font-weight: 600; font-size: 15px; }
+.chip .d { font-size: 13px; color: var(--muted); white-space: nowrap; }
+.chip[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+
+.status { display: flex; flex-wrap: wrap; gap: 8px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); flex: none; }
+.dot.bad { background: var(--bad); }
+.dot.off { background: var(--off); }
+
+.primary {
+  border: 0; border-radius: var(--radius); background: var(--accent); color: var(--accent-fg);
+  font-family: var(--font-display); font-weight: 700; font-size: 22px; min-height: 60px; width: 100%;
+}
+.secondary { border: 1px solid var(--line); background: transparent; border-radius: var(--radius); min-height: 56px; font-weight: 700; font-size: 17px; padding-inline: 14px; }
+.danger { border: 0; background: var(--bad); color: #fff; border-radius: var(--radius); min-height: 56px; font-weight: 700; font-size: 18px; font-family: var(--font-display); }
+.drivebtns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.drivebtns .danger { grid-column: 1 / -1; }
+.pulse { border-color: var(--warn); color: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--warn) 25%, transparent); } }
+@media (prefers-reduced-motion: reduce) { .pulse { animation: none; } .ring circle.p { transition: none; } }
+
+.ring { width: 140px; height: 140px; margin-inline: auto; display: block; }
+.ring circle { fill: none; stroke-width: 10; }
+.ring .t { stroke: var(--line); }
+.ring .p { stroke: var(--accent); stroke-linecap: round; transition: stroke-dashoffset .3s linear; transform: rotate(-90deg); transform-origin: 50% 50%; }
+.ringlabel { text-align: center; font-family: var(--font-display); font-size: 18px; font-weight: 600; }
+
+.notice { border: 1px solid var(--line); border-inline-start: 4px solid var(--warn); border-radius: 10px; padding: 10px 12px; font-size: 15px; line-height: 1.45; }
+.notice.good { border-inline-start-color: var(--ok); }
+.facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.fact { border: 1px solid var(--line); border-radius: 12px; padding: 8px 10px; }
+.fact .v { font-family: var(--font-display); font-weight: 700; font-size: 20px; }
+.fact .l { color: var(--muted); font-size: 13px; }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+.field { display: grid; gap: 4px; }
+.field label, .field .lab { font-size: 13px; color: var(--muted); font-weight: 600; }
+.field input { font: inherit; font-size: 17px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.field input.num { text-align: left; }
+.seg { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.seg button { border: 0; background: transparent; padding: 10px; font-weight: 600; }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
+.auto { font-size: 12px; color: var(--accent); font-weight: 700; }
+details { border-top: 1px solid var(--line); padding-top: 10px; }
+summary { cursor: pointer; font-weight: 700; }
+.menu { display: grid; gap: 8px; }
+.menu button { text-align: start; border: 1px solid var(--line); background: transparent; border-radius: 12px; padding: 12px 14px; display: grid; gap: 2px; }
+.menu button span { color: var(--muted); font-size: 14px; }
+.voice { display: flex; align-items: center; gap: 8px; font-size: 15px; }
+.voice input { width: 22px; height: 22px; accent-color: var(--accent); }
+
+/* Landscape and tablets: last, so it wins over the portrait sheet rules above. */
+@media (orientation: landscape) and (min-width: 700px) {
+  .app { grid-template-rows: auto minmax(0, 1fr); grid-template-columns: minmax(340px, 400px) minmax(0, 1fr); }
+  .mockbar { grid-column: 1 / -1; }
+  .sheet { grid-row: 2; grid-column: 1; border-radius: 0; border-top: 0; border-inline-end: 1px solid var(--line); max-height: none; }
+  .mapwrap { grid-row: 2; grid-column: 2; }
+}
+</style>
+
+<div class="app">
+  <nav class="mockbar" aria-label="מעבר בין מסכי ההדמיה">
+    <b>הדמיה:</b>
+    <button data-go="home">בית</button>
+    <button data-go="calibrate">כיול</button>
+    <button data-go="drive">נסיעה</button>
+    <button data-go="result">תוצאה</button>
+    <button data-go="advanced">מתקדם</button>
+    <button data-go="menu">תפריט</button>
+  </nav>
+
+  <div class="mapwrap" id="mapwrap">
+    <svg id="map" viewBox="0 0 400 400" preserveAspectRatio="xMidYMid slice" aria-label="מפה לדוגמה">
+      <g id="roads"></g>
+      <polyline id="route" class="route"></polyline>
+      <g id="regions" hidden>
+        <ellipse class="r90" cx="248" cy="132" rx="62" ry="44" transform="rotate(-18 248 132)"></ellipse>
+        <ellipse class="r50" cx="252" cy="128" rx="28" ry="19" transform="rotate(-18 252 128)"></ellipse>
+        <circle class="mode" cx="254" cy="127" r="4"></circle>
+        <text class="maplabel" x="254" y="112" text-anchor="middle">הכי סביר</text>
+      </g>
+      <g id="plan" hidden>
+        <circle class="plan" cx="300" cy="58" r="20"></circle>
+        <text class="maplabel" x="300" y="35" text-anchor="middle">מדוד כאן</text>
+        <circle class="plan" cx="330" cy="168" r="16"></circle>
+      </g>
+      <g id="bins"></g>
+      <g id="suspect" hidden>
+        <circle class="suspect" cx="196" cy="204" r="11"></circle>
+        <text class="maplabel" x="196" y="230" text-anchor="middle">למדוד שוב</text>
+      </g>
+      <polygon id="car" class="car" points="0,-9 7,7 0,3 -7,7"></polygon>
+    </svg>
+
+    <div class="hud" id="hud" hidden>
+      <div id="hud-last" class="heard"><div class="v">נשמע · <span class="num" id="hud-db">14</span> dB</div><div class="l">מדידה אחרונה</div></div>
+      <div><div class="v num" id="hud-bins">0</div><div class="l">מדידות, נסיעה זו</div></div>
+      <div id="hud-gps"><div class="v">USB</div><div class="l">GPS · <span class="num">9</span> לוויינים</div></div>
+    </div>
+    <div class="stale-region" id="stale" hidden>אזור מלפני <span class="num">6</span> דק׳</div>
+    <div class="mapnote">נתוני דוגמה</div>
+  </div>
+
+  <section class="sheet" id="sheet" aria-live="polite">
+
+    <!-- Home -->
+    <div class="screen" data-screen="home">
+      <div class="top">
+        <h1>מה מאתרים?</h1>
+        <button class="iconbtn" data-go="menu" aria-label="תפריט"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+      </div>
+      <label class="freq" for="freq-input">
+        <input id="freq-input" inputmode="decimal" value="469.350" aria-label="תדר במגה-הרץ">
+        <span>MHz</span>
+      </label>
+      <div class="chips" role="list" aria-label="יעדים אחרונים">
+        <button class="chip" role="listitem" aria-pressed="true" data-freq="469.350">
+          <span class="f">469.350</span><span class="d">ערוץ בקרה · 3 נסיעות · <span class="num">12.4</span> קמ״ר</span>
+        </button>
+        <button class="chip" role="listitem" aria-pressed="false" data-freq="164.5375">
+          <span class="f">164.5375</span><span class="d">ממסר · נסיעה אחת · טרם חושב</span>
+        </button>
+        <button class="chip" role="listitem" aria-pressed="false" data-freq="162.525">
+          <span class="f">162.525</span><span class="d">משדר אימות · מיקום ידוע</span>
+        </button>
+      </div>
+      <div class="status">
+        <span class="pill"><span class="dot"></span>מקלט RSP1B</span>
+        <span class="pill"><span class="dot"></span>USB GPS · <span class="num">9</span> לוויינים</span>
+        <span class="pill"><span class="dot"></span>דיסק <span class="num">41</span> GB</span>
+      </div>
+      <button class="primary" data-go="calibrate">התחל</button>
+      <p class="hint" id="home-hint">יעד קיים: ממשיכים את הקמפיין שלו עם אותו הגבר. יעד חדש: לפני הנסיעה יש כיול של דקה בעמידה.</p>
+    </div>
+
+    <!-- Calibrate -->
+    <div class="screen" data-screen="calibrate" hidden>
+      <div class="top"><h1>עמוד במקום, דקה אחת</h1></div>
+      <p class="hint">קובע הגבר קבוע לקמפיין של <span class="num">469.350</span> MHz. עדיף לעמוד במקום שבו התדר נשמע.</p>
+      <svg class="ring" viewBox="0 0 140 140" aria-hidden="true">
+        <circle class="t" cx="70" cy="70" r="60"></circle>
+        <circle class="p" id="ring" cx="70" cy="70" r="60" stroke-dasharray="377" stroke-dashoffset="377"></circle>
+      </svg>
+      <div class="ringlabel" id="ring-label">מודד הגבר <span class="num">0</span> מתוך <span class="num">40</span></div>
+      <button class="secondary" data-go="home">ביטול</button>
+    </div>
+
+    <!-- Drive -->
+    <div class="screen" data-screen="drive" hidden>
+      <div class="top">
+        <h2><span class="num">469.350</span> MHz · בנסיעה</h2>
+        <button class="iconbtn" data-go="advanced" aria-label="הגדרות היעד"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/></svg></button>
+      </div>
+      <div class="notice" id="worth" hidden>התדר היה קרוב לסף במדידה האחרונה. עצירה של דקה כאן כנראה תשמע אותו.</div>
+      <div class="drivebtns">
+        <button class="secondary" id="hold">מדוד כאן <span class="num">60</span> ש׳</button>
+        <button class="secondary" id="solve">עדכן תוצאה</button>
+        <button class="danger" data-go="result">עצור</button>
+      </div>
+      <label class="voice"><input type="checkbox" checked id="voice"> הודעות קוליות</label>
+    </div>
+
+    <!-- Result -->
+    <div class="screen" data-screen="result" hidden>
+      <div class="top"><h1>אזור חיפוש: <span class="num">3.2</span> קמ״ר</h1></div>
+      <div class="facts">
+        <div class="fact"><div class="v num">41</div><div class="l">נשמע</div></div>
+        <div class="fact"><div class="v num">17</div><div class="l">לא נשמע</div></div>
+        <div class="fact"><div class="v num">3</div><div class="l">נסיעות</div></div>
+      </div>
+      <div class="notice good">כדאי למדוד גם מצפון-מזרח לאזור. מדידה שם תקטין אותו הכי הרבה.</div>
+      <div class="notice">מדידה אחת לא מתיישבת עם השאר (מסומנת במפה). לא הוסרה. כדאי למדוד שוב בסביבתה.</div>
+      <p class="hint">האזור הוא אזור חיפוש, לא מיקום של משדר. הנקודה בתוכו היא התא הסביר ביותר. ההנחה: משדר אחד בתדר הזה.</p>
+      <div class="row2">
+        <button class="primary" data-go="drive">המשך לנסוע</button>
+        <button class="secondary">שתף קובץ</button>
+      </div>
+      <button class="secondary" data-go="home">יעד אחר</button>
+    </div>
+
+    <!-- Advanced (per target) -->
+    <div class="screen" data-screen="advanced" hidden>
+      <div class="top">
+        <h1>הגדרות היעד</h1>
+        <button class="iconbtn" data-back aria-label="חזרה"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+      </div>
+      <div class="field"><label for="adv-label">שם</label><input id="adv-label" value="ערוץ בקרה"></div>
+      <div class="field">
+        <span class="lab">אופי השידור</span>
+        <div class="seg" role="group" aria-label="אופי השידור">
+          <button aria-pressed="true" data-emission="continuous">רציף</button>
+          <button aria-pressed="false" data-emission="intermittent">לסירוגין</button>
+        </div>
+        <p class="hint" id="emission-hint">מקום שבו לא נשמע נחשב ראיה, וזה חלק חשוב מהתוצאה.</p>
+      </div>
+      <div class="row2">
+        <div class="field"><label for="adv-center">תדר מרכז <span class="auto">אוטומטי</span></label><input id="adv-center" class="num" value="469.250"></div>
+        <div class="field"><label for="adv-rate">קצב דגימה MS/s <span class="auto">אוטומטי</span></label><input id="adv-rate" class="num" value="2.0"></div>
+      </div>
+      <div class="row2">
+        <div class="field"><label for="adv-gain">הגבר (נקבע בכיול)</label><input id="adv-gain" class="num" value="IFGR 40 · LNA 4" readonly></div>
+        <div class="field"><label for="adv-corr">מתאם הצללה, מטר</label><input id="adv-corr" class="num" value="500"></div>
+      </div>
+      <p class="hint">תדר מרכז וקצב ניתנים לשינוי רק לפני המדידה הראשונה בקמפיין. בשטח פתוח, מתאם של <span class="num">1000</span> מטר נותן תוצאה הוגנת יותר.</p>
+      <details>
+        <summary>אימות מול מיקום ידוע</summary>
+        <div class="screen" style="margin-top:10px">
+          <div class="row2">
+            <div class="field"><label for="adv-lat">קו רוחב</label><input id="adv-lat" class="num" placeholder="32.0812"></div>
+            <div class="field"><label for="adv-lon">קו אורך</label><input id="adv-lon" class="num" placeholder="34.7804"></div>
+          </div>
+          <div class="field"><label for="adv-src">מקור המיקום</label><input id="adv-src" placeholder="רשימת אתרים מפורסמת"></div>
+          <p class="hint">המיקום לא משמש לחישוב ולא מוצג בזמן הנסיעה. בסוף מוצג המרחק ממנו, והאם הוא בתוך אזור ה-90%.</p>
+        </div>
+      </details>
+      <button class="secondary">התחל מחדש: קמפיין חדש וכיול חדש</button>
+    </div>
+
+    <!-- Menu -->
+    <div class="screen" data-screen="menu" hidden>
+      <div class="top">
+        <h1>תפריט</h1>
+        <button class="iconbtn" data-back aria-label="סגירה"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="menu">
+        <button data-go="advanced">הגדרות היעד<span>שם, אופי שידור, כיוונון, אימות מול מיקום ידוע</span></button>
+        <button>מתקדם<span>הקלטת IQ בתחנה, אתרי P25, רשימת עצירות, KML/GPX: האפליקציה הקיימת, ללא שינוי</span></button>
+        <button>הגדרות<span>שפת קול, שמירת מסך דולק, ערכת צבעים</span></button>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // Sample street network and a drive route, in map units (viewBox 0..400).
+  const roads = [
+    { d: "M-10 300 C 80 290, 160 260, 220 210 S 330 120, 420 90", major: true },
+    { d: "M60 -10 C 70 80, 90 160, 120 240 S 150 360, 160 420", major: true },
+    { d: "M-10 140 L 410 180", major: false },
+    { d: "M200 -10 L 230 420", major: false },
+    { d: "M300 -10 C 290 100, 320 220, 300 420", major: false },
+    { d: "M-10 380 L 410 340", major: false },
+    { d: "M120 240 L 300 260", major: false },
+  ];
+  const route = [[20,296],[70,290],[120,276],[160,256],[196,226],[220,206],[250,176],[280,148],[312,124],[350,108],[380,98],[358,140],[330,170],[302,190],[300,230],[270,250],[230,252],[196,204],[170,170],[130,150],[90,146],[60,143]];
+  // Excess SNR per bin; null = looked, not heard.
+  const level = [null,null,4,6,9,12,15,19,17,13,8,11,14,16,10,7,9,24,8,5,null,null];
+
+  const roadG = $("#roads");
+  for (const r of roads) {
+    const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    p.setAttribute("d", r.d);
+    p.setAttribute("class", "road" + (r.major ? " major" : ""));
+    p.setAttribute("stroke-width", r.major ? 9 : 5);
+    roadG.appendChild(p);
+  }
+  $("#route").setAttribute("points", route.map(p => p.join(",")).join(" "));
+
+  const binG = $("#bins");
+  function colour(db) {
+    if (db === null) return "var(--off)";
+    const t = Math.min(1, Math.max(0, db / 20));
+    return `color-mix(in srgb, var(--ok) ${Math.round(40 + 60 * t)}%, var(--sheet))`;
+  }
+  function drawBins(n) {
+    binG.innerHTML = "";
+    for (let i = 0; i < n && i < route.length; i++) {
+      const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      c.setAttribute("cx", route[i][0]); c.setAttribute("cy", route[i][1]);
+      c.setAttribute("r", level[i] === null ? 5 : 7);
+      c.setAttribute("class", "bin");
+      c.setAttribute("fill", colour(level[i]));
+      binG.appendChild(c);
+    }
+    const i = Math.max(0, Math.min(n, route.length) - 1);
+    const [x, y] = route[i];
+    const [nx, ny] = route[Math.min(i + 1, route.length - 1)];
+    const angle = Math.atan2(ny - y, nx - x) * 180 / Math.PI + 90;
+    $("#car").setAttribute("transform", `translate(${x} ${y}) rotate(${angle})`);
+    if (current === "drive") follow(x, y);
+  }
+  // While driving, the map follows the car; elsewhere it shows the whole area.
+  function follow(x, y) {
+    const size = 240;
+    const cx = Math.min(400 - size / 2, Math.max(size / 2, x));
+    const cy = Math.min(400 - size / 2, Math.max(size / 2, y));
+    $("#map").setAttribute("viewBox", `${cx - size / 2} ${cy - size / 2} ${size} ${size}`);
+  }
+
+  // Screens
+  let current = "home", previous = "home", timers = [];
+  const clear = () => { timers.forEach(clearInterval); timers = []; };
+  function show(name) {
+    clear();
+    if (name !== current) previous = current;
+    current = name;
+    $$("[data-screen]").forEach(s => s.hidden = s.dataset.screen !== name);
+    $$(".mockbar button").forEach(b => b.setAttribute("aria-current", String(b.dataset.go === name)));
+    const driving = name === "drive";
+    $("#hud").hidden = !driving;
+    // SVG elements have no `hidden` property; toggle the attribute itself.
+    $("#regions").toggleAttribute("hidden", !(name === "result" || (driving && solvedOnce)));
+    $("#plan").toggleAttribute("hidden", name !== "result");
+    $("#suspect").toggleAttribute("hidden", name !== "result");
+    $("#stale").hidden = !(driving && solvedOnce);
+    $("#sheet").scrollTop = 0;
+    if (name !== "drive") $("#map").setAttribute("viewBox", "0 0 400 400");
+    if (name === "home") drawBins(0);
+    if (name === "result") drawBins(route.length);
+    if (name === "calibrate") runCalibration();
+    if (name === "drive") runDrive();
+    try { history.replaceState(null, "", "#" + name); } catch (e) {}
+  }
+
+  function runCalibration() {
+    let step = 0;
+    const ring = $("#ring"), total = 40;
+    const tick = () => {
+      step++;
+      ring.setAttribute("stroke-dashoffset", String(377 * (1 - step / total)));
+      $("#ring-label").innerHTML = `מודד הגבר <span class="num">${step}</span> מתוך <span class="num">${total}</span>`;
+      if (step >= total) {
+        clear();
+        $("#ring-label").textContent = "ההגבר נקבע. אפשר לנסוע.";
+        timers.push(setTimeout(() => show("drive"), 900));
+      }
+    };
+    ring.setAttribute("stroke-dashoffset", "377");
+    timers.push(setInterval(tick, reduce ? 40 : 120));
+  }
+
+  let shown = 0, solvedOnce = false;
+  function runDrive() {
+    if (shown >= route.length) shown = 4;
+    drawBins(shown);
+    updateHud();
+    timers.push(setInterval(() => {
+      shown = shown >= route.length ? 4 : shown + 1;
+      drawBins(shown);
+      updateHud();
+    }, reduce ? 2500 : 1600));
+  }
+  function updateHud() {
+    const db = level[Math.max(0, shown - 1)];
+    const last = $("#hud-last");
+    if (db === null) {
+      last.className = "silent";
+      last.querySelector(".v").textContent = "לא נשמע";
+    } else {
+      last.className = "heard";
+      last.querySelector(".v").innerHTML = `נשמע · <span class="num">${db}</span> dB`;
+    }
+    $("#hud-bins").textContent = String(shown);
+    const near = db !== null && db <= 5;
+    $("#worth").hidden = !near;
+    $("#hold").classList.toggle("pulse", near);
+  }
+
+  $("#solve").addEventListener("click", (e) => {
+    const b = e.currentTarget;
+    b.disabled = true; b.textContent = "מחשב…";
+    setTimeout(() => {
+      solvedOnce = true; b.disabled = false; b.textContent = "עדכן תוצאה";
+      $("#regions").removeAttribute("hidden"); $("#stale").hidden = false;
+      $("#stale").innerHTML = "אזור מעכשיו";
+    }, 1800);
+  });
+  $("#hold").addEventListener("click", (e) => {
+    const b = e.currentTarget; let left = 60;
+    b.classList.remove("pulse"); b.disabled = true;
+    const t = setInterval(() => {
+      left -= 5; b.innerHTML = `עומד · <span class="num">${left}</span> ש׳`;
+      if (left <= 0) { clearInterval(t); b.disabled = false; b.innerHTML = 'מדוד כאן <span class="num">60</span> ש׳'; }
+    }, 250);
+  });
+
+  $$("[data-go]").forEach(b => b.addEventListener("click", () => show(b.dataset.go)));
+  $$("[data-back]").forEach(b => b.addEventListener("click", () => show(previous === current ? "home" : previous)));
+  $$(".chip").forEach(c => c.addEventListener("click", () => {
+    $$(".chip").forEach(o => o.setAttribute("aria-pressed", String(o === c)));
+    $("#freq-input").value = c.dataset.freq;
+  }));
+  $$("[data-emission]").forEach(b => b.addEventListener("click", () => {
+    $$("[data-emission]").forEach(o => o.setAttribute("aria-pressed", String(o === b)));
+    $("#emission-hint").textContent = b.dataset.emission === "continuous"
+      ? "מקום שבו לא נשמע נחשב ראיה, וזה חלק חשוב מהתוצאה."
+      : "מקום שבו לא נשמע נשמר אבל לא נחשב: ייתכן שפשוט לא שידר.";
+  }));
+
+  const start = (location.hash || "#home").slice(1);
+  show(["home", "calibrate", "drive", "result", "advanced", "menu"].includes(start) ? start : "home");
+  addEventListener("hashchange", () => {
+    const n = location.hash.slice(1);
+    if (n && n !== current && $(`[data-screen="${n}"]`)) show(n);
+  });
+})();
+</script>
