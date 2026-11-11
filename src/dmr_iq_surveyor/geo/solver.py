@@ -181,7 +181,7 @@ def _log_distance_ratio(
 
 
 def reference_level_offsets(
-    detection_count: int, settings: SolveSettings, sigma: float | None = None
+    detection_count: float, settings: SolveSettings, sigma: float | None = None
 ) -> np.ndarray:
     """Offsets from each cell's own best-fit reference level to integrate over.
 
@@ -228,6 +228,8 @@ def _evaluate_grid(
     censored_y: np.ndarray,
     censored_levels: np.ndarray,
     settings: SolveSettings,
+    detection_weights: np.ndarray | None = None,
+    censored_weights: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, float, float, int, np.ndarray]:
     """Marginal log posterior per cell, the best (n, sigma, P0, cell), and
     the log mass each sigma collected.
@@ -242,12 +244,27 @@ def _evaluate_grid(
     -- since they cancel in both the marginalisation and the final
     normalisation. The parts of the normaliser that DO depend on sigma are
     kept; see `log_measure` below for why that is not optional.
+
+    With weights (`SolveSettings.shadowing_correlation_m > 0`) every
+    detection's squared residual and every censored term is multiplied by
+    its weight, and the detection COUNT becomes the weight SUM wherever it
+    appears -- the reference-level mean, the `K delta^2` term, the offset
+    window and sigma's normaliser. The algebra is otherwise identical: the
+    per-cell `P0` is the weighted mean and `RSS` the weighted sum. Without
+    weights the original unweighted expressions run unchanged, so a Phase 7
+    solve is bit-for-bit what it was.
     """
     xs, ys = grid.axes()
     exponents = np.asarray(settings.path_loss_exponents, dtype=float)
     sigmas = np.asarray(settings.sigma_db_values, dtype=float)
     detection_count = int(detection_levels.size)
     censored_count = int(censored_levels.size)
+    weighted = detection_weights is not None
+    # The number of independent detections the evidence is worth. Equal to
+    # the count when unweighted.
+    effective_detections: float = (
+        float(np.sum(detection_weights)) if detection_weights is not None else detection_count
+    )
 
     # The largest temporary is (cells x offsets): censored measurements are
     # accumulated one at a time rather than broadcast into a three-axis
@@ -283,7 +300,7 @@ def _evaluate_grid(
         for sigma_index, sigma in enumerate(sigmas):
             sigma = float(sigma)
             two_sigma_squared = 2.0 * sigma * sigma
-            offsets = reference_level_offsets(detection_count, settings, sigma=sigma)
+            offsets = reference_level_offsets(effective_detections, settings, sigma=sigma)
             scaled_offsets = offsets / sigma
 
             # Sigma's own measure, and the reason it cannot be dropped the way
@@ -305,7 +322,7 @@ def _evaluate_grid(
             # and drops out. Both branches therefore reduce to -(K-1) log
             # sigma, which is the right power: profiling out the unknown
             # reference level costs exactly one degree of freedom.
-            log_measure = -detection_count * math.log(sigma)
+            log_measure = -effective_detections * math.log(sigma)
             if censored_ratio is None:
                 log_measure += math.log(sigma)
             else:
@@ -315,8 +332,16 @@ def _evaluate_grid(
                 # a_i: the reference level that would fit detection i exactly
                 # if the transmitter were in this cell with this exponent.
                 fitted = detection_levels[None, :] + 10.0 * exponent * detection_ratio
-                best_level = fitted.mean(axis=1)
-                residual_sum_squares = np.square(fitted - best_level[:, None]).sum(axis=1)
+                if weighted:
+                    best_level = (fitted * detection_weights[None, :]).sum(
+                        axis=1
+                    ) / effective_detections
+                    residual_sum_squares = (
+                        np.square(fitted - best_level[:, None]) * detection_weights[None, :]
+                    ).sum(axis=1)
+                else:
+                    best_level = fitted.mean(axis=1)
+                    residual_sum_squares = np.square(fitted - best_level[:, None]).sum(axis=1)
                 base = -residual_sum_squares / two_sigma_squared
 
                 if censored_ratio is None:
@@ -333,12 +358,15 @@ def _evaluate_grid(
                     ) / sigma
                     censored_term = np.zeros((stop - start, offsets.size), dtype=np.float64)
                     for column in range(censored_count):
-                        censored_term += tabulated_log_ndtr(
+                        term = tabulated_log_ndtr(
                             shift[:, column][:, None] - scaled_offsets[None, :]
                         )
+                        if censored_weights is not None:
+                            term *= float(censored_weights[column])
+                        censored_term += term
                     joint = (
                         base[:, None]
-                        - detection_count * np.square(offsets)[None, :] / two_sigma_squared
+                        - effective_detections * np.square(offsets)[None, :] / two_sigma_squared
                         + censored_term
                     )
                     marginal = np.logaddexp.reduce(joint, axis=1) + log_measure
@@ -363,6 +391,25 @@ def _evaluate_grid(
         log_marginal[start:stop] = chunk_accumulator
 
     return log_marginal, best_exponent, best_sigma, best_reference, best_cell, sigma_log_mass
+
+
+def shadowing_weights(
+    east: np.ndarray, north: np.ndarray, correlation_m: float
+) -> np.ndarray | None:
+    """Per-measurement weights for spatially correlated shadow fading.
+
+    `w_i = 1 / sum_j exp(-d_ij / correlation_m)`, the sum over every
+    measurement including i itself. An isolated stop keeps weight ~1; k
+    stops on top of each other each get ~1/k, so together they count as one.
+    `None` when correlation is not modelled, which callers treat as the
+    original unweighted likelihood.
+    """
+    if correlation_m <= 0:
+        return None
+    points = np.column_stack([np.asarray(east, dtype=float), np.asarray(north, dtype=float)])
+    deltas = points[:, None, :] - points[None, :, :]
+    distances = np.hypot(deltas[..., 0], deltas[..., 1])
+    return 1.0 / np.exp(-distances / correlation_m).sum(axis=1)
 
 
 def _normalise(log_marginal: np.ndarray) -> np.ndarray:
@@ -476,6 +523,9 @@ def solve_site(
     censored_levels = np.array(
         [float(m.censor_level_db) for m in measurements if not m.detected], dtype=float
     )
+    weights = shadowing_weights(east, north, resolved.shadowing_correlation_m)
+    detection_weights = None if weights is None else weights[detection_mask]
+    censored_weights = None if weights is None else weights[~detection_mask]
 
     coarse = build_grid(
         float(east.min()) - resolved.margin_m,
@@ -494,6 +544,8 @@ def solve_site(
         censored_y=censored_y,
         censored_levels=censored_levels,
         settings=resolved,
+        detection_weights=detection_weights,
+        censored_weights=censored_weights,
     )
     coarse_probability = _normalise(coarse_log)
 
@@ -517,6 +569,8 @@ def solve_site(
         censored_y=censored_y,
         censored_levels=censored_levels,
         settings=resolved,
+        detection_weights=detection_weights,
+        censored_weights=censored_weights,
     )
     probability = _normalise(fine_log)
 
@@ -668,6 +722,15 @@ def solve_site(
             "best_fit_db": sigma_fit,
         },
         "credible_region_touches_grid_edge": touches_edge,
+        "shadowing_correlation": {
+            "assumed_m": resolved.shadowing_correlation_m,
+            # How many independent measurements the evidence was counted as.
+            # Equal to the measurement count when correlation is not modelled.
+            "effective_measurements": (
+                float(len(measurements)) if weights is None else round(float(weights.sum()), 3)
+            ),
+            "measurements": len(measurements),
+        },
         "source_model": SOURCE_MODEL,
     }
 
@@ -707,5 +770,6 @@ __all__ = [
     "PosteriorSurface",
     "SolveResult",
     "highest_density_threshold",
+    "shadowing_weights",
     "solve_site",
 ]

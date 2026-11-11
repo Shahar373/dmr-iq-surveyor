@@ -155,3 +155,73 @@ def test_cli_calibrate_writes_a_report(tmp_path: Path) -> None:
 
     bad = runner.invoke(app, ["geo", "calibrate", "--layout", "spiral", "--trials", "1"])
     assert bad.exit_code == 1
+
+
+# --- Stage 4: correlated shadowing in the likelihood -------------------------
+
+
+def test_shadowing_weights_count_a_cluster_as_about_one_stop() -> None:
+    import numpy as np
+
+    from dmr_iq_surveyor.geo.solver import shadowing_weights
+
+    assert shadowing_weights(np.zeros(3), np.zeros(3), 0.0) is None
+    east = np.array([0.0, 0.0, 0.0, 50_000.0])
+    north = np.zeros(4)
+    weights = shadowing_weights(east, north, 300.0)
+    assert weights is not None
+    assert np.allclose(weights[:3], 1.0 / 3.0)
+    assert weights[3] == pytest.approx(1.0)
+
+
+def test_repeating_a_stop_no_longer_shrinks_the_region() -> None:
+    """Three copies of one measurement are one measurement, not three."""
+    import numpy as np
+
+    rng = np.random.default_rng(5)
+    scenario = CalibrationScenario(reference_level_db=40.0, stops=8, true_sigma_db=4.0)
+    once, _ = simulate_measurements(scenario, rng, _fast())
+    thrice = [m for m in once for _ in range(3)]
+
+    def area(measurements, correlation_m: float) -> float:
+        settings = _fast()
+        settings.shadowing_correlation_m = correlation_m
+        result = solve_site(measurements, settings)
+        assert result.surface is not None
+        cell = (result.surface.grid.resolution_m / 1000.0) ** 2
+        probability = result.surface.probability
+        from dmr_iq_surveyor.geo.solver import highest_density_threshold
+
+        return float(np.count_nonzero(probability >= highest_density_threshold(probability, 0.9)))* cell
+
+    independent_once, independent_thrice = area(once, 0.0), area(thrice, 0.0)
+    assert independent_thrice < 0.7 * independent_once, "the old likelihood is fooled by repeats"
+    weighted_once, weighted_thrice = area(once, 300.0), area(thrice, 300.0)
+    assert weighted_thrice == pytest.approx(weighted_once, rel=0.15)
+
+
+def test_correlation_off_reproduces_the_phase7_solver_exactly() -> None:
+    import numpy as np
+
+    rng = np.random.default_rng(9)
+    measurements, _ = simulate_measurements(
+        CalibrationScenario(reference_level_db=30.0, stops=8), rng, _fast()
+    )
+    baseline = solve_site(measurements, _fast())
+    explicit = _fast()
+    explicit.shadowing_correlation_m = 0.0
+    again = solve_site(measurements, explicit)
+    assert baseline.surface is not None and again.surface is not None
+    assert np.array_equal(baseline.surface.probability, again.surface.probability)
+    assert baseline.mode_latitude == again.mode_latitude
+    assert again.diagnostics["shadowing_correlation"]["effective_measurements"] == 8.0
+
+
+def test_modelling_the_correlation_restores_honest_coverage_on_a_drive() -> None:
+    settings = _fast()
+    settings.shadowing_correlation_m = 600.0
+    report = run_calibration(CalibrationScenario(correlation_m=600.0, **DRIVE), settings)
+    assert report["coverage_all_surfaces"]["0.9"]["verdict"] in (
+        VERDICT_CONSISTENT,
+        VERDICT_CONSERVATIVE,
+    )

@@ -84,6 +84,14 @@ STATUS_NO_MEASUREMENTS = "no_measurements"
 
 DEFAULT_TOLERANCE_HZ = 6250.0
 
+# Shadowing decorrelation distance the emitter solver assumes by default
+# (Phase 8, Stage 4). Phase 7's `geo solve` keeps 0 (independent stops) so its
+# results do not change. Chosen from `geo calibrate`: assuming at least the
+# true decorrelation distance restored honest 90% coverage on dense drive
+# data, while costing almost nothing on stops spread kilometres apart, whose
+# weights stay near 1. See docs/phase8-fixed-emitter-geolocation.md 5.
+EMITTER_SHADOWING_CORRELATION_M = 500.0
+
 EMITTER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS emitter_targets (
     emitter_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -802,7 +810,7 @@ def solve_emitters(
     stale. The common-mode correction runs exactly as in Phase 7: a first pass
     per emitter, then a second pass for the emitters a shifted stop touched.
     """
-    resolved = settings or SolveSettings()
+    resolved = settings or SolveSettings(shadowing_correlation_m=EMITTER_SHADOWING_CORRELATION_M)
     resolved.validate()
     common = common_mode or CommonModeSettings()
     common.validate()
@@ -935,6 +943,7 @@ __all__ = [
     "ATTRIBUTION_AMBIGUOUS_NEIGHBOUR",
     "ATTRIBUTION_FREQUENCY_MATCH",
     "DEFAULT_TOLERANCE_HZ",
+    "EMITTER_SHADOWING_CORRELATION_M",
     "EMISSIONS",
     "EMISSION_CONTINUOUS",
     "EMISSION_INTERMITTENT",

@@ -302,3 +302,17 @@ def test_cli_add_list_solve_and_remove(tmp_path: Path) -> None:
 
     removed = runner.invoke(app, ["geo", "emitter", "remove", "near", "--database", str(database)])
     assert removed.exit_code == 0
+
+
+def test_the_emitter_solve_models_shadowing_correlation_by_default(tmp_path: Path) -> None:
+    from dmr_iq_surveyor.geo.emitters import EMITTER_SHADOWING_CORRELATION_M
+
+    database = tmp_path / "db.sqlite3"
+    _seed(database)
+    _declare(database)
+    settings = fast_solve_settings(shadowing_correlation_m=EMITTER_SHADOWING_CORRELATION_M)
+    report = solve_emitters(database_path=database, settings=settings)
+    diagnostics = report["solutions"][0]["diagnostics"]["shadowing_correlation"]
+    assert diagnostics["assumed_m"] == EMITTER_SHADOWING_CORRELATION_M
+    assert diagnostics["effective_measurements"] < diagnostics["measurements"]
+    assert report["settings"]["shadowing_correlation_m"] == EMITTER_SHADOWING_CORRELATION_M

@@ -1,6 +1,6 @@
 # Phase 8 — fixed-frequency emitter geolocation (design)
 
-Status: **Stages 1 and 2 implemented; Stages 3–6 planned.**
+Status: **Stages 1 and 2 implemented; Stage 4 item 1 (correlated shadowing) implemented; the rest planned.**
 
 This document is authoritative for Phase 8. It re-scopes the geolocation work around one question:
 *where is the transmitter that is on the air on this frequency?* It does not replace Phase 7 — the
@@ -176,7 +176,7 @@ What this says, in order of consequence:
 3. **Geometry beats count.** 12 stops around the target do better than 40 bins along one side.
    `geo plan`'s azimuth-driven stop selection matters more than adding drive time.
 
-Until Stage 4 lands, treat a region built mostly from drive bins as optimistic.
+Stage 4.1 (below) addresses this; `geo emitter solve` now models the correlation by default.
 
 ## 5. Later stages (planned)
 
@@ -205,7 +205,40 @@ that a non-detection can be admitted as evidence.
 Given the findings in §4.4, the first item below is now the highest-value accuracy change on this
 roadmap and is recommended *before* Stage 3.
 
-- spatially correlated shadowing in the likelihood (or an effective-sample-size correction);
+#### 4.1 Correlated shadowing — implemented
+
+`SolveSettings.shadowing_correlation_m` weights every measurement by
+`w_i = 1 / sum_j exp(-d_ij / L)` over all measurements (heard or not). A cluster of stops that share
+their shadowing counts as about one stop; a stop kilometres from any other keeps weight ~1. It is a
+weighted composite likelihood: the detection count becomes the weight sum wherever it appears in the
+`P0` marginalisation and the sigma normaliser, and each censored term is scaled by its weight. It
+widens the posterior to what the data supports; it does not model the shared shadowing itself.
+
+- `geo emitter solve` assumes `L = 500 m` by default (`--shadowing-correlation-m`).
+- `geo calibrate --model-correlation-m` sets the solver's `L`; `--correlation-m` is the simulated truth.
+- Phase 7's `geo solve` is unchanged (`L = 0`); a test pins that `L = 0` is bit-identical to before.
+- Each solution's diagnostics record `shadowing_correlation.effective_measurements`.
+
+Measured (test-grade grid, 30 trials per row, true sigma 6 dB):
+
+| scenario | true L | 90 % coverage at model L = 0 / 300 / 600 m | median 90 % area at 0 / 300 / 600 m |
+|---|---:|---|---|
+| drive arc, 30 bins @ 300 m, all heard | 0 | 90 / 100 / 100 % | 135 / 211 / 297 km² |
+| drive arc, 30 bins @ 300 m, all heard | 200 m | 80 / 97 / 100 % | 128 / 208 / 292 km² |
+| drive arc, 30 bins @ 300 m, all heard | 600 m | **57** / **77** / 100 % | 93 / 170 / 265 km² |
+| drive arc, 40 bins @ 150 m, some unheard | 0 | **77** / 100 / 100 % | 144 / 285 / 329 km² |
+| drive arc, 40 bins @ 150 m, some unheard | 500 m | **30** / 97 / 100 % | 106 / 248 / 320 km² |
+| ring, 12 stationary stops | 0 | 93 / 93 / 100 % | 177 / 180 / 207 km² |
+| random, 16 stationary stops, some unheard | 0 | 100 / 100 / 100 % | 253 / 266 / 315 km² |
+
+Reading: assuming at least the true decorrelation distance restores honest coverage on drive data,
+at the price of roughly doubling the drive region — which is the size it should always have been.
+Stationary stops spread kilometres apart are almost unaffected. 500 m was chosen as the default
+because honesty comes first: 300 m already reached ~nominal 90 % coverage for a true 500 m but
+under-covered at 50 % (33 %). In open or rural terrain, where shadowing decorrelates more slowly,
+raise it. Mode error is unchanged by the weighting; it widens regions, it does not move them.
+
+- ~~spatially correlated shadowing in the likelihood~~ — done, see 4.1 above;
 - heavy-tailed residuals (Student-t) so one reflected or blocked stop cannot drag the region;
 - a stop-type offset (vehicle roof vs. handheld) marginalised like `P0`;
 - leave-one-out common-mode correction.

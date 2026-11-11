@@ -25,6 +25,7 @@ from dmr_iq_surveyor.geo.calibration import (
 from dmr_iq_surveyor.geo.emitters import (
     DEFAULT_TOLERANCE_HZ,
     EMISSIONS,
+    EMITTER_SHADOWING_CORRELATION_M,
     EmitterError,
     connect_emitter_database,
     list_emitters,
@@ -189,6 +190,18 @@ def emitter_solve(
     level_metric: Annotated[
         str, typer.Option("--level-metric", help="snr_db or p95_snr_db")
     ] = "snr_db",
+    shadowing_correlation_m: Annotated[
+        float,
+        typer.Option(
+            "--shadowing-correlation-m",
+            help=(
+                "Distance over which shadow fading is assumed shared between stops; stops "
+                "closer than this count as less than one independent measurement each. "
+                "0 treats every stop as independent (Phase 7 behaviour), which is "
+                "overconfident on dense drive data"
+            ),
+        ),
+    ] = EMITTER_SHADOWING_CORRELATION_M,
 ) -> None:
     """Solve every declared emitter. Produces credible regions, never coordinates."""
     try:
@@ -199,6 +212,7 @@ def emitter_solve(
             solve_batch_id=solve_batch_id,
             measurement_settings=MeasurementSettings(level_metric=level_metric),
             scope=_scope(campaign),
+            settings=SolveSettings(shadowing_correlation_m=shadowing_correlation_m),
         )
     except (ValueError, sqlite3.Error) as exc:
         console.print(f"[bold red]{exc}[/bold red]")
@@ -253,6 +267,16 @@ def calibrate_command(
     ] = 0.0,
     censor_level_db: Annotated[float, typer.Option("--censor-level-db")] = 6.0,
     drive_spacing_m: Annotated[float, typer.Option("--drive-spacing-m")] = 150.0,
+    model_correlation_m: Annotated[
+        float,
+        typer.Option(
+            "--model-correlation-m",
+            help=(
+                "Shadowing correlation the SOLVER assumes (what `geo emitter solve "
+                "--shadowing-correlation-m` sets); --correlation-m is the simulated truth"
+            ),
+        ),
+    ] = EMITTER_SHADOWING_CORRELATION_M,
     seed: Annotated[int, typer.Option()] = 0,
     output: Annotated[
         Path | None, typer.Option("--output", help="Write the full JSON report here")
@@ -279,7 +303,9 @@ def calibrate_command(
         seed=seed,
     )
     try:
-        report = run_calibration(scenario, SolveSettings())
+        report = run_calibration(
+            scenario, SolveSettings(shadowing_correlation_m=model_correlation_m)
+        )
     except ValueError as exc:
         console.print(f"[bold red]{exc}[/bold red]")
         raise typer.Exit(code=1) from exc

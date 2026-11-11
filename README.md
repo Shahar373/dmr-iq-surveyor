@@ -735,6 +735,10 @@ An `intermittent` emitter's non-detections are kept with the reason `absence_not
 used: not hearing it may only mean it was off. Two declared emitters within tolerance of each other
 are both `ambiguous`, never guessed.
 
+Stops closer together than `--shadowing-correlation-m` (default 500 m) share their shadow fading
+and are counted as less than one independent measurement each. Without this, dense drive data gave
+90 % regions that held the transmitter only 30–50 % of the time in simulation.
+
 `geo calibrate` measures whether the reported regions are honest, by simulation with the production
 solver:
 

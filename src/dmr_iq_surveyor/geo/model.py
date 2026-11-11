@@ -231,6 +231,22 @@ class SolveSettings:
     # cell chunk is derived from this, so peak memory is set by one
     # number rather than varying with how many non-detections a site has.
     max_working_elements: int = 4_000_000
+    # Decorrelation distance of shadow fading assumed by the likelihood
+    # (Phase 8, Stage 4). 0 -- the default, and what every Phase 7 solve
+    # uses -- treats every measurement as independent evidence, exactly as
+    # before. A positive value weights each measurement by
+    #
+    #     w_i = 1 / sum_j exp(-d_ij / shadowing_correlation_m)
+    #
+    # over every measurement j (detected or not), so a cluster of k stops
+    # close enough to share their shadowing counts as about one stop rather
+    # than k. This is a weighted composite likelihood, not the full
+    # correlated Gaussian: it widens the posterior to what the data can
+    # actually support but does not model the shared shadowing itself.
+    # Measured motivation: `docs/phase8-fixed-emitter-geolocation.md` 4.4,
+    # where dense drive bins gave 90% regions holding the truth 30-50% of
+    # the time.
+    shadowing_correlation_m: float = 0.0
 
     def validate(self) -> None:
         if self.sigma_db <= 0:
@@ -275,6 +291,8 @@ class SolveSettings:
             raise ValueError("chunk_cells must be at least 1")
         if self.max_working_elements < 1:
             raise ValueError("max_working_elements must be at least 1")
+        if not math.isfinite(self.shadowing_correlation_m) or self.shadowing_correlation_m < 0:
+            raise ValueError("shadowing_correlation_m must be a non-negative number of metres")
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
