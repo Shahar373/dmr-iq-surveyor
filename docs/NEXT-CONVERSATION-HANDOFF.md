@@ -28,6 +28,11 @@ Current release:
 > measurement is attributed to a site by frequency alone, and a frequency shared by two sites is
 > excluded rather than guessed. A NAC does not identify a site — one NAC is routinely shared by
 > many sites in a system.
+>
+> **Direction change (Phase 8).** The owner chose to locate fixed-frequency emitters with no
+> decoding at all; Phase 6B is off the roadmap. Read `docs/phase8-fixed-emitter-geolocation.md`:
+> Stages 1–2 (emitter targets, `geo calibrate`) are implemented, and the first calibration run
+> shows drive-bin regions are overconfident under correlated shadowing — the next accuracy work.
 
 The repository implements Phases 1–5.1 of an offline, passive, receive-only DMR survey pipeline. Do not restart the project or replace established commands, formats or tests without evidence.
 

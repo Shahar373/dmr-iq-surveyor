@@ -218,6 +218,10 @@ def connect_survey_database(path: str | Path) -> sqlite3.Connection:
     # by the gain check. NULL on rows written before this column existed means
     # exactly "not recorded", and readers say so rather than assuming a value.
     _ensure_column(connection, "sites", "lna_state", "INTEGER")
+    # Median excess-over-noise S/N across windows (Phase 8, Stage 3). NULL on
+    # rows written before it existed means "not measured", and readers that
+    # need it say so -- see geo.measurements.observation_level.
+    _ensure_column(connection, "rf_observations", "excess_snr_db", "REAL")
     connection.commit()
     return connection
 
@@ -513,10 +517,10 @@ def import_survey_run(
                 equivalent_width_hz, spectral_fill, symmetry, nearest_raster_hz,
                 raster_spacing_hz, raster_error_hz, spectral_class, classification,
                 classification_confidence, classification_method, edge_warning,
-                dc_warning
+                dc_warning, excess_snr_db
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -550,6 +554,7 @@ def import_survey_run(
                 observation.classification_method,
                 int(observation.edge_warning),
                 int(observation.dc_warning),
+                observation.excess_snr_db,
             ),
         )
 

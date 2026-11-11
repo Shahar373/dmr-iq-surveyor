@@ -181,7 +181,7 @@ def _log_distance_ratio(
 
 
 def reference_level_offsets(
-    detection_count: int, settings: SolveSettings, sigma: float | None = None
+    detection_count: float, settings: SolveSettings, sigma: float | None = None
 ) -> np.ndarray:
     """Offsets from each cell's own best-fit reference level to integrate over.
 
@@ -228,6 +228,10 @@ def _evaluate_grid(
     censored_y: np.ndarray,
     censored_levels: np.ndarray,
     settings: SolveSettings,
+    detection_weights: np.ndarray | None = None,
+    censored_weights: np.ndarray | None = None,
+    detection_position_sigma: np.ndarray | None = None,
+    censored_position_sigma: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, float, float, int, np.ndarray]:
     """Marginal log posterior per cell, the best (n, sigma, P0, cell), and
     the log mass each sigma collected.
@@ -242,12 +246,33 @@ def _evaluate_grid(
     -- since they cancel in both the marginalisation and the final
     normalisation. The parts of the normaliser that DO depend on sigma are
     kept; see `log_measure` below for why that is not optional.
+
+    With weights (`SolveSettings.shadowing_correlation_m > 0`) every
+    detection's squared residual and every censored term is multiplied by
+    its weight, and the detection COUNT becomes the weight SUM wherever it
+    appears -- the reference-level mean, the `K delta^2` term, the offset
+    window and sigma's normaliser. The algebra is otherwise identical: the
+    per-cell `P0` is the weighted mean and `RSS` the weighted sum. Without
+    weights the original unweighted expressions run unchanged, so a Phase 7
+    solve is bit-for-bit what it was.
     """
     xs, ys = grid.axes()
     exponents = np.asarray(settings.path_loss_exponents, dtype=float)
     sigmas = np.asarray(settings.sigma_db_values, dtype=float)
     detection_count = int(detection_levels.size)
     censored_count = int(censored_levels.size)
+    weighted = detection_weights is not None
+    # Position uncertainty (Phase 8, Stage 3.2). Only when some measurement
+    # actually carries one; otherwise the original expressions run untouched.
+    positional = any(
+        values is not None and bool(np.any(values > 0.0))
+        for values in (detection_position_sigma, censored_position_sigma)
+    )
+    # The number of independent detections the evidence is worth. Equal to
+    # the count when unweighted.
+    effective_detections: float = (
+        float(np.sum(detection_weights)) if detection_weights is not None else detection_count
+    )
 
     # The largest temporary is (cells x offsets): censored measurements are
     # accumulated one at a time rather than broadcast into a three-axis
@@ -283,7 +308,7 @@ def _evaluate_grid(
         for sigma_index, sigma in enumerate(sigmas):
             sigma = float(sigma)
             two_sigma_squared = 2.0 * sigma * sigma
-            offsets = reference_level_offsets(detection_count, settings, sigma=sigma)
+            offsets = reference_level_offsets(effective_detections, settings, sigma=sigma)
             scaled_offsets = offsets / sigma
 
             # Sigma's own measure, and the reason it cannot be dropped the way
@@ -305,7 +330,7 @@ def _evaluate_grid(
             # and drops out. Both branches therefore reduce to -(K-1) log
             # sigma, which is the right power: profiling out the unknown
             # reference level costs exactly one degree of freedom.
-            log_measure = -detection_count * math.log(sigma)
+            log_measure = -effective_detections * math.log(sigma)
             if censored_ratio is None:
                 log_measure += math.log(sigma)
             else:
@@ -315,30 +340,57 @@ def _evaluate_grid(
                 # a_i: the reference level that would fit detection i exactly
                 # if the transmitter were in this cell with this exponent.
                 fitted = detection_levels[None, :] + 10.0 * exponent * detection_ratio
-                best_level = fitted.mean(axis=1)
-                residual_sum_squares = np.square(fitted - best_level[:, None]).sum(axis=1)
-                base = -residual_sum_squares / two_sigma_squared
-
-                if censored_ratio is None:
+                if positional:
+                    marginal, peak, peak_offset, best_level = _positional_terms(
+                        fitted=fitted,
+                        detection_ratio=detection_ratio,
+                        censored_ratio=censored_ratio,
+                        censored_levels=censored_levels,
+                        exponent=float(exponent),
+                        sigma=sigma,
+                        offsets=offsets,
+                        log_measure=log_measure,
+                        settings=settings,
+                        detection_weights=detection_weights,
+                        censored_weights=censored_weights,
+                        detection_position_sigma=detection_position_sigma,
+                        censored_position_sigma=censored_position_sigma,
+                    )
+                elif weighted:
+                    best_level = (fitted * detection_weights[None, :]).sum(
+                        axis=1
+                    ) / effective_detections
+                    residual_sum_squares = (
+                        np.square(fitted - best_level[:, None]) * detection_weights[None, :]
+                    ).sum(axis=1)
+                else:
+                    best_level = fitted.mean(axis=1)
+                    residual_sum_squares = np.square(fitted - best_level[:, None]).sum(axis=1)
+                if not positional and censored_ratio is None:
+                    base = -residual_sum_squares / two_sigma_squared
                     # With no censored terms the offset integral is the same
                     # constant for every cell, so the marginal is the base
                     # term plus sigma's measure.
                     marginal = base + log_measure
                     peak = marginal
                     peak_offset = np.zeros_like(base)
-                else:
+                elif not positional:
+                    base = -residual_sum_squares / two_sigma_squared
                     shift = (
                         censored_levels[None, :] + 10.0 * exponent * censored_ratio
                         - best_level[:, None]
                     ) / sigma
                     censored_term = np.zeros((stop - start, offsets.size), dtype=np.float64)
                     for column in range(censored_count):
-                        censored_term += tabulated_log_ndtr(
+                        term = tabulated_log_ndtr(
                             shift[:, column][:, None] - scaled_offsets[None, :]
                         )
+                        if censored_weights is not None:
+                            term *= float(censored_weights[column])
+                        censored_term += term
                     joint = (
                         base[:, None]
-                        - detection_count * np.square(offsets)[None, :] / two_sigma_squared
+                        - effective_detections * np.square(offsets)[None, :] / two_sigma_squared
                         + censored_term
                     )
                     marginal = np.logaddexp.reduce(joint, axis=1) + log_measure
@@ -363,6 +415,162 @@ def _evaluate_grid(
         log_marginal[start:stop] = chunk_accumulator
 
     return log_marginal, best_exponent, best_sigma, best_reference, best_cell, sigma_log_mass
+
+
+_LOG10_E_TIMES_10 = 10.0 / math.log(10.0)
+
+
+def _positional_terms(
+    *,
+    fitted: np.ndarray,
+    detection_ratio: np.ndarray,
+    censored_ratio: np.ndarray | None,
+    censored_levels: np.ndarray,
+    exponent: float,
+    sigma: float,
+    offsets: np.ndarray,
+    log_measure: float,
+    settings: SolveSettings,
+    detection_weights: np.ndarray | None,
+    censored_weights: np.ndarray | None,
+    detection_position_sigma: np.ndarray | None,
+    censored_position_sigma: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """The marginal for one (sigma, exponent) when positions are uncertain.
+
+    A position known to within `s` metres, at distance `d` from the cell,
+    moves the predicted level by about `(10 n / ln 10) * s / d` dB. That adds
+    in quadrature to the shadowing, so each measurement's variance becomes
+    `sigma^2 / u` with
+
+        u = 1 / (1 + ((10 n / ln 10) * s / (sigma * d))^2)
+
+    -- 1 far from the cell, small close to it. The likelihood is then the
+    same Gaussian with per-cell, per-measurement weights `u` (times any
+    shadowing-correlation weight): weighted `P0`, weighted residual sum, and
+    each measurement's own normaliser `+ 1/2 log u`. A censored term's z is
+    scaled by `sqrt(u)`. The closed-form `P0` integral gains `-1/2 log E`,
+    with `E` the cell's weight sum, which is no longer a constant.
+
+    What this fixes: a stop that passes right by a candidate cell no longer
+    pins the transmitter to within metres of a centroid that is itself only
+    known to within tens of metres.
+    """
+    slope = _LOG10_E_TIMES_10 * exponent
+    distance = settings.reference_distance_m * np.power(10.0, detection_ratio)
+    if detection_position_sigma is not None:
+        inflation = slope * detection_position_sigma[None, :] / (sigma * distance)
+        u = 1.0 / (1.0 + np.square(inflation))
+    else:
+        u = np.ones_like(fitted)
+    strength = detection_weights[None, :] if detection_weights is not None else 1.0
+    weights = u * strength
+    effective = weights.sum(axis=1)
+    best_level = (fitted * weights).sum(axis=1) / effective
+    residual = (np.square(fitted - best_level[:, None]) * weights).sum(axis=1)
+    base = -residual / (2.0 * sigma * sigma) + 0.5 * (np.log(u) * strength).sum(axis=1)
+
+    if censored_ratio is None:
+        marginal = base - 0.5 * np.log(effective) + log_measure
+        return marginal, marginal, np.zeros_like(base), best_level
+
+    censored_distance = settings.reference_distance_m * np.power(10.0, censored_ratio)
+    if censored_position_sigma is not None:
+        censored_inflation = (
+            slope * censored_position_sigma[None, :] / (sigma * censored_distance)
+        )
+        root_u = 1.0 / np.sqrt(1.0 + np.square(censored_inflation))
+    else:
+        root_u = np.ones_like(censored_distance)
+    shift = (
+        censored_levels[None, :] + 10.0 * exponent * censored_ratio - best_level[:, None]
+    ) / sigma
+    scaled_offsets = offsets / sigma
+    censored_term = np.zeros((fitted.shape[0], offsets.size), dtype=np.float64)
+    for column in range(censored_levels.size):
+        scale = root_u[:, column][:, None]
+        term = tabulated_log_ndtr((shift[:, column][:, None] - scaled_offsets[None, :]) * scale)
+        if censored_weights is not None:
+            term *= float(censored_weights[column])
+        censored_term += term
+    joint = (
+        base[:, None]
+        - effective[:, None] * np.square(offsets)[None, :] / (2.0 * sigma * sigma)
+        + censored_term
+    )
+    marginal = np.logaddexp.reduce(joint, axis=1) + log_measure
+    argument = np.argmax(joint, axis=1)
+    peak = np.take_along_axis(joint, argument[:, None], axis=1).reshape(-1) + log_measure
+    return marginal, peak, offsets[argument], best_level
+
+
+def shadowing_weights(
+    east: np.ndarray, north: np.ndarray, correlation_m: float
+) -> np.ndarray | None:
+    """Per-measurement weights for spatially correlated shadow fading.
+
+    `w_i = 1 / sum_j exp(-d_ij / correlation_m)`, the sum over every
+    measurement including i itself. An isolated stop keeps weight ~1; k
+    stops on top of each other each get ~1/k, so together they count as one.
+    `None` when correlation is not modelled, which callers treat as the
+    original unweighted likelihood.
+    """
+    if correlation_m <= 0:
+        return None
+    points = np.column_stack([np.asarray(east, dtype=float), np.asarray(north, dtype=float)])
+    deltas = points[:, None, :] - points[None, :, :]
+    distances = np.hypot(deltas[..., 0], deltas[..., 1])
+    return 1.0 / np.exp(-distances / correlation_m).sum(axis=1)
+
+
+# Suspect-stop check (Phase 8, Stage 4.2). The Gaussian likelihood absorbs a
+# single wild stop by widening sigma -- measured: one stop 25 dB off pushed
+# the fitted shadowing from a true 4 dB to 8-10 dB -- so a plain residual
+# threshold never fires. A spread taken from the median absolute deviation is
+# not inflated by that one stop. Measured on 40 campaigns of 10 stops: a stop
+# 25 dB off was named in 35, and clean campaigns raised 4 flags in total.
+# A mixture likelihood was also tried; it named the stop as reliably but did
+# not locate the transmitter any better and was ~35x slower, so it was not
+# adopted. See docs/phase8-fixed-emitter-geolocation.md.
+SUSPECT_ROBUST_Z = 3.0
+SUSPECT_MIN_DETECTIONS = 5
+# Floor on the robust spread: with tightly agreeing stops the MAD can be a
+# fraction of a dB, and a stop 2 dB off would read as wildly inconsistent.
+SUSPECT_MIN_SPREAD_DB = 2.0
+
+
+def flag_suspect_stops(residuals: list[dict[str, Any]]) -> dict[str, Any]:
+    """Mark detections whose residual is far from the others' by a robust measure.
+
+    Annotates each detection entry in place with `robust_z` and `suspect`, and
+    returns a summary. Diagnostic only: nothing is removed or down-weighted.
+    """
+    detected = [entry for entry in residuals if "residual_db" in entry]
+    summary: dict[str, Any] = {
+        "method": "median_absolute_deviation",
+        "threshold_robust_z": SUSPECT_ROBUST_Z,
+        "robust_spread_db": None,
+        "labels": [],
+    }
+    if len(detected) < SUSPECT_MIN_DETECTIONS:
+        summary["note"] = (
+            f"{len(detected)} detection(s); at least {SUSPECT_MIN_DETECTIONS} are needed before "
+            "one stop can be told apart from the rest"
+        )
+        return summary
+    values = np.array([float(entry["residual_db"]) for entry in detected])
+    centre = float(np.median(values))
+    spread = max(
+        1.4826 * float(np.median(np.abs(values - centre))), SUSPECT_MIN_SPREAD_DB
+    )
+    summary["robust_spread_db"] = round(spread, 3)
+    for entry, value in zip(detected, values, strict=True):
+        z = (float(value) - centre) / spread
+        entry["robust_z"] = round(z, 3)
+        entry["suspect"] = abs(z) >= SUSPECT_ROBUST_Z
+        if entry["suspect"]:
+            summary["labels"].append(entry["label"])
+    return summary
 
 
 def _normalise(log_marginal: np.ndarray) -> np.ndarray:
@@ -476,6 +684,13 @@ def solve_site(
     censored_levels = np.array(
         [float(m.censor_level_db) for m in measurements if not m.detected], dtype=float
     )
+    weights = shadowing_weights(east, north, resolved.shadowing_correlation_m)
+    detection_weights = None if weights is None else weights[detection_mask]
+    censored_weights = None if weights is None else weights[~detection_mask]
+    position_sigma = np.array([float(m.position_sigma_m or 0.0) for m in measurements])
+    uncertain = bool(np.any(position_sigma > 0.0))
+    detection_position_sigma = position_sigma[detection_mask] if uncertain else None
+    censored_position_sigma = position_sigma[~detection_mask] if uncertain else None
 
     coarse = build_grid(
         float(east.min()) - resolved.margin_m,
@@ -494,6 +709,10 @@ def solve_site(
         censored_y=censored_y,
         censored_levels=censored_levels,
         settings=resolved,
+        detection_weights=detection_weights,
+        censored_weights=censored_weights,
+        detection_position_sigma=detection_position_sigma,
+        censored_position_sigma=censored_position_sigma,
     )
     coarse_probability = _normalise(coarse_log)
 
@@ -517,6 +736,10 @@ def solve_site(
         censored_y=censored_y,
         censored_levels=censored_levels,
         settings=resolved,
+        detection_weights=detection_weights,
+        censored_weights=censored_weights,
+        detection_position_sigma=detection_position_sigma,
+        censored_position_sigma=censored_position_sigma,
     )
     probability = _normalise(fine_log)
 
@@ -567,6 +790,14 @@ def solve_site(
             entry["exceedance_db"] = max(0.0, predicted - measurement.censor_level_db)
         residuals.append(entry)
     residual_rms = math.sqrt(squared_sum / len(detections)) if detections else None
+    suspects = flag_suspect_stops(residuals)
+    if suspects["labels"]:
+        warnings.append(
+            f"{len(suspects['labels'])} stop(s) disagree with the rest by at least "
+            f"{SUSPECT_ROBUST_Z:g} robust standard deviations ({', '.join(suspects['labels'])}); "
+            "such a stop may be blocked or have unusual line of sight. Its evidence is still "
+            "used -- re-measuring near it is the way to find out"
+        )
 
     bearings = [
         bearing_deg(mode_latitude, mode_longitude, m.latitude, m.longitude) for m in detections
@@ -668,6 +899,25 @@ def solve_site(
             "best_fit_db": sigma_fit,
         },
         "credible_region_touches_grid_edge": touches_edge,
+        "suspect_stops": suspects,
+        "position_uncertainty": {
+            "modelled": uncertain,
+            "measurements_with_sigma": int(np.count_nonzero(position_sigma > 0.0)),
+            "median_sigma_m": (
+                round(float(np.median(position_sigma[position_sigma > 0.0])), 1)
+                if uncertain
+                else None
+            ),
+        },
+        "shadowing_correlation": {
+            "assumed_m": resolved.shadowing_correlation_m,
+            # How many independent measurements the evidence was counted as.
+            # Equal to the measurement count when correlation is not modelled.
+            "effective_measurements": (
+                float(len(measurements)) if weights is None else round(float(weights.sum()), 3)
+            ),
+            "measurements": len(measurements),
+        },
         "source_model": SOURCE_MODEL,
     }
 
@@ -706,6 +956,8 @@ __all__ = [
     "VALIDATION_STATUS",
     "PosteriorSurface",
     "SolveResult",
+    "flag_suspect_stops",
     "highest_density_threshold",
+    "shadowing_weights",
     "solve_site",
 ]

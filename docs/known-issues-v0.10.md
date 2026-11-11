@@ -12,6 +12,10 @@ assumptions.
 
 ### Merged-segment SNR uses `max`, not a weighted mean
 
+> **Addressed alongside (Phase 8, Stage 3.1):** the existing field is unchanged, as compatibility
+> requires; a new unbiased level, `excess_snr_db`, is stored next to it and is the default for
+> `geo emitter`. See `docs/phase8-fixed-emitter-geolocation.md` 3.1.
+
 `detect/merge.py`, `merge_recordings()`: when segments (or drive-bin windows) covering the same
 candidate are merged, `average_snr_db` and `p95_snr_db` of the merged candidate are the **maximum**
 across the contributing segments/windows, not a duration- or quality-weighted mean. `measured_center_hz`
@@ -22,6 +26,10 @@ upward bias on measured levels that grows with the number of contributing window
 level as distance, so this pulls estimated regions toward "closer than measured."
 
 ### Channel SNR is computed as (signal+noise)/noise, not excess/noise
+
+> **Addressed alongside (Phase 8, Stage 3.1):** the existing field is unchanged, as compatibility
+> requires; a new unbiased level, `excess_snr_db`, is stored next to it and is the default for
+> `geo emitter`. See `docs/phase8-fixed-emitter-geolocation.md` 3.1.
 
 `detect/features.py`, `feature_at()`: `average_snr_db`/`p95_snr_db` are
 `10*log10(mean(S+N)/mean(N))`, i.e. total power over noise, not `10*log10((S+N-N)/N)`. The correct
@@ -51,6 +59,9 @@ in `geo/model.py`, a ~0.1% inconsistency.
 
 ### The bin window cap keeps the first N windows, not a spread sample
 
+> **Addressed (Phase 8, Stage 3):** opt-in `spread_windows_over_bin` spreads the windows over the span, and every bin now records
+> `under_spanned`. See `docs/phase8-fixed-emitter-geolocation.md` 3.3.
+
 `live/session.py`: `max_windows_per_bin` (10) is a hard cap on windows *appended in arrival order*;
 once reached, the bin closes immediately and further windows in the same bin are dropped
 (`windows_dwelled`) rather than sampled across the remainder of the bin's span. In slow traffic this
@@ -60,6 +71,9 @@ means a bin can close, and its measurement be placed, after only the first tens 
 it to flag a bin as under-spanned.
 
 ### GPS accuracy is stored and never used; drive bins do not store it at all
+
+> **Addressed (Phase 8, Stage 3):** drive bins store the median reported accuracy; emitter measurements derive a position
+> uncertainty from it, which the solver uses on request. See `docs/phase8-fixed-emitter-geolocation.md` 3.2.
 
 `survey_runs.gps_accuracy_m` and `geo_measurements.position_accuracy_m` exist and are populated for
 stationary stops (from the browser's `GeolocationPosition.coords.accuracy`), but `geo/pipeline.py`'s
@@ -82,6 +96,9 @@ reproducible, re-runnable calibration test.
 ## Drive mode plumbing
 
 ### The most likely mechanism for a drive bin repeating despite movement
+
+> **Addressed (Phase 8, Stage 3):** the page sends the fix's age measured on the phone's own clock, and the Pi backdates the fix
+> by it, so a repeated fix goes stale. See `docs/phase8-fixed-emitter-geolocation.md` 3.2.
 
 `web/static/app.js`'s `sendFix()` does not forward the browser's `GeolocationPosition.timestamp` to
 the server; `web/service.py`'s `push_live_position()` stamps every incoming fix with

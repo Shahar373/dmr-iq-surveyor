@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import re
 import sqlite3
 import threading
@@ -310,6 +311,9 @@ class FieldSettings:
     # measurement only starts a full 150 m span from where the last one
     # began, which is what stops spans from ever overlapping at any speed.
     live_adaptive_bins: bool = True
+    # Phase 8, Stage 3.3: spread a drive bin's windows over its span rather
+    # than keeping the first ones. Off by default, as before.
+    live_spread_windows_over_bin: bool = False
     # Backstop only, not a plan: a drive normally ends when the operator
     # stops it. Without a cap a forgotten session holds the SDR and burns
     # the battery until the Pi is found.
@@ -388,6 +392,31 @@ def default_probe_runner() -> ProbeRunner:
     runner it was handed.
     """
     return SubprocessProbeRunner()
+
+
+# A fix older than this is not a slow phone, it is a broken report. The age is
+# still honoured -- the fix is simply stale at once -- but capped so a bogus
+# value cannot underflow the monotonic clock arithmetic.
+_MAX_REPORTED_FIX_AGE_S = 86_400.0
+
+
+def _fix_age_seconds(value: Any) -> float | None:
+    """The phone's own measure of how old its fix was when sent, or None.
+
+    Negative values -- a provider timestamp a few milliseconds ahead of the
+    page clock -- are clamped to 0. Anything that is not a finite number is
+    treated as not sent rather than refused: a malformed age must not cost
+    the operator the position itself.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        age = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(age):
+        return None
+    return min(max(age, 0.0), _MAX_REPORTED_FIX_AGE_S)
 
 
 class FieldService:
@@ -1636,6 +1665,17 @@ class FieldService:
         wrong by hours, and staleness -- the one check that stops a
         measurement being placed where the receiver used to be -- has to be
         measured against something that cannot jump.
+
+        What the phone CAN say reliably is how old the fix already was when
+        it sent it: `fix_age_s`, the difference between two readings of the
+        phone's own clock (now, and the fix's timestamp), which cancels any
+        offset that clock has. The fix is backdated by that age on arrival
+        (Phase 8, Stage 3.2). Without it, a location provider that repeats
+        its last fix -- common on Android and iOS when no new one is ready --
+        looked fresh on every POST, and a drive kept placing measurements at
+        a spot it had left. A repeated fix now ages as it should and goes
+        stale on the same clock as everything else. A phone that does not
+        send the field is treated as before.
         """
         try:
             latitude = float(payload["latitude"])
@@ -1662,6 +1702,7 @@ class FieldService:
             accuracy_m=float(accuracy) if accuracy is not None else None,
             speed_mps=float(speed) if speed is not None else None,
             source="phone",
+            fix_age_s=_fix_age_seconds(payload.get("fix_age_s")),
         )
 
     def _store_live_fix(
@@ -1672,12 +1713,14 @@ class FieldService:
         accuracy_m: float | None,
         speed_mps: float | None,
         source: str,
+        fix_age_s: float | None = None,
     ) -> dict[str, Any]:
+        age = fix_age_s or 0.0
         fix = Position(
             latitude=latitude,
             longitude=longitude,
             accuracy_m=accuracy_m,
-            at=time.monotonic(),
+            at=time.monotonic() - age,
         )
         point = {
             "latitude": latitude,
@@ -1686,6 +1729,8 @@ class FieldService:
             "speed_mps": speed_mps,
             "source": source,
             "at": datetime.now(UTC).isoformat(),
+            # None means the sender did not say, which is not the same as 0.
+            "fix_age_s": fix_age_s,
         }
         with self._live_lock:
             self._live_fix = fix
@@ -1697,8 +1742,10 @@ class FieldService:
                 del self._live_trail[: len(self._live_trail) - _LIVE_TRAIL_LIMIT]
             running = self._live_job_id
             bins = len(self._live_bins)
+        stale = age > self.settings.live_max_position_age_seconds
         return {"accepted": True, "fix_count": self._live_fix_count,
-                "drive_running": running is not None, "bins": bins}
+                "drive_running": running is not None, "bins": bins,
+                "fix_age_s": fix_age_s, "stale": stale}
 
     def _accept_gnss_fix(self, fix: GnssFix) -> None:
         """A fix from the Pi's own receiver, on the reader's thread.
@@ -1771,6 +1818,11 @@ class FieldService:
             ),
             adaptive_bin_size=bool(
                 given.get("adaptive_bin_size", self.settings.live_adaptive_bins)
+            ),
+            spread_windows_over_bin=bool(
+                given.get(
+                    "spread_windows_over_bin", self.settings.live_spread_windows_over_bin
+                )
             ),
             fft_size=int(given.get("fft_size", self.settings.live_fft_size)),
             frames_per_window=int(

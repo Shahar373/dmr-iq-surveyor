@@ -378,6 +378,9 @@ class RfObservation:
     classification_method: str
     edge_warning: bool
     dc_warning: bool
+    # Median excess-over-noise S/N across the windows that detected the
+    # channel (Phase 8, Stage 3). None where it was not measured.
+    excess_snr_db: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -569,6 +572,7 @@ def observations_from_segments(
                 classification_method="spectral_only",
                 edge_warning=bool(candidate["edge_warning"]),
                 dc_warning=bool(candidate["dc_warning"]),
+                excess_snr_db=float(candidate["excess_snr_db"]),
             )
         )
     observations.sort(key=lambda item: item.measured_center_hz)

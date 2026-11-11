@@ -16,6 +16,10 @@ from dmr_iq_surveyor.detect.core import (
 )
 from dmr_iq_surveyor.detect.io import load_spectrum
 
+# A channel with no excess at all has no finite S/N; it is reported at this
+# floor rather than as minus infinity, which no reader of the field expects.
+EXCESS_SNR_FLOOR_DB = -60.0
+
 
 def feature_at(
     data: dict[str, Any],
@@ -55,6 +59,17 @@ def feature_at(
         (float(np.mean(percentile_linear)) + 1e-300)
         / (float(np.mean(noise_linear)) + 1e-300)
     )
+    # Excess power over the local noise floor, relative to that floor
+    # (Phase 8, Stage 3). `average_snr_db` above is (S+N)/N -- total power
+    # over noise -- which reads ~3 dB for a signal exactly AT the noise level
+    # and compresses everything near the detection gate. This is S/N: what a
+    # propagation model's level actually means. Kept alongside, not instead:
+    # batch configs and the detection gate read the existing two fields.
+    average_excess = float(np.mean(np.maximum(average_linear - noise_linear, 0.0)))
+    average_excess_snr_db = 10.0 * np.log10(
+        max(average_excess, 1e-300) / (float(np.mean(noise_linear)) + 1e-300)
+    )
+    average_excess_snr_db = max(average_excess_snr_db, EXCESS_SNR_FLOOR_DB)
     total_excess = float(np.sum(percentile_excess))
     measured_center = float(scan_center_hz)
     if total_excess > 0:
@@ -87,6 +102,7 @@ def feature_at(
         "measured_center_hz": measured_center,
         "average_snr_db": float(average_snr_db),
         "p95_snr_db": float(p95_snr_db),
+        "average_excess_snr_db": float(average_excess_snr_db),
         "occupancy_pct": float(np.mean(occupancy)),
         "width_90_hz": float(width_90),
         "equivalent_width_hz": float(equivalent_width),

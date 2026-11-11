@@ -139,6 +139,13 @@ class BinVisit:
     # a deliberate stop mid-drive, integrated longer, and is written and
     # reported differently -- but travels the same close-and-write path.
     kind: str = VISIT_DRIVE
+    # Reported GPS accuracy of the fixes behind each window, where the source
+    # gave one (Phase 8, Stage 3.2). Not index-aligned with `latitudes`: a
+    # window whose fixes carried no accuracy simply adds nothing here.
+    accuracies: list[float] = field(default_factory=list)
+    # Consecutive windows skipped by the spread-sampling gate because the
+    # receiver had not moved far enough since the last kept window.
+    stalled_windows: int = 0
 
     @property
     def window_count(self) -> int:
@@ -154,6 +161,16 @@ class BinVisit:
             sum(self.latitudes) / len(self.latitudes),
             sum(self.longitudes) / len(self.longitudes),
         )
+
+    def median_accuracy_m(self) -> float | None:
+        """The typical reported GPS accuracy of this visit's windows, or None."""
+        if not self.accuracies:
+            return None
+        ordered = sorted(self.accuracies)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2.0
 
     def travelled_m(self) -> float:
         """How far the receiver has come since this visit started."""

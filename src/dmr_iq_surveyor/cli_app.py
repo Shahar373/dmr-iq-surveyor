@@ -8,12 +8,18 @@ each additively registered commands on the same underlying Typer app.
 
 from __future__ import annotations
 
+from dmr_iq_surveyor.cli_emitter import calibrate_command, emitter_app
 from dmr_iq_surveyor.cli_geo import geo_app
 from dmr_iq_surveyor.cli_live import live_app
 from dmr_iq_surveyor.cli_project import project_app
 from dmr_iq_surveyor.cli_survey import survey_app
 from dmr_iq_surveyor.cli_v4 import app, console
 from dmr_iq_surveyor.cli_web import web_app
+
+# Phase 8: fixed-frequency emitters and the calibration harness, added under
+# `geo` without touching any existing geo command.
+geo_app.add_typer(emitter_app, name="emitter")
+geo_app.command("calibrate")(calibrate_command)
 
 app.add_typer(survey_app, name="survey")
 app.add_typer(geo_app, name="geo")
