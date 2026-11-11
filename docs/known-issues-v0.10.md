@@ -12,6 +12,10 @@ assumptions.
 
 ### Merged-segment SNR uses `max`, not a weighted mean
 
+> **Addressed alongside (Phase 8, Stage 3.1):** the existing field is unchanged, as compatibility
+> requires; a new unbiased level, `excess_snr_db`, is stored next to it and is the default for
+> `geo emitter`. See `docs/phase8-fixed-emitter-geolocation.md` 3.1.
+
 `detect/merge.py`, `merge_recordings()`: when segments (or drive-bin windows) covering the same
 candidate are merged, `average_snr_db` and `p95_snr_db` of the merged candidate are the **maximum**
 across the contributing segments/windows, not a duration- or quality-weighted mean. `measured_center_hz`
@@ -22,6 +26,10 @@ upward bias on measured levels that grows with the number of contributing window
 level as distance, so this pulls estimated regions toward "closer than measured."
 
 ### Channel SNR is computed as (signal+noise)/noise, not excess/noise
+
+> **Addressed alongside (Phase 8, Stage 3.1):** the existing field is unchanged, as compatibility
+> requires; a new unbiased level, `excess_snr_db`, is stored next to it and is the default for
+> `geo emitter`. See `docs/phase8-fixed-emitter-geolocation.md` 3.1.
 
 `detect/features.py`, `feature_at()`: `average_snr_db`/`p95_snr_db` are
 `10*log10(mean(S+N)/mean(N))`, i.e. total power over noise, not `10*log10((S+N-N)/N)`. The correct

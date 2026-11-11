@@ -152,6 +152,16 @@ def merge_recordings(
                 "offset_from_12k5_hz": measured - nearest_12k5,
                 "average_snr_db": max(values("average_snr_db")),
                 "p95_snr_db": max(values("p95_snr_db")),
+                # Phase 8, Stage 3. The two fields above take the MAXIMUM
+                # over every segment/window that saw the candidate, so the
+                # more windows a stop has, the higher it reads -- a bias the
+                # geolocation solver turns into "closer". This one is the
+                # MEDIAN of the per-window excess S/N: unbiased by window
+                # count, and robust to one window caught in a fade or a burst.
+                # Windows where the candidate was not detected are not in the
+                # cluster, so an intermittent carrier is measured while on.
+                "excess_snr_db": float(np.median(values("average_excess_snr_db"))),
+                "excess_snr_windows": len(cluster),
                 "occupancy_pct": max(values("occupancy_pct")),
                 "width_90_hz": float(
                     np.median(values("width_90_hz"))

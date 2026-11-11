@@ -25,6 +25,7 @@ from dmr_iq_surveyor.geo.calibration import (
 from dmr_iq_surveyor.geo.emitters import (
     DEFAULT_TOLERANCE_HZ,
     EMISSIONS,
+    EMITTER_LEVEL_METRIC,
     EMITTER_SHADOWING_CORRELATION_M,
     EmitterError,
     connect_emitter_database,
@@ -159,8 +160,15 @@ def emitter_measurements(
         list[str] | None, typer.Option("--run-id", help="Rebuild only these runs")
     ] = None,
     level_metric: Annotated[
-        str, typer.Option("--level-metric", help="snr_db or p95_snr_db")
-    ] = "snr_db",
+        str,
+        typer.Option(
+            "--level-metric",
+            help=(
+                "excess_snr_db (default: S/N above the noise floor, median across windows), "
+                "or the Phase 7 snr_db / p95_snr_db"
+            ),
+        ),
+    ] = EMITTER_LEVEL_METRIC,
 ) -> None:
     """Rebuild emitter measurements from stored survey observations."""
     try:
@@ -188,8 +196,15 @@ def emitter_solve(
     ] = None,
     solve_batch_id: Annotated[str | None, typer.Option("--solve-batch-id")] = None,
     level_metric: Annotated[
-        str, typer.Option("--level-metric", help="snr_db or p95_snr_db")
-    ] = "snr_db",
+        str,
+        typer.Option(
+            "--level-metric",
+            help=(
+                "excess_snr_db (default: S/N above the noise floor, median across windows), "
+                "or the Phase 7 snr_db / p95_snr_db"
+            ),
+        ),
+    ] = EMITTER_LEVEL_METRIC,
     shadowing_correlation_m: Annotated[
         float,
         typer.Option(

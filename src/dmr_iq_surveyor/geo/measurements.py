@@ -19,6 +19,7 @@ manufacture confidence that is not there:
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -52,6 +53,10 @@ USABILITY_RUN_EXCLUDED = "run_excluded"
 
 LEVEL_METRIC_AVERAGE_SNR = "snr_db"
 LEVEL_METRIC_P95_SNR = "p95_snr_db"
+# Excess-over-noise S/N, median across windows (Phase 8, Stage 3). Unlike the
+# two above it is neither (S+N)/N nor a maximum over windows, both of which
+# bias a level upwards -- which the solver reads as "closer".
+LEVEL_METRIC_EXCESS_SNR = "excess_snr_db"
 
 # Which detector threshold censors a non-detection, per level metric. The
 # Phase 3 detector accepts a candidate on a conjunction of criteria, so no
@@ -61,7 +66,46 @@ LEVEL_METRIC_P95_SNR = "p95_snr_db"
 _CENSOR_SETTING = {
     LEVEL_METRIC_AVERAGE_SNR: "min_average_channel_snr_db",
     LEVEL_METRIC_P95_SNR: "min_p95_channel_snr_db",
+    # The detector gates on (S+N)/N; `censor_level_for` converts that gate to
+    # the excess scale so a non-detection is bounded in the same units.
+    LEVEL_METRIC_EXCESS_SNR: "min_average_channel_snr_db",
 }
+
+# Same floor the detector reports a no-excess channel at.
+_EXCESS_FLOOR_DB = -60.0
+FLAG_LEVEL_DERIVED = "level_derived_from_snr_db"
+
+
+def excess_from_total_snr_db(total_snr_db: float) -> float:
+    """(S+N)/N in dB to S/N in dB: 10 log10(10^(x/10) - 1), floored."""
+    ratio = 10.0 ** (float(total_snr_db) / 10.0) - 1.0
+    if ratio <= 0.0:
+        return _EXCESS_FLOOR_DB
+    return max(10.0 * math.log10(ratio), _EXCESS_FLOOR_DB)
+
+
+def censor_level_for(detection_settings: dict[str, Any], level_metric: str) -> float:
+    """The run's detection threshold expressed in `level_metric` units."""
+    value = float(detection_settings.get(_CENSOR_SETTING[level_metric], 0.0))
+    if level_metric == LEVEL_METRIC_EXCESS_SNR:
+        return excess_from_total_snr_db(value)
+    return value
+
+
+def observation_level(observation: dict[str, Any], level_metric: str) -> tuple[float, bool]:
+    """An observation's level in `level_metric` units, and whether it was derived.
+
+    A run stored before `excess_snr_db` existed has NULL there. Its excess is
+    then derived from the stored `snr_db` -- exact for the (S+N)/N to S/N
+    conversion, but still carrying that field's max-over-windows bias -- and
+    the caller flags the row so the difference is never silent.
+    """
+    if level_metric == LEVEL_METRIC_EXCESS_SNR:
+        stored = observation.get("excess_snr_db")
+        if stored is not None:
+            return float(stored), False
+        return excess_from_total_snr_db(float(observation["snr_db"])), True
+    return float(observation[level_metric]), False
 
 POSITION_SOURCE_RUN_GPS = "run_gps"
 POSITION_SOURCE_SITE_PROFILE = "site_profile"
@@ -177,7 +221,7 @@ def build_run_measurements(
 
     latitude, longitude, position_source, accuracy = _resolve_position(run, site)
     detection_settings = json.loads(run["detection_settings_json"] or "{}")
-    censor_level = float(detection_settings.get(_CENSOR_SETTING[resolved.level_metric], 0.0))
+    censor_level = censor_level_for(detection_settings, resolved.level_metric)
 
     observations = [
         dict(row)
@@ -315,6 +359,9 @@ def build_run_measurements(
             # measured usable passband above is the honest edge test, and it
             # already runs. This stays a flag.
 
+        if observation is not None and observation_level(observation, resolved.level_metric)[1]:
+            flags.append(FLAG_LEVEL_DERIVED)
+
         rows.append(
             {
                 "p25_site_id": int(channel["p25_site_id"]),
@@ -326,7 +373,9 @@ def build_run_measurements(
                 "position_accuracy_m": accuracy,
                 "detected": detected,
                 "level_db": (
-                    float(observation[resolved.level_metric]) if observation is not None else None
+                    observation_level(observation, resolved.level_metric)[0]
+                    if observation is not None
+                    else None
                 ),
                 "level_metric": resolved.level_metric,
                 "censor_level_db": censor_level,
@@ -430,7 +479,9 @@ __all__ = [
     "ATTRIBUTION_DECODED",
     "ATTRIBUTION_FREQUENCY_UNKNOWN",
     "ATTRIBUTION_INFERRED_UNIQUE",
+    "FLAG_LEVEL_DERIVED",
     "LEVEL_METRIC_AVERAGE_SNR",
+    "LEVEL_METRIC_EXCESS_SNR",
     "LEVEL_METRIC_P95_SNR",
     "POSITION_SOURCE_MISSING",
     "POSITION_SOURCE_RUN_GPS",
@@ -445,5 +496,8 @@ __all__ = [
     "USABILITY_USABLE",
     "MeasurementSettings",
     "build_run_measurements",
+    "censor_level_for",
+    "excess_from_total_snr_db",
+    "observation_level",
     "summarise",
 ]

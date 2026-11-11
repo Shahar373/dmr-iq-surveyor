@@ -1,6 +1,6 @@
 # Phase 8 — fixed-frequency emitter geolocation (design)
 
-Status: **Stages 1 and 2 implemented; Stage 4 items 1 (correlated shadowing) and 2 (outlier stops — measured, adopted as a diagnostic) done; the rest planned.**
+Status: **Stages 1 and 2 implemented; Stage 3.1 (unbiased level) and Stage 4 items 1–2 done; the rest planned.**
 
 This document is authoritative for Phase 8. It re-scopes the geolocation work around one question:
 *where is the transmitter that is on the air on this frequency?* It does not replace Phase 7 — the
@@ -185,20 +185,47 @@ where available) before it is merged.
 
 ### Stage 3 — measurement biases
 
-From `docs/known-issues-v0.10.md`, all still open:
+From `docs/known-issues-v0.10.md`:
 
-- merged segments take `max` SNR instead of a weighted mean (bias toward "closer");
-- channel SNR is (S+N)/N rather than excess/N (compresses weak levels near the gate);
-- GPS accuracy is stored but unused, and not stored at all for drive bins;
-- the browser fix timestamp is not forwarded, so a stale repeated fix looks fresh;
-- the drive-bin window cap keeps the first N windows rather than a spread sample.
+- ~~merged segments take `max` SNR instead of a weighted mean~~ — done, 3.1;
+- ~~channel SNR is (S+N)/N rather than excess/N~~ — done, 3.1;
+- GPS accuracy is stored but unused, and not stored at all for drive bins — open;
+- the browser fix timestamp is not forwarded, so a stale repeated fix looks fresh — open;
+- the drive-bin window cap keeps the first N windows rather than a spread sample — open.
 
-Plus a level metric designed for a continuous carrier: integrated in-channel power above the local
-noise floor, median across windows. **Each fix adds a new field or metric next to the existing one;
-existing labels and values keep being emitted unchanged**, as `CLAUDE.md` requires.
+**Each fix adds a new field or metric next to the existing one; existing labels and values keep
+being emitted unchanged**, as `CLAUDE.md` requires.
 
-For intermittent emitters: occupancy-gated levels (measure only while on) and a dwell long enough
-that a non-detection can be admitted as evidence.
+#### 3.1 The level — implemented
+
+A new level, `excess_snr_db`, is measured beside the Phase 7 fields and is the default for
+`geo emitter` (`--level-metric`; P25 `geo measurements` / `geo solve` keep `snr_db`):
+
+- per window, `10 log10( mean(max(S+N − N, 0)) / mean(N) )` over the channel — **S/N**, not (S+N)/N
+  (`detect.features`: `average_excess_snr_db`, floored at −60 dB);
+- across the windows that detected the channel, the **median**, not the maximum
+  (`detect.merge`: `excess_snr_db`, `excess_snr_windows`);
+- stored as `rf_observations.excess_snr_db` (added in place; NULL on older rows);
+- non-detections are censored at the detector's `(S+N)/N` gate converted to the same scale,
+  `10 log10(10^(T/10) − 1)` — 4 dB becomes 1.8 dB;
+- a run stored before the column existed has its excess **derived** from `snr_db` (exact conversion,
+  but still carrying that field's max-over-windows bias), and the measurement is flagged
+  `level_derived_from_snr_db`.
+
+How large the two biases are:
+
+| bias | size |
+|---|---|
+| (S+N)/N instead of S/N | +3.0 dB at a true 0 dB, +1.2 dB at 5 dB, +0.4 dB at 10 dB — weak (far) stops read closer |
+| max over N windows, per-window spread σ | +0.85σ at 3 windows, +1.16σ at 5, +1.54σ at 10 (median: 0) — e.g. +3 dB for a 10-window drive bin at σ = 2 dB |
+
+The second varies with how many windows a stop or bin happened to get, so it is not even a constant
+offset that `P0` could absorb. Both are removed by construction in `excess_snr_db`. Because the
+detector only puts windows that *saw* the channel into the cluster, the median is also an
+occupancy-gated level for an intermittent emitter: it is measured while the emitter is on.
+
+Still open for intermittent emitters: a dwell long enough that a non-detection can be admitted as
+evidence.
 
 ### Stage 4 — statistical model
 

@@ -31,7 +31,8 @@ from dmr_iq_surveyor.geo.commonmode import residuals_by_run as _residuals_by_run
 from dmr_iq_surveyor.geo.commonmode import summarise as summarise_common_mode
 from dmr_iq_surveyor.geo.contours import credible_regions, regions_to_geojson
 from dmr_iq_surveyor.geo.measurements import (
-    _CENSOR_SETTING,
+    FLAG_LEVEL_DERIVED,
+    LEVEL_METRIC_EXCESS_SNR,
     USABILITY_AMBIGUOUS,
     USABILITY_LEVEL_UNRELIABLE,
     USABILITY_NO_POSITION,
@@ -43,6 +44,8 @@ from dmr_iq_surveyor.geo.measurements import (
     _covered,
     _nearest_observation,
     _resolve_position,
+    censor_level_for,
+    observation_level,
 )
 from dmr_iq_surveyor.geo.model import SolveSettings
 from dmr_iq_surveyor.geo.pipeline import (
@@ -91,6 +94,14 @@ DEFAULT_TOLERANCE_HZ = 6250.0
 # data, while costing almost nothing on stops spread kilometres apart, whose
 # weights stay near 1. See docs/phase8-fixed-emitter-geolocation.md 5.
 EMITTER_SHADOWING_CORRELATION_M = 500.0
+
+# The level emitters are solved on by default (Phase 8, Stage 3): excess S/N,
+# median across windows. Phase 7's P25 workflow keeps `snr_db`.
+EMITTER_LEVEL_METRIC = LEVEL_METRIC_EXCESS_SNR
+
+
+def _default_measurement_settings() -> MeasurementSettings:
+    return MeasurementSettings(level_metric=EMITTER_LEVEL_METRIC)
 
 EMITTER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS emitter_targets (
@@ -328,7 +339,7 @@ def build_emitter_run_measurements(
     declared emitters, not a registry of sites) and intermittent emitters,
     whose non-detections are recorded but are not evidence.
     """
-    resolved = settings or MeasurementSettings()
+    resolved = settings or _default_measurement_settings()
     resolved.validate()
 
     run_row = connection.execute(
@@ -350,7 +361,7 @@ def build_emitter_run_measurements(
 
     latitude, longitude, position_source, accuracy = _resolve_position(run, site)
     detection_settings = json.loads(run["detection_settings_json"] or "{}")
-    censor_level = float(detection_settings.get(_CENSOR_SETTING[resolved.level_metric], 0.0))
+    censor_level = censor_level_for(detection_settings, resolved.level_metric)
     observations = [
         dict(row)
         for row in connection.execute(
@@ -428,6 +439,8 @@ def build_emitter_run_measurements(
 
         if run_excluded is not None and detected and not excludes_detections:
             flags.append("detection_from_excluded_run")
+        if observation is not None and observation_level(observation, resolved.level_metric)[1]:
+            flags.append(FLAG_LEVEL_DERIVED)
         if observation is not None:
             if observation.get("edge_warning"):
                 flags.append("edge_warning")
@@ -451,7 +464,9 @@ def build_emitter_run_measurements(
                 "position_accuracy_m": accuracy,
                 "detected": detected,
                 "level_db": (
-                    float(observation[resolved.level_metric]) if observation is not None else None
+                    observation_level(observation, resolved.level_metric)[0]
+                    if observation is not None
+                    else None
                 ),
                 "level_metric": resolved.level_metric,
                 "censor_level_db": censor_level,
@@ -583,7 +598,7 @@ def materialise_emitter_measurements(
     Gain drift and noise-floor shifts are flagged against the campaign's
     reference, exactly as Phase 7's `materialise_within` does.
     """
-    resolved = settings or MeasurementSettings()
+    resolved = settings or _default_measurement_settings()
     resolved.validate()
     connection = connect_emitter_database(_database(database_path))
     try:
@@ -814,7 +829,7 @@ def solve_emitters(
     resolved.validate()
     common = common_mode or CommonModeSettings()
     common.validate()
-    measurement = measurement_settings or MeasurementSettings()
+    measurement = measurement_settings or _default_measurement_settings()
     measurement.validate()
     stored_campaign_id = scope.stored_campaign_id()
     batch = solve_batch_id or "_".join(
@@ -943,6 +958,7 @@ __all__ = [
     "ATTRIBUTION_AMBIGUOUS_NEIGHBOUR",
     "ATTRIBUTION_FREQUENCY_MATCH",
     "DEFAULT_TOLERANCE_HZ",
+    "EMITTER_LEVEL_METRIC",
     "EMITTER_SHADOWING_CORRELATION_M",
     "EMISSIONS",
     "EMISSION_CONTINUOUS",
