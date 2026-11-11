@@ -8,6 +8,22 @@ a result means: a region is a search-area reduction, not a transmitter coordinat
 **Maturity: experimental.** The estimator has not been validated against a transmitter at a
 known position on this band. The first drive should be one where the answer is known.
 
+**The answer comes from `geo emitter solve`, not from the map in the field app.** The carrier is
+declared as a Phase 8 *emitter* ([`phase8-fixed-emitter-geolocation.md`](phase8-fixed-emitter-geolocation.md))
+and solved from the command line after the drive (section 3). The field app measures and stores
+the drive; its own map still solves the older Phase 7 way, which simulation shows is
+overconfident on drive data (90 % regions holding the transmitter 30–50 % of the time). Treat the
+in-app region as a live preview only.
+
+## In short
+
+```text
+once, on the Pi     geo emitter add  (what to locate)    + placeholder import (for gain calibration)
+parked, per campaign  Calibrate gain on the Drive tab
+driving             Start drive -> Stop drive
+afterwards          geo emitter solve --campaign <id>    <- the result
+```
+
 ## What changed for a drive
 
 | Before | Now |
@@ -56,9 +72,44 @@ For the installed service, set `FIELD_GNSS_DEVICE=auto` (or the `/dev/serial/by-
 `/etc/dmr-field/field.env.local` and run `fieldctl restart`. The unit now also grants `dialout`;
 re-run the installer, or add `dialout` to `SupplementaryGroups` by hand on an older install.
 
-Import the channel you are looking for as reference data. It is matched only after observation
-and never changes what the detector looks for. The import format is still the P25 one, so a
-non-P25 channel needs placeholder identifiers that say so:
+### Declare what you are locating (Phase 8)
+
+The examples below use the installed service's database. For a manual `web serve` run, use the
+database that run writes to (`runs/inventory/dmr_inventory.sqlite3` unless `--database` says
+otherwise). Declaring is reference data: it is matched to the stored measurements only afterwards
+and never changes what the detector looks for, so it can be done before or after the drive.
+
+```bash
+DB=/var/lib/dmr-field/inventory/dmr_inventory.sqlite3
+
+dmr-surveyor geo emitter add cc469 --frequency-mhz 469.350 \
+  --emission continuous --label "469.350 control channel" --database "$DB"
+```
+
+- `continuous` is right for a control channel that is always keyed: a place where it was *not*
+  heard is evidence too, and an important part of the answer. Use `--emission intermittent` for a
+  carrier that comes and goes; its non-detections are kept with the reason `absence_not_evidence`
+  and not used, because it may simply have been off.
+- The default `--tolerance-hz` is 6250 Hz. Two declared emitters closer than that to one
+  observation are both marked `ambiguous` rather than guessed.
+- **For a validation drive**, declare a transmitter whose position is published or surveyed, in
+  the same tuning, with its position. The position is never used by the solver; it only scores
+  the result afterwards:
+
+  ```bash
+  dmr-surveyor geo emitter add ref1 --frequency-mhz <MHz> \
+    --truth-lat <lat> --truth-lon <lon> --truth-source "<where the position comes from>" \
+    --database "$DB"
+  dmr-surveyor geo emitter list --database "$DB"
+  ```
+
+### Also import it as a placeholder site, for now
+
+The field app's **Calibrate gain** chooses its target channel from the Phase 7 registry, and
+the field app's map and *Sites* tab draw only registry sites. Until the field app learns about
+emitters, import the same channel there too, or calibration falls back to judging by the noise
+floor. The import format is still the P25 one, so a non-P25 channel needs placeholder
+identifiers that say so:
 
 ```
 wacn_hex,system_id_hex,rfss,site,observation_status,primary_cc_mhz,nac_hex,notes
@@ -66,8 +117,11 @@ wacn_hex,system_id_hex,rfss,site,observation_status,primary_cc_mhz,nac_hex,notes
 ```
 
 ```bash
-dmr-surveyor geo import-sites config/cc469.csv --snapshot-id cc469_v1
+dmr-surveyor geo import-sites config/cc469.csv --snapshot-id cc469_v1 --database "$DB"
 ```
+
+This placeholder does not affect the emitter result: `geo emitter solve` reads the stored
+observations by frequency and ignores the registry.
 
 ## 1. Before driving: parked, once per campaign
 
@@ -98,8 +152,54 @@ around the transmitter gave no bounded region, while 16 places spread from about
 including far ones where the carrier was not heard, bounded it. Drive towards and away from the
 area, not around it.
 
+Press **Stop drive** when done. Every bin is already in the database; stopping only ends the
+session.
+
+## 3. After driving: the result
+
+Solve the emitters from the campaign you just drove. It rebuilds the emitter measurements from
+the stored observations first, so nothing stale is read, and writes JSON and GeoJSON next to the
+other field output:
+
+```bash
+dmr-surveyor geo emitter solve --campaign 2026-11_uhf469_day1 \
+  --database "$DB" --output-root /var/lib/dmr-field/emitters
+```
+
+What it does differently from the in-app map, on purpose:
+
+| | in-app map (Phase 7) | `geo emitter solve` (Phase 8) |
+|---|---|---|
+| level | `snr_db`: (S+N)/N, maximum over a bin's windows | `excess_snr_db`: S/N, median over the windows that heard it |
+| neighbouring bins | each counts as independent | bins within 500 m share their shadow fading and count as less than one each |
+| suspect stops | not reported | named, with a request to re-measure there |
+| known position | not used | error and containment reported |
+
+How to read the table it prints:
+
+- **status** — `ok` is a bounded region. `unbounded_region` means the 90 % region reaches the
+  edge of the analysed area: the data says *roughly where*, not *where*; drive further away on
+  the far side. `weak_geometry` means it was heard from one direction only. `insufficient_evidence`
+  means too few usable bins. None of them is an error.
+- **det/non** — bins where it was heard / bins where it was looked for and not heard. Both count.
+- **90 % area** — the size of the search area, in km².
+- **vs known position** (validation emitters only) — how far the most likely cell is from the
+  known position, and whether the known position is inside the 90 % region. A `NO` here on a
+  validation drive is the most important thing a drive can show: write it down with the
+  campaign id.
+- A line naming **suspect stops** means one or more bins disagree with the rest by more than
+  three robust standard deviations. Nothing is removed; re-measure near them.
+
+The GeoJSON under `/var/lib/dmr-field/emitters/reports/emitters_<batch>.geojson` opens in any
+GIS viewer (QGIS, for example) without uploading the drive anywhere. The region is a search area, not a transmitter
+coordinate, and one transmitter per frequency is assumed.
+
+In open or rural terrain, shadowing decorrelates over longer distances than the 500 m default;
+`--shadowing-correlation-m 1000` is the honest choice there and gives a larger region.
+
 ## Known limits
 
+- The field app does not show emitter results yet: section 3 is a command-line step.
 - NMEA RMC/GGA carry no accuracy in metres. HDOP and satellite count are shown; `accuracy_m` is
   left empty rather than invented.
 - Calibration judges clipping by the ADC peak at the place it ran. A carrier much stronger than
