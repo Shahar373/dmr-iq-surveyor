@@ -225,3 +225,70 @@ def test_modelling_the_correlation_restores_honest_coverage_on_a_drive() -> None
         VERDICT_CONSISTENT,
         VERDICT_CONSERVATIVE,
     )
+
+
+# --- Stage 4.2: outlier stops ------------------------------------------------
+
+
+def test_simulated_outliers_change_levels_but_not_geometry() -> None:
+    import numpy as np
+
+    clean, truth = simulate_measurements(
+        CalibrationScenario(stops=10, reference_level_db=40.0), np.random.default_rng(2), _fast()
+    )
+    noisy, noisy_truth = simulate_measurements(
+        CalibrationScenario(stops=10, reference_level_db=40.0, outlier_fraction=1.0),
+        np.random.default_rng(2),
+        _fast(),
+    )
+    assert truth == noisy_truth
+    assert [(m.latitude, m.longitude) for m in clean] == [
+        (m.latitude, m.longitude) for m in noisy
+    ]
+    assert [m.level_db for m in clean] != [m.level_db for m in noisy]
+    with pytest.raises(ValueError):
+        CalibrationScenario(outlier_fraction=1.5).validate()
+
+
+def _campaign_with_wild_stop(seed: int, offset_db: float):
+    import numpy as np
+
+    measurements, _ = simulate_measurements(
+        CalibrationScenario(reference_level_db=40.0, stops=10, true_sigma_db=4.0, radius_m=3000.0),
+        np.random.default_rng(seed),
+        _fast(),
+    )
+    wild = next(m for m in measurements if m.detected)
+    wild.level_db -= offset_db
+    return measurements, wild.label
+
+
+def test_a_blocked_stop_is_named_as_suspect() -> None:
+    named = 0
+    for seed in range(6):
+        measurements, wild = _campaign_with_wild_stop(seed, 25.0)
+        result = solve_site(measurements, _fast())
+        suspects = result.diagnostics["suspect_stops"]["labels"]
+        if wild in suspects:
+            named += 1
+            assert any("robust standard deviations" in warning for warning in result.warnings)
+            entry = next(e for e in result.residuals if e["label"] == wild)
+            assert entry["suspect"] is True and abs(entry["robust_z"]) >= 3.0
+    assert named >= 5
+
+
+def test_clean_campaigns_rarely_raise_a_suspect() -> None:
+    flagged = 0
+    for seed in range(6):
+        measurements, _ = _campaign_with_wild_stop(seed, 0.0)
+        result = solve_site(measurements, _fast())
+        flagged += len(result.diagnostics["suspect_stops"]["labels"])
+    assert flagged <= 1
+
+
+def test_too_few_detections_to_name_a_suspect_says_so() -> None:
+    from dmr_iq_surveyor.geo.solver import flag_suspect_stops
+
+    summary = flag_suspect_stops([{"label": "a", "residual_db": 30.0}, {"label": "b"}])
+    assert summary["labels"] == []
+    assert "at least" in summary["note"]

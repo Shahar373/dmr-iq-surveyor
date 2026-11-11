@@ -412,6 +412,56 @@ def shadowing_weights(
     return 1.0 / np.exp(-distances / correlation_m).sum(axis=1)
 
 
+# Suspect-stop check (Phase 8, Stage 4.2). The Gaussian likelihood absorbs a
+# single wild stop by widening sigma -- measured: one stop 25 dB off pushed
+# the fitted shadowing from a true 4 dB to 8-10 dB -- so a plain residual
+# threshold never fires. A spread taken from the median absolute deviation is
+# not inflated by that one stop. Measured on 40 campaigns of 10 stops: a stop
+# 25 dB off was named in 35, and clean campaigns raised 4 flags in total.
+# A mixture likelihood was also tried; it named the stop as reliably but did
+# not locate the transmitter any better and was ~35x slower, so it was not
+# adopted. See docs/phase8-fixed-emitter-geolocation.md.
+SUSPECT_ROBUST_Z = 3.0
+SUSPECT_MIN_DETECTIONS = 5
+# Floor on the robust spread: with tightly agreeing stops the MAD can be a
+# fraction of a dB, and a stop 2 dB off would read as wildly inconsistent.
+SUSPECT_MIN_SPREAD_DB = 2.0
+
+
+def flag_suspect_stops(residuals: list[dict[str, Any]]) -> dict[str, Any]:
+    """Mark detections whose residual is far from the others' by a robust measure.
+
+    Annotates each detection entry in place with `robust_z` and `suspect`, and
+    returns a summary. Diagnostic only: nothing is removed or down-weighted.
+    """
+    detected = [entry for entry in residuals if "residual_db" in entry]
+    summary: dict[str, Any] = {
+        "method": "median_absolute_deviation",
+        "threshold_robust_z": SUSPECT_ROBUST_Z,
+        "robust_spread_db": None,
+        "labels": [],
+    }
+    if len(detected) < SUSPECT_MIN_DETECTIONS:
+        summary["note"] = (
+            f"{len(detected)} detection(s); at least {SUSPECT_MIN_DETECTIONS} are needed before "
+            "one stop can be told apart from the rest"
+        )
+        return summary
+    values = np.array([float(entry["residual_db"]) for entry in detected])
+    centre = float(np.median(values))
+    spread = max(
+        1.4826 * float(np.median(np.abs(values - centre))), SUSPECT_MIN_SPREAD_DB
+    )
+    summary["robust_spread_db"] = round(spread, 3)
+    for entry, value in zip(detected, values, strict=True):
+        z = (float(value) - centre) / spread
+        entry["robust_z"] = round(z, 3)
+        entry["suspect"] = abs(z) >= SUSPECT_ROBUST_Z
+        if entry["suspect"]:
+            summary["labels"].append(entry["label"])
+    return summary
+
+
 def _normalise(log_marginal: np.ndarray) -> np.ndarray:
     finite = log_marginal[np.isfinite(log_marginal)]
     if finite.size == 0:
@@ -621,6 +671,14 @@ def solve_site(
             entry["exceedance_db"] = max(0.0, predicted - measurement.censor_level_db)
         residuals.append(entry)
     residual_rms = math.sqrt(squared_sum / len(detections)) if detections else None
+    suspects = flag_suspect_stops(residuals)
+    if suspects["labels"]:
+        warnings.append(
+            f"{len(suspects['labels'])} stop(s) disagree with the rest by at least "
+            f"{SUSPECT_ROBUST_Z:g} robust standard deviations ({', '.join(suspects['labels'])}); "
+            "such a stop may be blocked or have unusual line of sight. Its evidence is still "
+            "used -- re-measuring near it is the way to find out"
+        )
 
     bearings = [
         bearing_deg(mode_latitude, mode_longitude, m.latitude, m.longitude) for m in detections
@@ -722,6 +780,7 @@ def solve_site(
             "best_fit_db": sigma_fit,
         },
         "credible_region_touches_grid_edge": touches_edge,
+        "suspect_stops": suspects,
         "shadowing_correlation": {
             "assumed_m": resolved.shadowing_correlation_m,
             # How many independent measurements the evidence was counted as.
@@ -769,6 +828,7 @@ __all__ = [
     "VALIDATION_STATUS",
     "PosteriorSurface",
     "SolveResult",
+    "flag_suspect_stops",
     "highest_density_threshold",
     "shadowing_weights",
     "solve_site",

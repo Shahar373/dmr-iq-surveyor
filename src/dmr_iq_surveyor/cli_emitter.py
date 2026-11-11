@@ -239,6 +239,13 @@ def emitter_solve(
             versus,
         )
     console.print(table)
+    for row in report["solutions"]:
+        suspects = (row.get("diagnostics") or {}).get("suspect_stops", {}).get("labels") or []
+        if suspects:
+            console.print(
+                f"[yellow]{row['emitter_key']}:[/yellow] suspect stop(s) {', '.join(suspects)} "
+                "disagree with the rest; re-measure near them before trusting the region"
+            )
     console.print(
         "[dim]A credible region is a search area, not a transmitter coordinate; "
         "one transmitter per frequency is assumed.[/dim]"
@@ -266,6 +273,13 @@ def calibrate_command(
         ),
     ] = 0.0,
     censor_level_db: Annotated[float, typer.Option("--censor-level-db")] = 6.0,
+    outlier_fraction: Annotated[
+        float,
+        typer.Option("--outlier-fraction", help="Simulated fraction of stops far off the model"),
+    ] = 0.0,
+    outlier_sigma_db: Annotated[
+        float, typer.Option("--outlier-sigma-db", help="Spread of those stops' extra error")
+    ] = 20.0,
     drive_spacing_m: Annotated[float, typer.Option("--drive-spacing-m")] = 150.0,
     model_correlation_m: Annotated[
         float,
@@ -298,6 +312,8 @@ def calibrate_command(
         true_sigma_db=sigma_db,
         correlation_m=correlation_m,
         censor_level_db=censor_level_db,
+        outlier_fraction=outlier_fraction,
+        outlier_sigma_db=outlier_sigma_db,
         drive_spacing_m=drive_spacing_m,
         trials=trials,
         seed=seed,

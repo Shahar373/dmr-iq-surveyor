@@ -83,6 +83,11 @@ class CalibrationScenario:
     # The detector's threshold in the same units: below it a stop records a
     # non-detection, exactly as a real survey run does.
     censor_level_db: float = 6.0
+    # Fraction of stops whose level is additionally off by a large amount
+    # (blocked, or with unusual line of sight), drawn N(0, outlier_sigma_db).
+    # Applied before censoring, as the real effect would be.
+    outlier_fraction: float = 0.0
+    outlier_sigma_db: float = 20.0
     # Spacing of stops along the loop for the `drive_loop` layout.
     drive_spacing_m: float = 150.0
     trials: int = 40
@@ -105,6 +110,10 @@ class CalibrationScenario:
             raise ValueError("true_sigma_db must be non-negative")
         if self.correlation_m < 0:
             raise ValueError("correlation_m must be non-negative")
+        if not 0.0 <= self.outlier_fraction <= 1.0:
+            raise ValueError("outlier_fraction must be in [0, 1]")
+        if self.outlier_sigma_db < 0:
+            raise ValueError("outlier_sigma_db must be non-negative")
         if self.drive_spacing_m <= 0:
             raise ValueError("drive_spacing_m must be positive")
         if self.trials < 1:
@@ -205,6 +214,11 @@ def simulate_measurements(
         * np.log10(distances / settings.reference_distance_m)
         + _shadowing(positions, scenario, rng)
     )
+    # Always drawn, so turning outliers on or off never shifts the random
+    # stream every later draw depends on.
+    outlier_draw = rng.uniform(0.0, 1.0, levels.size)
+    outlier_offset = rng.normal(0.0, scenario.outlier_sigma_db, levels.size)
+    levels = levels + np.where(outlier_draw < scenario.outlier_fraction, outlier_offset, 0.0)
     latitudes, longitudes = projection.to_geographic(positions[:, 0], positions[:, 1])
     measurements = []
     for index, (latitude, longitude, level) in enumerate(
@@ -426,7 +440,9 @@ def render_calibration_markdown(report: dict[str, Any]) -> str:
             f"Scenario: {scenario['stops']} stops, layout `{scenario['layout']}`, radius "
             f"{scenario['radius_m']:g} m, true n={scenario['true_path_loss_exponent']:g}, "
             f"true sigma={scenario['true_sigma_db']:g} dB, correlation "
-            f"{scenario['correlation_m']:g} m, {report['trials']} trials, seed {scenario['seed']}."
+            f"{scenario['correlation_m']:g} m, outliers {scenario['outlier_fraction'] * 100:g}% "
+            f"(+/-{scenario['outlier_sigma_db']:g} dB), {report['trials']} trials, "
+            f"seed {scenario['seed']}."
         ),
         "",
         "Status counts: "

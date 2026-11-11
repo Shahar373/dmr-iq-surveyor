@@ -1,6 +1,6 @@
 # Phase 8 — fixed-frequency emitter geolocation (design)
 
-Status: **Stages 1 and 2 implemented; Stage 4 item 1 (correlated shadowing) implemented; the rest planned.**
+Status: **Stages 1 and 2 implemented; Stage 4 items 1 (correlated shadowing) and 2 (outlier stops — measured, adopted as a diagnostic) done; the rest planned.**
 
 This document is authoritative for Phase 8. It re-scopes the geolocation work around one question:
 *where is the transmitter that is on the air on this frequency?* It does not replace Phase 7 — the
@@ -238,8 +238,35 @@ because honesty comes first: 300 m already reached ~nominal 90 % coverage for a 
 under-covered at 50 % (33 %). In open or rural terrain, where shadowing decorrelates more slowly,
 raise it. Mode error is unchanged by the weighting; it widens regions, it does not move them.
 
+#### 4.2 Outlier stops — measured; a robust diagnostic, not a likelihood change
+
+The question: does one badly wrong stop (behind a building, or with line of sight to a hilltop) drag
+the region, and would a heavy-tailed likelihood fix it? The harness gained `outlier_fraction` /
+`outlier_sigma_db` (`geo calibrate --outlier-fraction --outlier-sigma-db`) to simulate it. A
+two-component mixture likelihood (inliers N(0, σ²), outliers 4σ wide) was implemented and measured:
+
+| test | Gaussian (existing) | mixture likelihood |
+|---|---|---|
+| ring of 12, 15 % outlier stops: 90 % coverage | 97 % | 97–100 % |
+| ring of 12, 15 % outlier stops: median mode error | 1.5 km | 1.2–1.4 km |
+| 10 stops, one stop 25 dB off: median mode error (12 campaigns) | 1,142 m | 1,141 m |
+| same: the bad stop identified | never by a plain residual threshold | 12 / 12 |
+| solve time | 1× | ~35× |
+
+Reading: the existing solver is *already honest* under outliers, because marginalising over σ lets
+it widen σ (true 4 dB, fitted 8–10 dB with one wild stop) — a larger, still truthful region. The
+mixture did not locate the transmitter better, and cost 35× the time, so it was **not adopted**.
+
+What it did show is that the bad stop is identifiable, which the Gaussian fit hides. A free
+equivalent was adopted instead: residuals at the best fit are compared with their median using a
+spread from the median absolute deviation (floored at 2 dB), and any detection ≥ 3 robust SDs away
+is marked `suspect` (`diagnostics.suspect_stops`, `residuals[].robust_z`, a warning, and a line in
+`geo emitter solve`'s output). Measured on 40 campaigns of 10 stops: the 25 dB stop named in 35;
+40 clean campaigns raised 4 flags in total. It needs at least 5 detections and never removes or
+down-weights anything — it tells the operator where to re-measure.
+
 - ~~spatially correlated shadowing in the likelihood~~ — done, see 4.1 above;
-- heavy-tailed residuals (Student-t) so one reflected or blocked stop cannot drag the region;
+- ~~heavy-tailed residuals~~ — measured; adopted as a diagnostic, not a likelihood change. See 4.2 below;
 - a stop-type offset (vehicle roof vs. handheld) marginalised like `P0`;
 - leave-one-out common-mode correction.
 
