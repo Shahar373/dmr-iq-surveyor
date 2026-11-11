@@ -230,6 +230,8 @@ def _evaluate_grid(
     settings: SolveSettings,
     detection_weights: np.ndarray | None = None,
     censored_weights: np.ndarray | None = None,
+    detection_position_sigma: np.ndarray | None = None,
+    censored_position_sigma: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, float, float, int, np.ndarray]:
     """Marginal log posterior per cell, the best (n, sigma, P0, cell), and
     the log mass each sigma collected.
@@ -260,6 +262,12 @@ def _evaluate_grid(
     detection_count = int(detection_levels.size)
     censored_count = int(censored_levels.size)
     weighted = detection_weights is not None
+    # Position uncertainty (Phase 8, Stage 3.2). Only when some measurement
+    # actually carries one; otherwise the original expressions run untouched.
+    positional = any(
+        values is not None and bool(np.any(values > 0.0))
+        for values in (detection_position_sigma, censored_position_sigma)
+    )
     # The number of independent detections the evidence is worth. Equal to
     # the count when unweighted.
     effective_detections: float = (
@@ -332,7 +340,23 @@ def _evaluate_grid(
                 # a_i: the reference level that would fit detection i exactly
                 # if the transmitter were in this cell with this exponent.
                 fitted = detection_levels[None, :] + 10.0 * exponent * detection_ratio
-                if weighted:
+                if positional:
+                    marginal, peak, peak_offset, best_level = _positional_terms(
+                        fitted=fitted,
+                        detection_ratio=detection_ratio,
+                        censored_ratio=censored_ratio,
+                        censored_levels=censored_levels,
+                        exponent=float(exponent),
+                        sigma=sigma,
+                        offsets=offsets,
+                        log_measure=log_measure,
+                        settings=settings,
+                        detection_weights=detection_weights,
+                        censored_weights=censored_weights,
+                        detection_position_sigma=detection_position_sigma,
+                        censored_position_sigma=censored_position_sigma,
+                    )
+                elif weighted:
                     best_level = (fitted * detection_weights[None, :]).sum(
                         axis=1
                     ) / effective_detections
@@ -342,16 +366,16 @@ def _evaluate_grid(
                 else:
                     best_level = fitted.mean(axis=1)
                     residual_sum_squares = np.square(fitted - best_level[:, None]).sum(axis=1)
-                base = -residual_sum_squares / two_sigma_squared
-
-                if censored_ratio is None:
+                if not positional and censored_ratio is None:
+                    base = -residual_sum_squares / two_sigma_squared
                     # With no censored terms the offset integral is the same
                     # constant for every cell, so the marginal is the base
                     # term plus sigma's measure.
                     marginal = base + log_measure
                     peak = marginal
                     peak_offset = np.zeros_like(base)
-                else:
+                elif not positional:
+                    base = -residual_sum_squares / two_sigma_squared
                     shift = (
                         censored_levels[None, :] + 10.0 * exponent * censored_ratio
                         - best_level[:, None]
@@ -391,6 +415,93 @@ def _evaluate_grid(
         log_marginal[start:stop] = chunk_accumulator
 
     return log_marginal, best_exponent, best_sigma, best_reference, best_cell, sigma_log_mass
+
+
+_LOG10_E_TIMES_10 = 10.0 / math.log(10.0)
+
+
+def _positional_terms(
+    *,
+    fitted: np.ndarray,
+    detection_ratio: np.ndarray,
+    censored_ratio: np.ndarray | None,
+    censored_levels: np.ndarray,
+    exponent: float,
+    sigma: float,
+    offsets: np.ndarray,
+    log_measure: float,
+    settings: SolveSettings,
+    detection_weights: np.ndarray | None,
+    censored_weights: np.ndarray | None,
+    detection_position_sigma: np.ndarray | None,
+    censored_position_sigma: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """The marginal for one (sigma, exponent) when positions are uncertain.
+
+    A position known to within `s` metres, at distance `d` from the cell,
+    moves the predicted level by about `(10 n / ln 10) * s / d` dB. That adds
+    in quadrature to the shadowing, so each measurement's variance becomes
+    `sigma^2 / u` with
+
+        u = 1 / (1 + ((10 n / ln 10) * s / (sigma * d))^2)
+
+    -- 1 far from the cell, small close to it. The likelihood is then the
+    same Gaussian with per-cell, per-measurement weights `u` (times any
+    shadowing-correlation weight): weighted `P0`, weighted residual sum, and
+    each measurement's own normaliser `+ 1/2 log u`. A censored term's z is
+    scaled by `sqrt(u)`. The closed-form `P0` integral gains `-1/2 log E`,
+    with `E` the cell's weight sum, which is no longer a constant.
+
+    What this fixes: a stop that passes right by a candidate cell no longer
+    pins the transmitter to within metres of a centroid that is itself only
+    known to within tens of metres.
+    """
+    slope = _LOG10_E_TIMES_10 * exponent
+    distance = settings.reference_distance_m * np.power(10.0, detection_ratio)
+    if detection_position_sigma is not None:
+        inflation = slope * detection_position_sigma[None, :] / (sigma * distance)
+        u = 1.0 / (1.0 + np.square(inflation))
+    else:
+        u = np.ones_like(fitted)
+    strength = detection_weights[None, :] if detection_weights is not None else 1.0
+    weights = u * strength
+    effective = weights.sum(axis=1)
+    best_level = (fitted * weights).sum(axis=1) / effective
+    residual = (np.square(fitted - best_level[:, None]) * weights).sum(axis=1)
+    base = -residual / (2.0 * sigma * sigma) + 0.5 * (np.log(u) * strength).sum(axis=1)
+
+    if censored_ratio is None:
+        marginal = base - 0.5 * np.log(effective) + log_measure
+        return marginal, marginal, np.zeros_like(base), best_level
+
+    censored_distance = settings.reference_distance_m * np.power(10.0, censored_ratio)
+    if censored_position_sigma is not None:
+        censored_inflation = (
+            slope * censored_position_sigma[None, :] / (sigma * censored_distance)
+        )
+        root_u = 1.0 / np.sqrt(1.0 + np.square(censored_inflation))
+    else:
+        root_u = np.ones_like(censored_distance)
+    shift = (
+        censored_levels[None, :] + 10.0 * exponent * censored_ratio - best_level[:, None]
+    ) / sigma
+    scaled_offsets = offsets / sigma
+    censored_term = np.zeros((fitted.shape[0], offsets.size), dtype=np.float64)
+    for column in range(censored_levels.size):
+        scale = root_u[:, column][:, None]
+        term = tabulated_log_ndtr((shift[:, column][:, None] - scaled_offsets[None, :]) * scale)
+        if censored_weights is not None:
+            term *= float(censored_weights[column])
+        censored_term += term
+    joint = (
+        base[:, None]
+        - effective[:, None] * np.square(offsets)[None, :] / (2.0 * sigma * sigma)
+        + censored_term
+    )
+    marginal = np.logaddexp.reduce(joint, axis=1) + log_measure
+    argument = np.argmax(joint, axis=1)
+    peak = np.take_along_axis(joint, argument[:, None], axis=1).reshape(-1) + log_measure
+    return marginal, peak, offsets[argument], best_level
 
 
 def shadowing_weights(
@@ -576,6 +687,10 @@ def solve_site(
     weights = shadowing_weights(east, north, resolved.shadowing_correlation_m)
     detection_weights = None if weights is None else weights[detection_mask]
     censored_weights = None if weights is None else weights[~detection_mask]
+    position_sigma = np.array([float(m.position_sigma_m or 0.0) for m in measurements])
+    uncertain = bool(np.any(position_sigma > 0.0))
+    detection_position_sigma = position_sigma[detection_mask] if uncertain else None
+    censored_position_sigma = position_sigma[~detection_mask] if uncertain else None
 
     coarse = build_grid(
         float(east.min()) - resolved.margin_m,
@@ -596,6 +711,8 @@ def solve_site(
         settings=resolved,
         detection_weights=detection_weights,
         censored_weights=censored_weights,
+        detection_position_sigma=detection_position_sigma,
+        censored_position_sigma=censored_position_sigma,
     )
     coarse_probability = _normalise(coarse_log)
 
@@ -621,6 +738,8 @@ def solve_site(
         settings=resolved,
         detection_weights=detection_weights,
         censored_weights=censored_weights,
+        detection_position_sigma=detection_position_sigma,
+        censored_position_sigma=censored_position_sigma,
     )
     probability = _normalise(fine_log)
 
@@ -781,6 +900,15 @@ def solve_site(
         },
         "credible_region_touches_grid_edge": touches_edge,
         "suspect_stops": suspects,
+        "position_uncertainty": {
+            "modelled": uncertain,
+            "measurements_with_sigma": int(np.count_nonzero(position_sigma > 0.0)),
+            "median_sigma_m": (
+                round(float(np.median(position_sigma[position_sigma > 0.0])), 1)
+                if uncertain
+                else None
+            ),
+        },
         "shadowing_correlation": {
             "assumed_m": resolved.shadowing_correlation_m,
             # How many independent measurements the evidence was counted as.

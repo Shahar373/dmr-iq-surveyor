@@ -217,6 +217,16 @@ def emitter_solve(
             ),
         ),
     ] = EMITTER_SHADOWING_CORRELATION_M,
+    model_position_uncertainty: Annotated[
+        bool,
+        typer.Option(
+            "--model-position-uncertainty/--exact-positions",
+            help=(
+                "Let each stop's GPS accuracy and drive-bin spread widen its level variance "
+                "near the transmitter. Off by default: measured gain was not consistent"
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Solve every declared emitter. Produces credible regions, never coordinates."""
     try:
@@ -228,6 +238,7 @@ def emitter_solve(
             measurement_settings=MeasurementSettings(level_metric=level_metric),
             scope=_scope(campaign),
             settings=SolveSettings(shadowing_correlation_m=shadowing_correlation_m),
+            model_position_uncertainty=model_position_uncertainty,
         )
     except (ValueError, sqlite3.Error) as exc:
         console.print(f"[bold red]{exc}[/bold red]")

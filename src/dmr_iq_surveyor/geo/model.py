@@ -122,12 +122,18 @@ class GeoMeasurement:
     censor_level_db: float
     survey_run_id: str = ""
     frequency_hz: float = 0.0
+    # One-sigma uncertainty of where this was measured, in metres (Phase 8,
+    # Stage 3.2). 0 means the position is taken as exact, as every
+    # measurement was before.
+    position_sigma_m: float = 0.0
 
     def validate(self) -> None:
         if not -90.0 <= self.latitude <= 90.0:
             raise ValueError(f"{self.label}: latitude out of range: {self.latitude}")
         if not -180.0 <= self.longitude <= 180.0:
             raise ValueError(f"{self.label}: longitude out of range: {self.longitude}")
+        if not math.isfinite(self.position_sigma_m) or self.position_sigma_m < 0:
+            raise ValueError(f"{self.label}: position_sigma_m must be a non-negative number")
         if self.detected and self.level_db is None:
             raise ValueError(f"{self.label}: a detected measurement must carry a level")
 

@@ -1285,13 +1285,20 @@ function renderDriveGps() {
     (live.postError ? ` · not reaching the Pi: ${live.postError}` : "");
 }
 
+function fixAgeSeconds(fix) {
+  if (typeof fix.timestamp !== "number" || !isFinite(fix.timestamp)) return null;
+  return Math.max(0, (Date.now() - fix.timestamp) / 1000);
+}
+
 async function sendFix(fix) {
   live.fixes += 1;
   live.lastFix = {
     latitude: fix.coords.latitude,
     longitude: fix.coords.longitude,
     accuracy: fix.coords.accuracy,
-    at: Date.now(),
+    // When the fix was taken, not when it reached this page, so the HUD's
+    // "last fix" age shows a repeated old fix for what it is.
+    at: Date.now() - (fixAgeSeconds(fix) || 0) * 1000,
   };
   renderDriveGps();
   // One request in flight at a time. Fixes arrive about once a second and the
@@ -1308,6 +1315,10 @@ async function sendFix(fix) {
         longitude: fix.coords.longitude,
         accuracy_m: fix.coords.accuracy,
         speed_mps: fix.coords.speed,
+        // How old the fix already is, measured on the phone's own clock (both
+        // readings come from it, so its offset cancels). Lets the Pi tell a
+        // repeated old fix from a new one.
+        fix_age_s: fixAgeSeconds(fix),
       }),
     });
     live.postError = "";

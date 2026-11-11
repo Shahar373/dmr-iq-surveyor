@@ -1,6 +1,6 @@
 # Phase 8 — fixed-frequency emitter geolocation (design)
 
-Status: **Stages 1 and 2 implemented; Stage 3.1 (unbiased level) and Stage 4 items 1–2 done; the rest planned.**
+Status: **Stages 1–3 implemented; Stage 4 items 1–2 done; the rest planned.**
 
 This document is authoritative for Phase 8. It re-scopes the geolocation work around one question:
 *where is the transmitter that is on the air on this frequency?* It does not replace Phase 7 — the
@@ -189,9 +189,10 @@ From `docs/known-issues-v0.10.md`:
 
 - ~~merged segments take `max` SNR instead of a weighted mean~~ — done, 3.1;
 - ~~channel SNR is (S+N)/N rather than excess/N~~ — done, 3.1;
-- GPS accuracy is stored but unused, and not stored at all for drive bins — open;
-- the browser fix timestamp is not forwarded, so a stale repeated fix looks fresh — open;
-- the drive-bin window cap keeps the first N windows rather than a spread sample — open.
+- ~~GPS accuracy is stored but unused, and not stored at all for drive bins~~ — done, 3.2;
+- ~~the browser fix timestamp is not forwarded, so a stale repeated fix looks fresh~~ — done, 3.2;
+- ~~the drive-bin window cap keeps the first N windows rather than a spread sample~~ — done
+  (opt-in), 3.3.
 
 **Each fix adds a new field or metric next to the existing one; existing labels and values keep
 being emitted unchanged**, as `CLAUDE.md` requires.
@@ -226,6 +227,53 @@ occupancy-gated level for an intermittent emitter: it is measured while the emit
 
 Still open for intermittent emitters: a dwell long enough that a non-detection can be admitted as
 evidence.
+
+#### 3.2 Where a measurement was taken — implemented
+
+**Fix age.** The page now sends `fix_age_s` = `Date.now() − fix.timestamp`, two readings of the
+phone's *own* clock, so any offset that clock has cancels. The Pi backdates the fix by that age on
+its monotonic clock (`web/service.py: push_live_position`). A location provider that repeats its
+last fix — the most likely cause of the "same bin repeating" field symptom — now sees that fix age
+and go stale after `live_max_position_age_seconds`, so its windows are dropped rather than placed
+at a spot the car has left. The response says `fix_age_s` and `stale`. A phone that sends no age,
+or a malformed one, is treated exactly as before; ages are clamped to [0 s, 1 day]. The HUD's
+"last fix" age also counts from when the fix was taken.
+
+**Accuracy.** Each drive window carries the worse reported accuracy of its two fixes; a bin stores
+the median as `survey_runs.gps_accuracy_m` (NULL where the source reports none, e.g. a USB receiver
+speaking RMC/GGA). Emitter measurements derive `position_sigma_m` =
+√((accuracy/2.45)² + (spread/2)²): the 95 % GPS radius as a one-sigma, plus half the road a drive
+bin's level was averaged over.
+
+**Using it in the solver** — implemented, measured, and left **opt-in**
+(`geo emitter solve --model-position-uncertainty`). Near a stop, position error σₚ adds
+`(10n/ln10 · σₚ/d)²` to a measurement's level variance; the solver applies that per cell
+(`_positional_terms`) only when some measurement carries σₚ > 0, so every other solve is untouched.
+Measured (16 random stops with non-detections, 30 trials):
+
+| position error | 90 % coverage, not told / told | median mode error, not told / told |
+|---|---|---|
+| 0 m | 100 / 100 % | 246 / 246 m |
+| 100 m | 100 / 100 % | 299 / 269 m |
+| 250 m | 100 / 100 % | 315 / 337 m |
+
+Regions of order 100 km² and 4–8 dB shadowing dominate; positions wrong by up to 250 m did not make
+them dishonest, and modelling it gave no consistent gain for ~35 % more solve time. It stays
+available for campaigns with stops very close to a suspected site.
+
+#### 3.3 How much road a drive bin covers — implemented (opt-in)
+
+`LiveSettings.spread_windows_over_bin` (field app: `live_spread_windows_over_bin`) keeps a window
+only once the receiver has moved `span / max_windows_per_bin` since the last kept one, and skips it
+before the FFT otherwise — so in slow traffic the ten windows are spread over the whole 150 m
+instead of the first ~40 m. A receiver that stays put for 2 × `max_windows_per_bin` windows is
+treated as stopped and filled as before, so a parked measurement still lands. It is **off by
+default** because existing tests pin the earlier behaviour (a parked receiver writes after exactly
+`max_windows_per_bin` windows); turning it on for field drives is recommended.
+
+Whatever the setting, every drive bin now records `under_spanned` (covered less than half its
+nominal span, judged from `position_spread_m`), counted in `LiveStats.bins_under_spanned`, and
+emitter measurements from such a bin carry the quality flag `under_spanned_bin`.
 
 ### Stage 4 — statistical model
 

@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS emitter_measurements (
     longitude REAL,
     position_source TEXT NOT NULL,
     position_accuracy_m REAL,
+    position_sigma_m REAL,
     detected INTEGER NOT NULL,
     level_db REAL,
     level_metric TEXT NOT NULL,
@@ -201,6 +202,9 @@ def connect_emitter_database(path: str | Path) -> sqlite3.Connection:
     """Open a database with the full Phase 7 schema plus the emitter tables."""
     connection = connect_geo_database(path)
     connection.executescript(EMITTER_SCHEMA)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(emitter_measurements)")}
+    if "position_sigma_m" not in columns:
+        connection.execute("ALTER TABLE emitter_measurements ADD COLUMN position_sigma_m REAL")
     connection.commit()
     return connection
 
@@ -323,6 +327,41 @@ def _neighbours(emitters: list[dict[str, Any]]) -> dict[int, list[str]]:
     return found
 
 
+# --- position uncertainty ---------------------------------------------------
+
+# A browser's `coords.accuracy` is a 95 % radius. For a 2-D Gaussian that is
+# about 2.45 standard deviations per axis.
+_ACCURACY_95_TO_SIGMA = 1.0 / 2.45
+
+
+def position_sigma_m(accuracy_m: Any, spread_m: Any) -> float | None:
+    """One-sigma uncertainty of where a measurement was taken (Phase 8, Stage 3.2).
+
+    Two sources, combined in quadrature:
+
+    * the GPS's own reported accuracy (a 95 % radius, converted to sigma);
+    * for a drive bin, the stretch of road its windows were averaged over --
+      the level belongs to that stretch, not to its centroid. `spread` is the
+      furthest window from the centroid, so half of it stands in for sigma.
+
+    None when neither is known, which the solver treats as an exact position:
+    the behaviour every measurement had before.
+    """
+    parts = []
+    for value, scale in ((accuracy_m, _ACCURACY_95_TO_SIGMA), (spread_m, 0.5)):
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number) and number > 0:
+            parts.append(number * scale)
+    if not parts:
+        return None
+    return math.sqrt(sum(part * part for part in parts))
+
+
 # --- measurements -----------------------------------------------------------
 
 
@@ -360,6 +399,8 @@ def build_emitter_run_measurements(
     )
 
     latitude, longitude, position_source, accuracy = _resolve_position(run, site)
+    run_settings = json.loads(run.get("settings_json") or "{}")
+    position_sigma = position_sigma_m(accuracy, run_settings.get("position_spread_m"))
     detection_settings = json.loads(run["detection_settings_json"] or "{}")
     censor_level = censor_level_for(detection_settings, resolved.level_metric)
     observations = [
@@ -439,6 +480,8 @@ def build_emitter_run_measurements(
 
         if run_excluded is not None and detected and not excludes_detections:
             flags.append("detection_from_excluded_run")
+        if run_settings.get("under_spanned"):
+            flags.append("under_spanned_bin")
         if observation is not None and observation_level(observation, resolved.level_metric)[1]:
             flags.append(FLAG_LEVEL_DERIVED)
         if observation is not None:
@@ -462,6 +505,7 @@ def build_emitter_run_measurements(
                 "longitude": longitude,
                 "position_source": position_source,
                 "position_accuracy_m": accuracy,
+                "position_sigma_m": position_sigma,
                 "detected": detected,
                 "level_db": (
                     observation_level(observation, resolved.level_metric)[0]
@@ -512,12 +556,14 @@ def write_emitter_run_measurements(
             """
             INSERT INTO emitter_measurements(
                 survey_run_id, emitter_id, frequency_hz, latitude, longitude,
-                position_source, position_accuracy_m, detected, level_db, level_metric,
+                position_source, position_accuracy_m, position_sigma_m, detected, level_db,
+                level_metric,
                 censor_level_db, power_unit, calibrated, attribution, attribution_detail,
                 usability, exclusion_reason, quality_flags_json, measured_center_hz,
                 frequency_error_hz, occupancy_pct, persistence, capture_start_utc,
                 site_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?)
             """,
             (
                 survey_run_id,
@@ -527,6 +573,7 @@ def write_emitter_run_measurements(
                 row["longitude"],
                 row["position_source"],
                 row["position_accuracy_m"],
+                row.get("position_sigma_m"),
                 int(row["detected"]),
                 row["level_db"],
                 row["level_metric"],
@@ -654,6 +701,7 @@ def _solve_emitter(
     settings: SolveSettings,
     level_metric: str,
     offsets: dict[str, float],
+    model_position_uncertainty: bool = False,
 ) -> tuple[dict[str, Any], Any]:
     row: dict[str, Any] = {
         "emitter_id": int(emitter["emitter_id"]),
@@ -698,7 +746,16 @@ def _solve_emitter(
         )
         return row, None
 
-    result = solve_site(_to_geo_measurements(usable, offsets), settings)
+    inputs = (
+        usable
+        if model_position_uncertainty
+        # Stored either way; only handed to the solver on request. Measured
+        # (docs/phase8-fixed-emitter-geolocation.md 3.2): up to 250 m of
+        # position error left coverage honest without it, and modelling it
+        # gave no consistent gain for ~35 % more solve time.
+        else [{**item, "position_sigma_m": None} for item in usable]
+    )
+    result = solve_site(_to_geo_measurements(inputs, offsets), settings)
     row.update(
         status=result.status,
         status_reason=result.status_reason,
@@ -816,6 +873,7 @@ def solve_emitters(
     settings: SolveSettings | None = None,
     measurement_settings: MeasurementSettings | None = None,
     common_mode: CommonModeSettings | None = None,
+    model_position_uncertainty: bool = False,
     scope: CampaignScope = WHOLE_DATABASE,
 ) -> dict[str, Any]:
     """Rebuild the scope's emitter measurements, then solve every declared emitter.
@@ -870,6 +928,7 @@ def solve_emitters(
                 settings=resolved,
                 level_metric=measurement.level_metric,
                 offsets=offsets,
+                model_position_uncertainty=model_position_uncertainty,
             )
             return row
 
@@ -972,6 +1031,7 @@ __all__ = [
     "get_emitter",
     "latest_emitter_solutions",
     "list_emitters",
+    "position_sigma_m",
     "materialise_emitter_measurements",
     "remove_emitter",
     "solve_emitters",

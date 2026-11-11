@@ -88,6 +88,13 @@ class CalibrationScenario:
     # Applied before censoring, as the real effect would be.
     outlier_fraction: float = 0.0
     outlier_sigma_db: float = 20.0
+    # One-sigma error, per axis, between where each stop really was and where
+    # it is reported to have been -- GPS error plus, for a drive bin, the
+    # road its level was averaged over (Phase 8, Stage 3.2). The level is
+    # generated at the TRUE position; the solver sees the reported one.
+    position_error_m: float = 0.0
+    # Whether the solver is told that error (GeoMeasurement.position_sigma_m).
+    report_position_sigma: bool = True
     # Spacing of stops along the loop for the `drive_loop` layout.
     drive_spacing_m: float = 150.0
     trials: int = 40
@@ -112,6 +119,8 @@ class CalibrationScenario:
             raise ValueError("correlation_m must be non-negative")
         if not 0.0 <= self.outlier_fraction <= 1.0:
             raise ValueError("outlier_fraction must be in [0, 1]")
+        if self.position_error_m < 0:
+            raise ValueError("position_error_m must be non-negative")
         if self.outlier_sigma_db < 0:
             raise ValueError("outlier_sigma_db must be non-negative")
         if self.drive_spacing_m <= 0:
@@ -219,7 +228,14 @@ def simulate_measurements(
     outlier_draw = rng.uniform(0.0, 1.0, levels.size)
     outlier_offset = rng.normal(0.0, scenario.outlier_sigma_db, levels.size)
     levels = levels + np.where(outlier_draw < scenario.outlier_fraction, outlier_offset, 0.0)
-    latitudes, longitudes = projection.to_geographic(positions[:, 0], positions[:, 1])
+    # Drawn unconditionally, like the outliers, so the stream after it does
+    # not depend on whether position error is switched on.
+    position_noise = rng.normal(0.0, 1.0, positions.shape) * scenario.position_error_m
+    reported = positions + position_noise
+    reported_sigma = (
+        scenario.position_error_m if scenario.report_position_sigma else 0.0
+    )
+    latitudes, longitudes = projection.to_geographic(reported[:, 0], reported[:, 1])
     measurements = []
     for index, (latitude, longitude, level) in enumerate(
         zip(np.atleast_1d(latitudes), np.atleast_1d(longitudes), levels, strict=True)
@@ -234,6 +250,7 @@ def simulate_measurements(
                 level_db=float(level) if detected else None,
                 censor_level_db=scenario.censor_level_db,
                 survey_run_id=f"stop{index}",
+                position_sigma_m=reported_sigma,
             )
         )
     truth_latitude, truth_longitude = projection.to_geographic(tx_x, tx_y)

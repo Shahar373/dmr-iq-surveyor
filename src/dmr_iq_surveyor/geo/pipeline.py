@@ -438,6 +438,9 @@ def _to_geo_measurements(
                 censor_level_db=float(row["censor_level_db"]) - offset,
                 survey_run_id=str(row["survey_run_id"]),
                 frequency_hz=float(row["frequency_hz"]),
+                # Only Phase 8 emitter rows carry this; a P25 row has no such
+                # column and its position stays exact, as before.
+                position_sigma_m=float(row.get("position_sigma_m") or 0.0),
             )
         )
     return measurements

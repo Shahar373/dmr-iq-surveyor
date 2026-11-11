@@ -77,6 +77,11 @@ DEFAULT_WINDOW_SECONDS = 1.0
 SUPERSEDED_REASON_PREFIX = "superseded by "
 
 
+# See `LiveSettings.spread_windows_over_bin`: how many window-lengths of
+# standing still turn a crawl into a stop.
+SPREAD_STALL_FACTOR = 2
+
+
 @dataclass(slots=True)
 class Position:
     latitude: float
@@ -154,6 +159,18 @@ class LiveSettings:
     ledger_cell_m: float = DEFAULT_LEDGER_CELL_M
     min_bin_size_m: float = MIN_ADAPTIVE_BIN_M
     max_bin_size_m: float = MAX_ADAPTIVE_BIN_M
+    # Spread a bin's windows over its whole span instead of keeping the first
+    # `max_windows_per_bin` that arrive (Phase 8, Stage 3.3). In slow traffic
+    # the cap can fill in the first tens of metres of a 150 m bin, and the
+    # level then describes one spot rather than the stretch it is filed under
+    # -- less shadow-fading averaging than the bin size promises. With this
+    # on, a window is kept only once the receiver has moved at least
+    # span / max_windows_per_bin since the last kept one, and is skipped
+    # before the FFT otherwise. A receiver that stays put for
+    # `SPREAD_STALL_FACTOR` x max_windows_per_bin windows is treated as
+    # stopped and filled as before, so a parked measurement still lands.
+    # Off by default, which keeps the behaviour every earlier drive had.
+    spread_windows_over_bin: bool = False
 
     def travel_limit_m(self) -> float:
         if self.max_window_travel_m is not None:
@@ -259,6 +276,11 @@ class LiveStats:
     # says the drive retraced its route, the other says it stopped moving,
     # and an operator reading the summary needs to tell those apart.
     windows_dwelled: int = 0
+    # Windows skipped by `spread_windows_over_bin` because the receiver had
+    # not yet moved a window-spacing since the last kept window.
+    windows_spaced_out: int = 0
+    # Bins written while covering less than half their nominal span.
+    bins_under_spanned: int = 0
     bins_written: int = 0
     # Of those, the ones closed by reaching the cap rather than by the
     # receiver leaving them.
@@ -552,9 +574,14 @@ class LiveSession:
         # The midpoint, because the samples were gathered across the whole
         # span. Either endpoint would place the average where only half of
         # it was measured.
+        reported = [
+            fix.accuracy_m for fix in (started_at, ended_at) if fix.accuracy_m is not None
+        ]
         position = Position(
             latitude=(started_at.latitude + ended_at.latitude) / 2.0,
             longitude=(started_at.longitude + ended_at.longitude) / 2.0,
+            # The worse of the two: the window's samples span both fixes.
+            accuracy_m=max(reported) if reported else None,
             at=ended_at.at,
         )
 
@@ -614,12 +641,35 @@ class LiveSession:
                 span_target_m=self._span_target_m(),
             )
 
+        if self.settings.spread_windows_over_bin and self._visit.latitudes:
+            spacing = (
+                self._visit.span_target_m or self.settings.bin_size_m
+            ) / self.settings.max_windows_per_bin
+            moved = haversine_m(
+                self._visit.latitudes[-1], self._visit.longitudes[-1],
+                position.latitude, position.longitude,
+            )
+            if moved < spacing:
+                self._visit.stalled_windows += 1
+                if (
+                    self._visit.stalled_windows
+                    < SPREAD_STALL_FACTOR * self.settings.max_windows_per_bin
+                ):
+                    # Before the FFT, so crawling costs no transforms.
+                    self.stats.windows_spaced_out += 1
+                    return
+                # Parked long enough to be a stationary measurement: fill it.
+            else:
+                self._visit.stalled_windows = 0
+
         spectrum = self._analyse(samples)
         if spectrum is None:
             return
         self._visit.spectra.append(spectrum)
         self._visit.latitudes.append(position.latitude)
         self._visit.longitudes.append(position.longitude)
+        if position.accuracy_m is not None:
+            self._visit.accuracies.append(float(position.accuracy_m))
         self._visit.cells.add(key)
         self.stats.windows_recorded += 1
         if self._visit.window_count >= self.settings.max_windows_per_bin:
@@ -733,6 +783,8 @@ class LiveSession:
             visit.spectra.append(spectrum)
             visit.latitudes.append(at.latitude)
             visit.longitudes.append(at.longitude)
+            if at.accuracy_m is not None:
+                visit.accuracies.append(float(at.accuracy_m))
             if self._grid is not None:
                 visit.cells.add(self._grid.key_for(at.latitude, at.longitude))
             self.stats.windows_recorded += 1
@@ -893,6 +945,14 @@ class LiveSession:
             else self.settings.frames_per_window
         )
         spread = visit.spread_m()
+        span = visit.span_target_m or self.settings.bin_size_m
+        # `spread` is the furthest window from the centroid, so the road
+        # covered is about twice it. Under half the span is a measurement of
+        # a spot filed as a stretch (Phase 8, Stage 3.3); written down so the
+        # measurement layer can say so. A hold is meant to stand still.
+        under_spanned = not is_hold and 2.0 * spread < 0.5 * span
+        if under_spanned:
+            self.stats.bins_under_spanned += 1
         record = SurveyRunRecord(
             survey_run_id=run_id,
             site_id=self.site.site_id,
@@ -941,10 +1001,16 @@ class LiveSession:
                 "cells": len(visit.cells) or 1,
                 "window_seconds": self.settings.window_seconds,
                 "position_spread_m": round(spread, 1),
+                "under_spanned": under_spanned,
+                "spread_windows_over_bin": self.settings.spread_windows_over_bin,
                 "place_key": place_key,
             },
             gps_latitude=latitude,
             gps_longitude=longitude,
+            # The typical reported accuracy of the fixes behind the windows
+            # (Phase 8, Stage 3.2). NULL when the source reported none, which
+            # a USB receiver speaking RMC/GGA does not.
+            gps_accuracy_m=visit.median_accuracy_m(),
             gps_source="live_gps",
             campaign_id=self.settings.campaign_id,
             # One snapshot taken when the radio was configured, carried by
