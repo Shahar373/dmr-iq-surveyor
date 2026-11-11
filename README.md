@@ -17,6 +17,7 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - Phase 6A: protocol-agnostic RF survey (discovery, persistent inventory, run comparison), the first step toward multi-protocol support (P25 in 866-870 MHz)
 - Phase 7: multi-session P25 site geolocation (reference registry, censored-likelihood grid posterior, credible-region polygons) and a field web app
 - Phase 7.1: live (moving) survey — measure while driving, write no IQ, one virtual stop per 150 m
+- Phase 8 (Stages 1–2): fixed-frequency emitter geolocation with no protocol decoding, and a calibration harness that measures whether credible regions are honest
 
 ## Project documentation
 
@@ -29,6 +30,7 @@ The project is designed for a Raspberry Pi and SDRplay workflow. Wideband IQ fil
 - [`docs/phase6-design.md`](docs/phase6-design.md)
 - [`docs/phase6a-survey.md`](docs/phase6a-survey.md)
 - [`docs/phase7-geolocation-design.md`](docs/phase7-geolocation-design.md)
+- [`docs/phase8-fixed-emitter-geolocation.md`](docs/phase8-fixed-emitter-geolocation.md)
 - [`docs/projects-and-campaigns.md`](docs/projects-and-campaigns.md)
 - [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
 - [`docs/PHASE7-FIELD-GEOLOCATION.md`](docs/PHASE7-FIELD-GEOLOCATION.md)
@@ -710,6 +712,42 @@ for want of a card.
 See [`docs/phase7-geolocation-design.md`](docs/phase7-geolocation-design.md) for the full design and
 schema, [`docs/PHASE7-FIELD-GEOLOCATION.md`](docs/PHASE7-FIELD-GEOLOCATION.md) for the campaign
 procedure, and [`config/p25_sites.example.md`](config/p25_sites.example.md) for the snapshot format.
+
+
+## Phase 8 — fixed-frequency emitter geolocation
+
+Locates a transmitter that is on the air on a known frequency, with no protocol decoding: the
+emitter *is* its frequency. It reuses the Phase 7 estimator unchanged, but attaches measurements to
+a declared emitter instead of a P25 site.
+
+```bash
+# Declare what to locate. A known position is optional and used only to score the result.
+dmr-surveyor geo emitter add tx1 --frequency-mhz 164.537500
+dmr-surveyor geo emitter add ref1 --frequency-mhz 162.525000 \
+  --truth-lat 32.0812 --truth-lon 34.7804 --truth-source "published site list"
+dmr-surveyor geo emitter add bursty --frequency-mhz 165.625000 --emission intermittent
+
+# After `survey run` stops (or live drive bins) are in the database:
+dmr-surveyor geo emitter solve --output-root runs/emitters
+```
+
+An `intermittent` emitter's non-detections are kept with the reason `absence_not_evidence` and not
+used: not hearing it may only mean it was off. Two declared emitters within tolerance of each other
+are both `ambiguous`, never guessed.
+
+`geo calibrate` measures whether the reported regions are honest, by simulation with the production
+solver:
+
+```bash
+dmr-surveyor geo calibrate --trials 40 --layout drive_loop --stops 30 \
+  --drive-spacing-m 300 --reference-level-db 45 --correlation-m 600
+```
+
+It reports how often the 50 % / 90 % regions contain the true transmitter (`consistent`,
+`overconfident` or `conservative`), the mode error and the region size. A 90 % region that contains
+the truth well under 90 % of the time is overconfident; that is the failure every later accuracy
+change must not introduce. See
+[`docs/phase8-fixed-emitter-geolocation.md`](docs/phase8-fixed-emitter-geolocation.md).
 
 
 ## Projects and campaigns

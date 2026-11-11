@@ -6,9 +6,11 @@ Read these files first:
 2. `src/dmr_iq_surveyor/iq/metadata.py`
 3. `tests/test_metadata.py`
 
-If a plan document exists under `docs/phase6-design.md`, `docs/phase6a-survey.md` or
-`docs/phase7-geolocation-design.md`, read it too — those are the authoritative designs for the RF
-survey / P25 / geolocation work.
+If a plan document exists under `docs/phase6-design.md`, `docs/phase6a-survey.md`,
+`docs/phase7-geolocation-design.md` or `docs/phase8-fixed-emitter-geolocation.md`, read it too —
+those are the authoritative designs for the RF survey / P25 / geolocation work. Phase 8 is the
+current direction: locating fixed-frequency emitters with no protocol decoding, and measuring the
+accuracy of every change with `geo calibrate` before accepting it.
 
 ## Current state
 
@@ -23,6 +25,9 @@ What is genuinely *not* implemented is protocol decoding for P25 (Phase 6B). Sit
 therefore by frequency alone (`inferred_unique`), and a frequency shared by two sites is excluded
 (`ambiguous_reuse`) rather than guessed. Do not describe a geolocation result as confirming which
 site was heard.
+
+Phase 6B is not on the current roadmap: the owner chose to locate fixed-frequency emitters
+without any decoding (Phase 8). Do not start decoder work unless asked.
 
 `cli.py`, `cli_v2.py`, `cli_v3.py`, `cli_v4.py` are not competing versions. Each imports the previous
 module's `app` and adds commands for one phase; the console entry point pulls in the whole chain
