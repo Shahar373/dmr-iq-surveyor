@@ -1,6 +1,6 @@
 # Phase 8 field app: "Locate" (design)
 
-Status: **proposed. The owner approves this document and the mockup before any code.**
+Status: **approved 2026-11-12. PR 1 (section 4.1–4.5) implemented; PRs 2–4 to follow.**
 Mockup: [`mockups/field-app-locate.html`](mockups/field-app-locate.html), also published at
 <https://claude.ai/artifact/7yU3JPrZwgGRu1M1Mi5oBX> (private to the owner). Open it in a phone
 browser; every screen in section 3 can be clicked through.
@@ -164,11 +164,12 @@ safety-relevant change here. Rules:
   `sample_rate_hz`, `band_profile_path`, `if_gain_reduction_db`, `lna_state`,
   `calibrated_at_utc`, `calibration_path`). A restart resumes a target at its own gain, so a
   campaign stays at one gain across days without copying lines into a site profile.
-- A deployment bound to a project (`FIELD_PROJECT`) needs a campaign manifest. The service
-  renders it with the existing `render_campaign_manifest` only if that keeps every check
-  `fieldctl campaign new` makes. Otherwise the bound case refuses, names
-  `fieldctl campaign new`, and the unbound case works. This is settled in the first PR, with a
-  test.
+- **Settled in PR 1: a deployment bound to a project (`FIELD_PROJECT`) refuses Locate.** Each
+  campaign there needs a manifest under the project directory, which the installer makes
+  root-owned (`/etc/dmr-field`), and the service does not write manifests. The refusal names
+  `fieldctl campaign new` / `fieldctl campaign use`. An unbound deployment works.
+- A restart comes up on its startup campaign (`FIELD_CAMPAIGN`), not on the last target.
+  Choosing the frequency again resumes that target's campaign, tuning and gain.
 - `FIELD_CAMPAIGN`, `/classic` and the CLI keep their current meaning. A service started with
   `FIELD_CAMPAIGN` opens on that campaign until a target is picked.
 
@@ -216,8 +217,9 @@ Each PR keeps every existing test passing unmodified, and `ruff` stays clean.
 
 1. **Server: targets, tuning, campaign switch, stored gain** (4.1–4.5), with tests for the
    switch rules and for a restart resuming a target at its gain.
-2. **Geo: plan for emitters, and the solve endpoint** (4.7), with tests that `plan=False` is
-   unchanged and that an under-determined fit is not planned from.
+2. **Drive and result: the target's drive defaults and HUD, the solve endpoint, and a plan
+   for emitters** (4.6–4.7), with tests that `plan=False` is unchanged and that an
+   under-determined fit is not planned from.
 3. **Front end: the new page** (section 3), with `/classic` unchanged.
 4. **Field procedure**: `FIELD-DRIVE-USB-GPS-AND-GAIN.md` rewritten around the new screen; the
    command-line route kept as the fallback.
@@ -225,7 +227,39 @@ Each PR keeps every existing test passing unmodified, and `ruff` stays clean.
 The first drive after PR 3 should be a validation drive against a transmitter with a known
 position (3.5), as Phase 8 §4.3 asks.
 
-## 7. Open points
+## 7. Implemented in PR 1
+
+`geo/locate.py` holds the rules and the `locate_targets` table; `web/service.py` composes it
+(`select_locate_target`, `locate_targets`, and two hooks in the gain calibration);
+`web/server.py` adds `GET /api/locate/targets` and `POST /api/locate/target`. Tests:
+`tests/test_geo_locate.py`, `tests/test_web_locate.py`.
+
+Choices made while building it:
+
+- **An emitter already declared at the frequency is reused**, under its own key (`cc469`
+  declared from the CLI becomes campaign `loc-cc469`). A declared emitter *within tolerance*
+  but not at the frequency is refused by name. Declaring a second one beside it would make
+  every observation between them `ambiguous`, and neither could ever be solved.
+- **The gain is stored when the campaign opens**, as the gain in force then
+  (`gain_source = in_force_at_creation`), and replaced by a calibration while the campaign
+  has no runs. A campaign driven without calibrating therefore still resumes at the gain it
+  was measured with.
+- **The tuning of a campaign that holds runs cannot change**; "start over" opens the next
+  campaign for that.
+- **The generated band profile is written once** to `<output>/bands/target_<key>.yaml` and
+  never rewritten, because runs name it. Its thresholds are pinned equal to
+  `uhf_469_narrow.yaml` by a test.
+- Choosing a target clears the in-memory drive drawing (bins, last solve). The database
+  keeps everything.
+
+`POST /api/locate/target` takes `frequency_mhz` and optionally `label`, `emission`,
+`tolerance_hz`, `truth` (`{latitude, longitude, source}`, or `{}` to clear),
+`center_frequency_hz`, `sample_rate_hz` and `start_over`. It answers 400 with the reason
+when the target cannot be prepared, and 409 while a job runs or from a read-only view.
+
+Not in PR 1: the drive defaults and per-target HUD of 4.6, and the solve and plan of 4.7.
+
+## 8. Open points
 
 - **Hebrew TTS on the phone in use.** Android's Google TTS has Hebrew; it is checked on the
   actual device before PR 3.

@@ -40,6 +40,12 @@ from dmr_iq_surveyor.capture.probe import (
     SubprocessProbeRunner,
 )
 from dmr_iq_surveyor.geo.export import to_gpx, to_kml
+from dmr_iq_surveyor.geo.locate import (
+    connect_locate_database,
+    list_targets,
+    prepare_target,
+    record_target_gain,
+)
 from dmr_iq_surveyor.geo.measurements import MeasurementSettings
 from dmr_iq_surveyor.geo.model import SolveSettings
 from dmr_iq_surveyor.geo.pipeline import (
@@ -499,6 +505,11 @@ class FieldService:
         # process. `None` is the startup resolution (`cli_web` prints that one).
         self.gain_origin: str | None = None
         self._last_calibration: dict[str, Any] | None = None
+        # The Locate target this process is working on (Phase 8 field app),
+        # as `geo.locate.describe_target` returned it when it was chosen.
+        # None until one is chosen, and after every restart: the service then
+        # writes into its startup campaign, exactly as before Locate existed.
+        self._locate_active: dict[str, Any] | None = None
         # The radio a calibration opens. A seam for tests, exactly like the
         # one `LiveSession` takes; in the field it is the real SDRplay.
         self.calibration_device_factory: Callable[[], IqDevice] = SoapyIqDevice
@@ -949,6 +960,7 @@ class FieldService:
             "tiles_via_pi": self.tile_cache is not None,
             "calibration": self.last_calibration(),
             "gnss": self.gnss_status(),
+            "locate": {"active": self.locate_active()},
         }
 
     def geojson(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
@@ -2211,7 +2223,9 @@ class FieldService:
         if given:
             targets = [float(value) for value in given]
         else:
-            targets = self.calibration_targets(center, rate)
+            targets = self._locate_calibration_targets(center, rate)
+            if not targets:
+                targets = self.calibration_targets(center, rate)
 
         with self._device_transition_lock:
             self.require_device_ready()
@@ -2324,6 +2338,8 @@ class FieldService:
         path = directory / f"gain_{stamp}.json"
         path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
         report["report_path"] = str(path)
+        if applied and usable:
+            report["locate_target"] = self._remember_locate_gain(str(path))
         with self._live_lock:
             self._last_calibration = report
         if recommended is not None:
@@ -2378,6 +2394,146 @@ class FieldService:
     def last_calibration(self) -> dict[str, Any] | None:
         with self._live_lock:
             return self._last_calibration
+
+    # -- Locate (Phase 8 field app) ---------------------------------------
+    #
+    # A frequency becomes a target with its own tuning, band profile, campaign
+    # and gain (geo/locate.py). Choosing one points every later write of this
+    # process at that campaign; everything else -- captures, drives, solves --
+    # runs through the same code as before, reading the settings it always
+    # read. See docs/phase8-field-app-locate.md, section 4.
+
+    @contextlib.contextmanager
+    def _locate_connection(self) -> Any:
+        connection = connect_locate_database(Path(self.settings.database_path))
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    def locate_active(self) -> dict[str, Any] | None:
+        with self._live_lock:
+            return dict(self._locate_active) if self._locate_active else None
+
+    def locate_targets(self) -> dict[str, Any]:
+        """Recent targets, most recently chosen first, and the one in force."""
+        with self._locate_connection() as connection:
+            targets = list_targets(connection)
+        return {"active": self.locate_active(), "targets": targets}
+
+    def select_locate_target(
+        self, payload: dict[str, Any], view: ViewScope = CURRENT_VIEW
+    ) -> dict[str, Any]:
+        """Choose the frequency to locate, and switch this process to its campaign.
+
+        The write campaign is otherwise fixed for the life of the process, on
+        purpose, so the switch is held to the moments it cannot split a
+        measurement: no job may be running, and it happens under the same
+        device-transition lock a capture or drive start takes, so neither can
+        start halfway through it. A drive or capture started afterwards reads
+        the new campaign, tuning, band profile and gain from the settings, as
+        it always has.
+
+        A deployment bound to a project is refused: each campaign there needs
+        a manifest under the project, written with `fieldctl campaign new`,
+        and the service does not write manifests.
+        """
+        refuse_if_read_only(view, "choosing a target", self.settings.capture_campaign_id)
+        if self.settings.project_id is not None:
+            raise ValueError(
+                f"this service is bound to project {self.settings.project_id!r}, where every "
+                "campaign needs its own manifest; Locate opens a campaign per frequency and "
+                "cannot write one. Create and switch to the campaign with `fieldctl campaign "
+                "new` and `fieldctl campaign use`, or run the field app without FIELD_PROJECT"
+            )
+        if payload.get("frequency_hz") is not None:
+            frequency_hz = float(payload["frequency_hz"])
+        elif payload.get("frequency_mhz") is not None:
+            frequency_hz = float(payload["frequency_mhz"]) * 1e6
+        else:
+            raise ValueError("give the frequency to locate as frequency_mhz")
+
+        with self._device_transition_lock:
+            running = self.jobs.active_job()
+            if running is not None:
+                raise RuntimeError(
+                    f"a {running.kind} job is running ({running.stage or 'starting'}); the "
+                    "target can only change between measurements -- stop it first"
+                )
+            with self._locate_connection() as connection:
+                target = prepare_target(
+                    connection,
+                    frequency_hz=frequency_hz,
+                    output_root=self.settings.output_root,
+                    gain_in_force=(
+                        float(self.settings.if_gain_reduction_db), int(self.settings.lna_state)
+                    ),
+                    payload=payload,
+                )
+            self._apply_locate_target(target)
+        return {"active": self.locate_active()}
+
+    def _apply_locate_target(self, target: dict[str, Any]) -> None:
+        """Point the settings every later write reads at this target."""
+        tuning, gain = target["tuning"], target["gain"]
+        self.settings.campaign_id = target["campaign_id"]
+        self.settings.band = target["band_profile_path"]
+        self.settings.center_frequency_hz = float(tuning["center_frequency_hz"])
+        self.settings.sample_rate_hz = float(tuning["sample_rate_hz"])
+        self.settings.if_gain_reduction_db = float(gain["if_gain_reduction_db"])
+        self.settings.lna_state = int(gain["lna_state"])
+        self.gain_origin = (
+            f"Locate target {target['emitter_key']}: "
+            + (f"calibrated {gain['calibrated_at_utc']}" if gain["calibrated_at_utc"]
+               else "the gain in force when its campaign was opened")
+        )
+        with self._live_lock:
+            self._locate_active = target
+            # What the map draws for a drive belongs to the campaign it was
+            # measured in; the database keeps all of it.
+            self._live_bins = []
+            self._live_pending_runs = []
+            self._live_stats = {}
+            self._live_last_solve = None
+
+    def _locate_calibration_targets(self, center_hz: float, sample_rate_hz: float) -> list[float]:
+        """The active target, when this tuning can see it; else nothing."""
+        active = self.locate_active()
+        if active is None:
+            return []
+        frequency = float(active["frequency_hz"])
+        if 12_500.0 <= abs(frequency - center_hz) <= 0.4 * sample_rate_hz:
+            return [frequency]
+        return []
+
+    def _remember_locate_gain(self, calibration_path: str) -> dict[str, Any] | None:
+        """Store a gain just put in force against the active target's campaign.
+
+        Only when the campaign being written is still that target's: a
+        calibration started before a switch cannot land on another target.
+        """
+        active = self.locate_active()
+        if active is None or active["campaign_id"] != self.settings.capture_campaign_id:
+            return None
+        with self._locate_connection() as connection:
+            record_target_gain(
+                connection,
+                active["campaign_id"],
+                if_gain_reduction_db=float(self.settings.if_gain_reduction_db),
+                lna_state=int(self.settings.lna_state),
+                calibration_path=calibration_path,
+            )
+            refreshed = prepare_target(
+                connection,
+                frequency_hz=float(active["frequency_hz"]),
+                output_root=self.settings.output_root,
+                gain_in_force=(
+                    float(self.settings.if_gain_reduction_db), int(self.settings.lna_state)
+                ),
+            )
+        with self._live_lock:
+            self._locate_active = refreshed
+        return refreshed
 
     def _take_pending_runs(self) -> list[str]:
         with self._live_lock:
