@@ -42,6 +42,7 @@ from dmr_iq_surveyor.capture.probe import (
 from dmr_iq_surveyor.geo.emitters import EMITTER_SHADOWING_CORRELATION_M, solve_emitters
 from dmr_iq_surveyor.geo.export import to_gpx, to_kml
 from dmr_iq_surveyor.geo.locate import (
+    LocateError,
     connect_locate_database,
     describe_target,
     list_targets,
@@ -2545,7 +2546,13 @@ class FieldService:
                     None,
                 )
                 if fresh is None:
-                    fresh = describe_target(connection, active["campaign_id"])
+                    try:
+                        fresh = describe_target(connection, active["campaign_id"])
+                    except LocateError:
+                        # Its emitter was removed from the command line; the
+                        # listing must still answer. Choosing the frequency
+                        # again declares it afresh and resumes the campaign.
+                        fresh = None
                 active = fresh
         if active is not None:
             with self._live_lock:
@@ -2708,9 +2715,8 @@ class FieldService:
                 job.emit("solve", f"status {result['solution']['status']}", progress=0.99)
             return result
         except Exception as exc:
-            if job is not None:
-                raise
-            # A side-thread solve has no job to fail; the drive must go on.
+            # Recorded either way: a failed solve must not leave the previous
+            # region on screen as if it were this one.
             with self._live_lock:
                 self._locate_result = {
                     "emitter_key": active["emitter_key"],
@@ -2719,6 +2725,9 @@ class FieldService:
                     "error": f"{type(exc).__name__}: {exc}",
                     "solution": None, "regions": None, "plan": None,
                 }
+            if job is not None:
+                raise
+            # A side-thread solve has no job to fail; the drive must go on.
             return {}
         finally:
             with self._live_lock:
@@ -2825,6 +2834,16 @@ class FieldService:
         """
         if self.locate_active() is None:
             return
+        # The band profile is the target's too: detections under another
+        # profile's thresholds are not comparable with the campaign's.
+        band = payload.get("band")
+        # (Captures and drives take a band; a calibration measures no channel.)
+        if keys == _LOCATE_PINNED_ALL and band and str(band) != str(self.settings.band):
+            raise ValueError(
+                f"{action} is refused: the Locate target in force pins the band profile "
+                f"{self.settings.band} for its campaign, and this request asked for {band}. "
+                "The page was probably opened before the target was chosen; reload it"
+            )
         current = {
             "center_frequency_hz": float(self.settings.center_frequency_hz),
             "sample_rate_hz": float(self.settings.sample_rate_hz),
