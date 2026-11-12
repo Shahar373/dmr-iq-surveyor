@@ -302,3 +302,6 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
 .hud-cell.ok .hud-value { color: #0b7a5f; }
 #drive-pullover.pullover { border-color: #0b7a5f; }
 #drive-hold.big { font-size: 20px; padding: 16px; }
+
+/* Link to the Phase 8 Locate page (/locate). */
+#locate-link { text-decoration: none; color: var(--accent); margin-left: 8px; font-weight: 600; }

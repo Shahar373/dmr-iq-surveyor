@@ -301,6 +301,17 @@ def test_url_prints_the_bookmark_the_phone_needs(tmp_path: Path) -> None:
     assert result.stdout.strip() == f"https://100.90.110.54:8765/?token={TOKEN_VALUE}"
 
 
+def test_url_locate_prints_the_locate_page_bookmark(tmp_path: Path) -> None:
+    """The Phase 8 Locate page lives at /locate; the classic app stays at /."""
+    environment = _config(tmp_path)
+    result = _run(environment, "url", "--locate")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"https://100.90.110.54:8765/locate?token={TOKEN_VALUE}"
+    refused = _run(environment, "url", "--elsewhere")
+    assert refused.returncode != 0
+    assert TOKEN_VALUE not in refused.stdout
+
+
 def test_url_puts_its_warning_on_stderr_so_the_url_stays_pipeable(
     tmp_path: Path,
 ) -> None:

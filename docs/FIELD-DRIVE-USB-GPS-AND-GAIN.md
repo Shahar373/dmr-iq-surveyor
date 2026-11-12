@@ -8,14 +8,58 @@ a result means: a region is a search-area reduction, not a transmitter coordinat
 **Maturity: experimental.** The estimator has not been validated against a transmitter at a
 known position on this band. The first drive should be one where the answer is known.
 
-**The answer comes from `geo emitter solve`, not from the map in the field app.** The carrier is
-declared as a Phase 8 *emitter* ([`phase8-fixed-emitter-geolocation.md`](phase8-fixed-emitter-geolocation.md))
-and solved from the command line after the drive (section 3). The field app measures and stores
-the drive; its own map still solves the older Phase 7 way, which simulation shows is
-overconfident on drive data (90 % regions holding the transmitter 30–50 % of the time). Treat the
-in-app region as a live preview only.
+## The Locate page (recommended, since 2026-11-12)
 
-## In short
+The field app has a page for exactly this workflow, in Hebrew: type the frequency, press
+**התחל**, drive. Design: [`phase8-field-app-locate.md`](phase8-field-app-locate.md).
+
+1. **Update the Pi** (once, at home, once these changes are on the branch the Pi runs):
+
+   ```bash
+   cd ~/Projects/dmr-iq-surveyor && git pull && fieldctl restart
+   ```
+
+   The map needs Leaflet: from the internet, or a local copy made once with
+   `bash scripts/vendor_leaflet.sh` while online. Without it the page works with no map.
+
+2. **Open the page.** `fieldctl url --locate` prints its address with the token. Bookmark it
+   on the phone. The classic app is still at the old address (`fieldctl url`), and each page
+   links to the other.
+3. **Type the frequency** (for example `469.350`) and press **התחל**. The first time for a
+   frequency, park somewhere the carrier is heard: the page calibrates the gain for about a
+   minute, then starts the drive by itself. Later drives on the same frequency resume its
+   campaign at the same gain and skip calibration.
+4. **Drive.** The screen shows, for your frequency only, whether the last measurement heard
+   it and how loud, how many measurements heard it, and the GPS. **מדוד כאן 60 ש׳** takes a
+   stationary minute (the button pulses when that is worth doing). **עדכן תוצאה** draws the
+   current search area without stopping the drive.
+5. **Press עצור.** The result is computed at once: the search area, its size, where a next
+   measurement would shrink it most, and any measurement that disagrees with the rest.
+
+What the page sets up by itself, which this document otherwise describes by hand: the
+emitter (`geo emitter add`), the tuning (100 kHz below the frequency at 2 MS/s), a band
+profile for it, a campaign of its own (`loc-f469_350000`), the gain calibration judged by
+your frequency (no placeholder P25 import needed), and the Phase 8 solve. Choices that matter
+are under **הגדרות היעד**: continuous or intermittent emission, the channel bandwidth (12.5,
+25 or 50 kHz; leave 12.5 if unsure), and a known position for a validation drive.
+
+`fieldctl campaign current` shows that the Locate page moved the service to a target's
+campaign; `fieldctl restart` returns it to the configured one.
+
+The rest of this document is the same workflow by hand, from the command line. It still
+works, and it is the fallback if the page is unavailable.
+
+## By hand, from the command line
+
+**The answer comes from `geo emitter solve`, not from the map in the classic app.** The
+carrier is declared as a Phase 8 *emitter*
+([`phase8-fixed-emitter-geolocation.md`](phase8-fixed-emitter-geolocation.md)) and solved from
+the command line after the drive (section 3). The classic app measures and stores the drive;
+its own map still solves the older Phase 7 way, which simulation shows is overconfident on
+drive data (90 % regions holding the transmitter 30–50 % of the time). Treat its region as a
+live preview only.
+
+### In short
 
 ```text
 once, on the Pi     geo emitter add  (what to locate)    + placeholder import (for gain calibration)
@@ -199,7 +243,8 @@ In open or rural terrain, shadowing decorrelates over longer distances than the 
 
 ## Known limits
 
-- The field app does not show emitter results yet: section 3 is a command-line step.
+- In the classic app, emitter results are a command-line step (section 3); the Locate page
+  shows them.
 - NMEA RMC/GGA carry no accuracy in metres. HDOP and satellite count are shown; `accuracy_m` is
   left empty rather than invented.
 - Calibration judges clipping by the ADC peak at the place it ran. A carrier much stronger than

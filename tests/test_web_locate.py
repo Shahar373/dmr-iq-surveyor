@@ -549,3 +549,70 @@ def test_a_target_drive_spreads_its_windows_and_others_keep_the_default(
         ).spread_windows_over_bin is False
     finally:
         service.close()
+
+
+# -- the page ---------------------------------------------------------------------
+
+
+def test_the_locate_page_is_served_and_the_classic_app_stays_at_the_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import urllib.request
+
+    from dmr_iq_surveyor.web.server import create_server
+
+    monkeypatch.setattr("dmr_iq_surveyor.web.service.default_probe_runner", StubProbeRunner)
+    build_database(tmp_path / "db.sqlite3").close()
+    settings = FieldSettings(
+        database_path=tmp_path / "db.sqlite3", output_root=tmp_path / "out",
+        recordings_dir=tmp_path / "rec", token="s3cret",
+    )
+    server = create_server(settings, host="127.0.0.1", port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def fetch(path: str) -> tuple[int, str]:
+        with urllib.request.urlopen(base + path, timeout=30) as response:
+            return response.status, response.read().decode("utf-8")
+
+    try:
+        for path in ("/locate", "/locate/"):
+            status, body = fetch(path)
+            assert status == 200
+            assert 'lang="he" dir="rtl"' in body and "/locate.js" in body
+        assert fetch("/locate.js")[0] == 200
+        assert fetch("/locate.css")[0] == 200
+        status, classic = fetch("/")
+        assert status == 200 and "P25 site survey" in classic
+        assert 'href="/locate"' in classic
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_listed_active_target_counts_runs_measured_since_it_was_chosen(
+    tmp_path: Path,
+) -> None:
+    """The page locks the tuning by this count, so it must not be the
+    snapshot taken when the target was chosen."""
+    from fixtures.geo_scenario import Transmitter, seed_run
+
+    from dmr_iq_surveyor.geo.store import connect_geo_database
+
+    service = _service(tmp_path)
+    try:
+        active = service.select_locate_target({"frequency_hz": _TX_HZ})["active"]
+        assert active["run_count"] == 0
+        connection = connect_geo_database(tmp_path / "db.sqlite3")
+        try:
+            seed_run(connection, run_id="later", latitude=32.05, longitude=34.79,
+                     transmitters=[Transmitter(_TX_HZ, 32.05, 34.80)],
+                     campaign_id=active["campaign_id"])
+        finally:
+            connection.close()
+        listed = service.locate_targets()
+        assert listed["active"]["run_count"] == 1
+        assert listed["active"]["needs_calibration"] is False
+        assert service.locate_active()["run_count"] == 1
+    finally:
+        service.close()

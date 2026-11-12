@@ -2162,6 +2162,9 @@ window.addEventListener("unhandledrejection", (event) => {
 });
 
 async function boot() {
+  // The Locate page (Phase 8) is one tap away; it needs the same token.
+  const locateLink = $("#locate-link");
+  if (locateLink && TOKEN) locateLink.href = "/locate?token=" + encodeURIComponent(TOKEN);
   try {
     wireUi();
     const payload = await refreshState();

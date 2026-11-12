@@ -43,6 +43,7 @@ from dmr_iq_surveyor.geo.emitters import EMITTER_SHADOWING_CORRELATION_M, solve_
 from dmr_iq_surveyor.geo.export import to_gpx, to_kml
 from dmr_iq_surveyor.geo.locate import (
     connect_locate_database,
+    describe_target,
     list_targets,
     prepare_target,
     record_target_gain,
@@ -2513,10 +2514,30 @@ class FieldService:
             return dict(self._locate_active) if self._locate_active else None
 
     def locate_targets(self) -> dict[str, Any]:
-        """Recent targets, most recently chosen first, and the one in force."""
+        """Recent targets, most recently chosen first, and the one in force.
+
+        The active target is re-read rather than returned as it was when it
+        was chosen: its run count (which locks its tuning) and its calibration
+        move while it is in force.
+        """
+        active = self.locate_active()
         with self._locate_connection() as connection:
             targets = list_targets(connection)
-        return {"active": self.locate_active(), "targets": targets}
+            if active is not None:
+                fresh = next(
+                    (row for row in targets if row["campaign_id"] == active["campaign_id"]),
+                    None,
+                )
+                if fresh is None:
+                    fresh = describe_target(connection, active["campaign_id"])
+                active = fresh
+        if active is not None:
+            with self._live_lock:
+                if self._locate_active and self._locate_active["campaign_id"] == active[
+                    "campaign_id"
+                ]:
+                    self._locate_active = active
+        return {"active": active, "targets": targets}
 
     def select_locate_target(
         self, payload: dict[str, Any], view: ViewScope = CURRENT_VIEW

@@ -198,7 +198,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_tile(path)
             return
         if not path.startswith("/api/"):
-            self._serve_static("/index.html" if path == "/" else path)
+            # `/` stays the classic app; `/locate` is the Phase 8 Locate page.
+            if path == "/":
+                self._serve_static("/index.html")
+            elif path in ("/locate", "/locate/"):
+                self._serve_static("/locate.html")
+            else:
+                self._serve_static(path)
             return
         if not self._authorised(query):
             self._send_error_json(401, "missing or invalid token")

@@ -1,6 +1,6 @@
 # Phase 8 field app: "Locate" (design)
 
-Status: **approved 2026-11-12. PRs 1–2 (section 4) implemented; PRs 3–4 to follow.**
+Status: **approved 2026-11-12. PRs 1–3 implemented (server and page); PR 4 (field procedure) to follow.**
 Mockup: [`mockups/field-app-locate.html`](mockups/field-app-locate.html), also published at
 <https://claude.ai/artifact/7yU3JPrZwgGRu1M1Mi5oBX> (private to the owner). Open it in a phone
 browser; every screen in section 3 can be clicked through.
@@ -208,8 +208,11 @@ for sites, including its refusal to plan from an under-determined fit. Default o
 
 ## 5. Front end
 
-- New page at `/`: Hebrew, `dir="rtl"`, CSS logical properties. Leaflet and the tile proxy are
-  reused unchanged. The current page is served at `/classic` byte-for-byte.
+- New page at **`/locate`** (`web/static/locate.html`, `locate.js`, `locate.css`): Hebrew,
+  `dir="rtl"`, CSS logical properties. Leaflet and the tile proxy are reused unchanged.
+  The classic app **stays at `/`**: an existing test pins it there, and existing bookmarks
+  keep working. It gained one "איכון" link to `/locate`; *Advanced* on the new page links
+  back to `/`. `fieldctl url --locate` prints the bookmark with the token.
 - One layout: in portrait, the map is on top with a bottom sheet; in landscape or on a tablet,
   the panel is on the right and the map on the left. Buttons are at least 56 px, and drive
   controls are reachable with one thumb.
@@ -309,6 +312,37 @@ when the target cannot be prepared, and 409 while a job runs or from a read-only
   solution, without a plan. `solve_emitters(plan=False)` is unchanged; a test pins that the
   plan changes no solution.
 - **Channel bandwidth (4.8).**
+
+## 7b. Implemented in PR 3
+
+The page at `/locate` follows section 3 and the mockup. What it does, screen by screen:
+
+- **Home.** The frequency field, recent targets as chips (frequency, label, measurements,
+  region size), status pills for the receiver, the GPS (USB on the Pi, or the phone) and the
+  disk. Start chooses the target (`POST /api/locate/target`), then calibrates if the
+  target's campaign has not been calibrated, then starts the drive.
+- **Calibration.** Progress from the job; on success the drive starts by itself. If the
+  target was not heard while parked, the screen says so and offers *drive anyway* or
+  *calibrate again*, the decision the backend used to make silently.
+- **Drive.** HUD: heard / not heard and the level for the last bin, heard in *n* of *m*, and
+  the GPS source and age. Bins are coloured by the target's level, grey where it was not
+  heard. Hold 60 s (pulsing when the pull-over hint fires), *update result*, Stop. Speech
+  in Hebrew when the phone has a Hebrew voice: GPS lost / back, every fifth bin, heard
+  again / lost, worth a stop, result updated.
+- **Result.** Solved automatically when a drive stops, and on request. Status in words,
+  the 50 % / 90 % regions, the most likely cell labelled as *not* a transmitter position,
+  up to three "measure here" markers and one sentence naming the compass direction, any
+  suspect measurements, and the known-position check when one is on record.
+- **Target settings.** Label, emission, channel bandwidth, tuning (locked once the campaign
+  holds runs), the gain (read-only), the known position, and *start over*. Before a
+  frequency's first Start, the same screen stores settings for it.
+- A drive or a calibration running on the Pi is rejoined after a reload. The map loads
+  alongside the rest and never changes the screen; without Leaflet the page still works
+  and says the map is missing.
+
+Tested end to end in a headless browser against a server with a simulated receiver, USB
+GPS and a car on a loop around a simulated transmitter: home → calibration → drive →
+update result during the drive → stop → result, in portrait and landscape.
 
 ## 8. Open points
 
