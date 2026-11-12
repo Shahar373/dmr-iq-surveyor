@@ -828,3 +828,24 @@ def test_every_campaign_command_needs_a_project(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "no project is configured" in result.stderr
+
+
+def test_current_explains_a_locate_switch_instead_of_warning(pi: Deployment) -> None:
+    """The field app's Locate screen moves the running service to a target's
+    own campaign on purpose. That is not a configuration edited without a
+    restart, and must not be reported as one."""
+    pi.set_local("FIELD_CAMPAIGN=day1\n")
+    pi.set_service("active")
+    (pi.root / "api.state").write_text(
+        json.dumps({"scope": {"project_id": "p25_central_il",
+                              "capture_campaign_id": "loc-f469_350000",
+                              "locate_target": "f469_350000"}}),
+        encoding="utf-8",
+    )
+
+    result = pi.run("campaign", "current")
+
+    assert result.returncode == 0, result.stderr
+    assert "WARNING  the configuration says" not in result.stdout
+    assert "locating f469_350000" in result.stdout
+    assert "loc-f469_350000" in result.stdout and "day1" in result.stdout

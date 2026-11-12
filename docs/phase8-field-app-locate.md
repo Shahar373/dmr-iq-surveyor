@@ -165,10 +165,16 @@ safety-relevant change here. Rules:
   `sample_rate_hz`, `band_profile_path`, `if_gain_reduction_db`, `lna_state`,
   `calibrated_at_utc`, `calibration_path`). A restart resumes a target at its own gain, so a
   campaign stays at one gain across days without copying lines into a site profile.
-- **Settled in PR 1: a deployment bound to a project (`FIELD_PROJECT`) refuses Locate.** Each
-  campaign there needs a manifest under the project directory, which the installer makes
-  root-owned (`/etc/dmr-field`), and the service does not write manifests. The refusal names
-  `fieldctl campaign new` / `fieldctl campaign use`. An unbound deployment works.
+- **A deployment bound to a project (`FIELD_PROJECT`) is supported.** The field Pi is one
+  (`fieldctl status`, 2026-11-12). The service cannot write a campaign manifest there:
+  `/etc` is read-only to it (`ProtectSystem=full`). It does not need one, because
+  `locate_targets` pins what a manifest would (tuning, band profile, gain, bandwidth). The
+  database binding is untouched. `/api/state` names the target in `scope.locate_target`,
+  and `fieldctl campaign current` explains the switch ("locating ...; a restart returns it
+  to ...") instead of reporting a missed restart. `fieldctl campaign use` says the same if
+  it meets one. A Locate campaign cannot be closed with `fieldctl campaign close`, since it
+  has no manifest. (PR 1 refused this case; that was reversed once the field Pi turned out
+  to be bound.)
 - A restart comes up on its startup campaign (`FIELD_CAMPAIGN`), not on the last target.
   Choosing the frequency again resumes that target's campaign, tuning and gain.
 - `FIELD_CAMPAIGN`, `/classic` and the CLI keep their current meaning. A service started with

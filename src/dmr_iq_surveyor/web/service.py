@@ -921,6 +921,9 @@ class FieldService:
             "read_only": view.is_read_only,
             # Whether there is anything to go and look at, so the page can
             # offer Legacy honestly rather than advertising an empty view.
+            # The Locate target that moved the write campaign here, if any, so
+            # `fieldctl` can tell a deliberate switch from a stale restart.
+            "locate_target": self._locate_target_for(capture),
             "has_legacy": any(entry["campaign_id"] is None for entry in census),
             "campaigns": census,
             "counts": counts,
@@ -2528,18 +2531,16 @@ class FieldService:
         the new campaign, tuning, band profile and gain from the settings, as
         it always has.
 
-        A deployment bound to a project is refused: each campaign there needs
-        a manifest under the project, written with `fieldctl campaign new`,
-        and the service does not write manifests.
+        A deployment bound to a project works the same way. Its database
+        binding is untouched -- the process still opens only the claimed file
+        -- but a Locate campaign has no manifest under the project: the
+        service cannot write one (`/etc` is read-only to it, ProtectSystem),
+        and it does not need one, because `locate_targets` pins exactly what a
+        manifest would (tuning, band profile, gain, bandwidth). `/api/state`
+        names the target in `scope.locate_target`, and `fieldctl` explains the
+        switch rather than calling it a missed restart.
         """
         refuse_if_read_only(view, "choosing a target", self.settings.capture_campaign_id)
-        if self.settings.project_id is not None:
-            raise ValueError(
-                f"this service is bound to project {self.settings.project_id!r}, where every "
-                "campaign needs its own manifest; Locate opens a campaign per frequency and "
-                "cannot write one. Create and switch to the campaign with `fieldctl campaign "
-                "new` and `fieldctl campaign use`, or run the field app without FIELD_PROJECT"
-            )
         if payload.get("frequency_hz") is not None:
             frequency_hz = float(payload["frequency_hz"])
         elif payload.get("frequency_mhz") is not None:
@@ -2592,6 +2593,13 @@ class FieldService:
             self._live_target = None
             self._live_target_counts = {"heard": 0, "not_heard": 0}
             self._locate_result = None
+
+    def _locate_target_for(self, campaign_id: str | None) -> str | None:
+        with self._live_lock:
+            active = self._locate_active
+        if active is None or campaign_id is None or active["campaign_id"] != campaign_id:
+            return None
+        return str(active["emitter_key"])
 
     def locate_state(self) -> dict[str, Any]:
         """The small Locate block of `/api/state`; the regions are on `/api/locate/result`."""

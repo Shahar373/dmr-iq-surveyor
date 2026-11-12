@@ -120,12 +120,24 @@ def test_a_read_only_view_cannot_choose_a_target(tmp_path: Path) -> None:
         service.close()
 
 
-def test_a_project_bound_service_refuses_and_names_the_fieldctl_route(tmp_path: Path) -> None:
-    service = _service(tmp_path, project_id="p25_central_il")
+def test_a_project_bound_service_locates_without_writing_a_manifest(tmp_path: Path) -> None:
+    """The field Pi runs bound to a project. Locate must work there: the
+    database binding is untouched, no manifest is written under the project
+    (the service cannot write /etc), and the API says which target moved the
+    campaign so `fieldctl` can tell it from a missed restart."""
+    project_root = tmp_path / "project"
+    (project_root / "campaigns").mkdir(parents=True)
+    service = _service(tmp_path, project_id="p25_central_il", project_root=project_root)
     try:
-        with pytest.raises(ValueError, match="fieldctl campaign new"):
-            service.select_locate_target({"frequency_mhz": 469.35})
-        assert service.settings.capture_campaign_id == "startup_round"
+        assert service.state()["scope"]["locate_target"] is None
+        active = service.select_locate_target({"frequency_mhz": 469.35})["active"]
+        scope = service.state()["scope"]
+        assert scope["capture_campaign_id"] == active["campaign_id"]
+        assert scope["project_id"] == "p25_central_il"
+        assert scope["locate_target"] == "f469_350000"
+        assert list((project_root / "campaigns").iterdir()) == []
+        # A campaign with no manifest is not a closed one: writes are allowed.
+        service.refuse_if_campaign_closed("starting a drive")
     finally:
         service.close()
 
