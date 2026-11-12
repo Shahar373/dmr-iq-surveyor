@@ -13,11 +13,20 @@ known position on this band. The first drive should be one where the answer is k
 The field app has a page for exactly this workflow, in Hebrew: type the frequency, press
 **התחל**, drive. Design: [`phase8-field-app-locate.md`](phase8-field-app-locate.md).
 
-1. **Update the Pi** (once, at home, once these changes are on the branch the Pi runs):
+1. **Update the Pi** (once, at home). The service runs from `/opt/dmr-field/app`, not from a
+   development checkout, so update that one, as `OPERATIONS.md` ("Update") describes:
 
    ```bash
-   cd ~/Projects/dmr-iq-surveyor && git pull && fieldctl restart
+   cd /opt/dmr-field/app
+   sudo git pull
+   sudo /opt/dmr-field/venv/bin/pip install -e .
+   sudo ./scripts/install_field_service.sh --site /etc/dmr-field/sites/<your-site>.yaml
+   sudo systemctl restart dmr-field.service
+   fieldctl status
    ```
+
+   Re-running the installer is what refreshes `fieldctl` itself (`fieldctl url --locate` is
+   new). The token, certificate and `field.env` are left alone.
 
    The map needs Leaflet: from the internet, or a local copy made once with
    `bash scripts/vendor_leaflet.sh` while online. Without it the page works with no map.
