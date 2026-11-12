@@ -198,7 +198,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_tile(path)
             return
         if not path.startswith("/api/"):
-            self._serve_static("/index.html" if path == "/" else path)
+            # `/` stays the classic app; `/locate` is the Phase 8 Locate page.
+            if path == "/":
+                self._serve_static("/index.html")
+            elif path in ("/locate", "/locate/"):
+                self._serve_static("/locate.html")
+            else:
+                self._serve_static(path)
             return
         if not self._authorised(query):
             self._send_error_json(401, "missing or invalid token")
@@ -229,6 +235,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"calibration": self.service.last_calibration()})
             elif path == "/api/gnss":
                 self._send_json({"gnss": self.service.gnss_status()})
+            elif path == "/api/locate/targets":
+                self._send_json(self.service.locate_targets())
+            elif path == "/api/locate/result":
+                self._send_json(self.service.locate_result())
             elif path == "/api/export":
                 self._send_export((query.get("format") or ["geojson"])[0], view)
             elif path.startswith("/api/history/"):
@@ -283,6 +293,29 @@ class _Handler(BaseHTTPRequestHandler):
                 self._start(lambda: self.service.start_live(payload, view))
             elif path == "/api/calibrate/gain":
                 self._start(lambda: self.service.start_gain_calibration(payload, view))
+            elif path == "/api/locate/solve":
+                try:
+                    started = self.service.request_locate_solve(view)
+                except ReadOnlyViewError:
+                    raise
+                except ValueError as exc:
+                    self._send_error_json(400, str(exc))
+                except RuntimeError as exc:
+                    self._send_error_json(409, str(exc))
+                else:
+                    self._send_json(started, status=202 if started["started"] else 200)
+            elif path == "/api/locate/target":
+                try:
+                    chosen = self.service.select_locate_target(payload, view)
+                except ReadOnlyViewError:
+                    raise
+                except ValueError as exc:
+                    self._send_error_json(400, str(exc))
+                except RuntimeError as exc:
+                    # A job is running: a precondition the operator can act on.
+                    self._send_error_json(409, str(exc))
+                else:
+                    self._send_json(chosen)
             elif path == "/api/live/solve":
                 self._send_json(self.service.request_live_solve(view))
             elif path == "/api/live/hold":

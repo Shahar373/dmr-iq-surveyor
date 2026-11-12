@@ -580,13 +580,18 @@ cmd_url() {
     # in this script goes out of its way to keep the value out of argv and
     # out of the journal, so the warning goes to stderr and the URL to
     # stdout -- `fieldctl url | qrencode -t ansiutf8` stays useful.
-    local host token
+    local host token page="/"
+    case "${1:-}" in
+        --locate) page="/locate" ;;   # the Phase 8 Locate page
+        "") ;;
+        *) die "unknown option $1 for 'url' (use --locate for the Locate page)" ;;
+    esac
     host="$(resolve_host)" || die "no address to bind: FIELD_HOST is unset and no Tailscale IPv4 address is available"
     [[ -r "$FIELD_TOKEN_FILE" ]] || die "cannot read ${FIELD_TOKEN_FILE}"
     token="$(tr -d '\r\n' < "$FIELD_TOKEN_FILE")"
     [[ -n "$token" ]] || die "${FIELD_TOKEN_FILE} is empty"
     log "This URL contains the API token. Do not paste it into a log, an issue or a chat."
-    printf 'https://%s:%s/?token=%s\n' "$host" "$FIELD_PORT" "$token"
+    printf 'https://%s:%s%s?token=%s\n' "$host" "$FIELD_PORT" "$page" "$token"
 }
 
 cmd_render_unit() {
@@ -659,6 +664,7 @@ sys.exit(4)
 
 API_SCOPE_CAMPAIGN=""
 API_SCOPE_PROJECT=""
+API_SCOPE_LOCATE=""
 
 api_scope_read() {
     # What the running service says it is recording into, into
@@ -673,6 +679,10 @@ api_scope_read() {
     (( status == 0 )) || { API_SCOPE_CAMPAIGN=""; return 4; }
     API_SCOPE_PROJECT="$(printf '%s' "$state" | api_json_field scope.project_id)" || status=$?
     (( status == 0 )) || { API_SCOPE_CAMPAIGN=""; API_SCOPE_PROJECT=""; return 4; }
+    # Which Locate target, if any, moved the service to the campaign it reports
+    # (the field app's Locate screen). Absent on a service older than Locate,
+    # which is the same answer as "none".
+    API_SCOPE_LOCATE="$(printf '%s' "$state" | api_json_field scope.locate_target 2>/dev/null || true)"
     return 0
 }
 
@@ -1107,13 +1117,21 @@ cmd_campaign_current() {
     fi
     api_campaign="$(printf '%s' "$state" | api_json_field scope.capture_campaign_id 2>/dev/null || true)"
     api_project="$(printf '%s' "$state" | api_json_field scope.project_id 2>/dev/null || true)"
+    api_locate="$(printf '%s' "$state" | api_json_field scope.locate_target 2>/dev/null || true)"
     printf 'api      recording into %s (project %s)\n' \
         "${api_campaign:-nothing -- stops stay unassigned}" "${api_project:-none}"
 
     # The disagreement that matters: the file says one round, the running
     # process is recording into another. It happens whenever the file has been
-    # edited and the service not restarted, and it is invisible otherwise.
-    if [[ "$api_campaign" != "$FIELD_CAMPAIGN" ]]; then
+    # edited and the service not restarted, and it is invisible otherwise --
+    # unless the field app's Locate screen chose a target, which moves the
+    # running service to that target's own campaign on purpose.
+    if [[ -n "$api_locate" && "$api_campaign" != "$FIELD_CAMPAIGN" ]]; then
+        printf 'locate   the field app is locating %s, so the service records into its campaign\n' \
+            "$api_locate"
+        printf '         %s. A restart returns it to %s.\n' \
+            "$api_campaign" "${FIELD_CAMPAIGN:-no campaign}"
+    elif [[ "$api_campaign" != "$FIELD_CAMPAIGN" ]]; then
         printf 'WARNING  the configuration says %s and the running service is recording into %s.\n' \
             "${FIELD_CAMPAIGN:-no campaign}" "${api_campaign:-no campaign}"
         printf '         The service has not been restarted since the change. Stops are going to\n'
@@ -1300,6 +1318,9 @@ cmd_campaign_use() {
                 # one campaign and the radio is recording into another, and
                 # calling that "nothing to do" leaves the stops where nobody
                 # chose.
+                if [[ -n "$API_SCOPE_LOCATE" ]]; then
+                    die "${ENV_LOCAL_FILE} names campaign ${target}, but the field app's Locate screen moved ${FIELD_UNIT} to campaign ${API_SCOPE_CAMPAIGN} (target ${API_SCOPE_LOCATE}). \`fieldctl restart\` returns it to ${target}."
+                fi
                 die "${ENV_LOCAL_FILE} names campaign ${target} in project ${expect_project:-none}, but ${FIELD_UNIT} is recording into campaign ${API_SCOPE_CAMPAIGN:-nothing} in project ${API_SCOPE_PROJECT:-nothing}. The service has not been restarted since the configuration changed. \`fieldctl campaign current\` shows both; restart the service, or switch to the campaign you want."
             fi
             # An unreadable API is not confirmation either. "Nothing to do"
@@ -1524,7 +1545,7 @@ usage: fieldctl <command>
   start | stop | restart      control the service (uses sudo)
   status                      one screen of diagnosis
   logs [journalctl args...]   default: -n 50
-  url                         the phone bookmark, token included
+  url [--locate]              the phone bookmark, token included (--locate: the Locate page)
 
   print-command [--null]      the exact argv the service would run
   wait-network                block until a bind address exists (ExecStartPre)

@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>איכון משדר</title>
+<link rel="stylesheet" href="/locate.css">
+</head>
+<body>
+<!-- Phase 8 field app: "type a frequency, press Start, drive".
+     Design: docs/phase8-field-app-locate.md. The classic app stays at /. -->
+<div class="app">
+  <div class="mapwrap">
+    <div id="map" dir="ltr"></div>
+    <div class="hud" id="hud" hidden>
+      <div id="hud-last" class="silent"><div class="v" id="hud-last-v">–</div><div class="l">מדידה אחרונה</div></div>
+      <div><div class="v num" id="hud-bins">0</div><div class="l" id="hud-bins-l">מדידות בנסיעה</div></div>
+      <div id="hud-gps"><div class="v" id="hud-gps-v">–</div><div class="l" id="hud-gps-l">GPS</div></div>
+    </div>
+    <div class="mapnote" id="region-age" hidden></div>
+  </div>
+
+  <section class="sheet" id="sheet" aria-live="polite">
+    <div id="banner" class="notice bad" hidden></div>
+
+    <!-- Home -->
+    <div class="screen" data-screen="home">
+      <div class="top">
+        <h1>מה מאתרים?</h1>
+        <button class="iconbtn" data-go="menu" aria-label="תפריט"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+      </div>
+      <label class="freq" for="freq">
+        <input id="freq" inputmode="decimal" autocomplete="off" placeholder="469.350" aria-label="תדר במגה-הרץ">
+        <span>MHz</span>
+      </label>
+      <div class="chips" id="recent" role="list" aria-label="יעדים אחרונים"></div>
+      <div class="status" id="status"></div>
+      <button class="primary" id="start">התחל</button>
+      <p class="hint" id="home-hint">יעד חדש: לפני הנסיעה יש כיול של דקה בעמידה. יעד קיים: ממשיכים את הקמפיין שלו באותו הגבר.</p>
+    </div>
+
+    <!-- Calibrate -->
+    <div class="screen" data-screen="calibrate" hidden>
+      <div class="top"><h1>עמוד במקום, דקה אחת</h1></div>
+      <p class="hint" id="cal-hint"></p>
+      <svg class="ring" viewBox="0 0 140 140" aria-hidden="true">
+        <circle class="t" cx="70" cy="70" r="60"></circle>
+        <circle class="p" id="ring" cx="70" cy="70" r="60" stroke-dasharray="377" stroke-dashoffset="377"></circle>
+      </svg>
+      <div class="ringlabel" id="cal-label">מתחיל…</div>
+      <div class="notice" id="cal-result" hidden></div>
+      <div class="row2" id="cal-choice" hidden>
+        <button class="primary" id="cal-drive">סע בכל זאת</button>
+        <button class="secondary" id="cal-retry">כייל שוב</button>
+      </div>
+      <button class="secondary" id="cal-cancel">ביטול</button>
+    </div>
+
+    <!-- Drive -->
+    <div class="screen" data-screen="drive" hidden>
+      <div class="top">
+        <h2 id="drive-title"></h2>
+        <button class="iconbtn" data-go="advanced" aria-label="הגדרות היעד"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/></svg></button>
+      </div>
+      <div class="notice" id="worth" hidden>התדר היה קרוב לסף במדידה האחרונה. עצירה של דקה כאן כנראה תשמע אותו.</div>
+      <div class="notice" id="drive-note" hidden></div>
+      <div class="drivebtns">
+        <button class="secondary" id="hold">מדוד כאן <span class="num">60</span> ש׳</button>
+        <button class="secondary" id="solve">עדכן תוצאה</button>
+        <button class="danger" id="stop">עצור</button>
+      </div>
+      <label class="check"><input type="checkbox" id="voice" checked> הודעות קוליות</label>
+    </div>
+
+    <!-- Result -->
+    <div class="screen" data-screen="result" hidden>
+      <div class="top"><h1 id="res-title">מחשב…</h1></div>
+      <div class="facts" id="res-facts" hidden>
+        <div class="fact"><div class="v num" id="res-heard">0</div><div class="l">נשמע</div></div>
+        <div class="fact"><div class="v num" id="res-silent">0</div><div class="l">לא נשמע</div></div>
+        <div class="fact"><div class="v num" id="res-area">–</div><div class="l">קמ״ר (90%)</div></div>
+      </div>
+      <div class="notice good" id="res-plan" hidden></div>
+      <div class="notice" id="res-suspect" hidden></div>
+      <div class="notice" id="res-truth" hidden></div>
+      <p class="hint">האזור הוא אזור חיפוש, לא מיקום של משדר. הנקודה בתוכו היא התא הסביר ביותר. ההנחה: משדר אחד בתדר הזה.</p>
+      <div class="row2">
+        <button class="primary" id="res-drive">המשך לנסוע</button>
+        <button class="secondary" id="res-refresh">חשב שוב</button>
+      </div>
+      <button class="secondary" data-go="home">יעד אחר</button>
+    </div>
+
+    <!-- Advanced (per target) -->
+    <div class="screen" data-screen="advanced" hidden>
+      <div class="top">
+        <h1>הגדרות היעד</h1>
+        <button class="iconbtn" data-back aria-label="חזרה"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+      </div>
+      <p class="hint" id="adv-for"></p>
+      <div class="field"><label for="adv-label">שם</label><input id="adv-label" placeholder="למשל: ערוץ בקרה"></div>
+      <div class="field">
+        <span class="lab">אופי השידור</span>
+        <div class="seg" role="group" aria-label="אופי השידור">
+          <button type="button" aria-pressed="true" data-emission="continuous">רציף</button>
+          <button type="button" aria-pressed="false" data-emission="intermittent">לסירוגין</button>
+        </div>
+        <p class="hint" id="emission-hint"></p>
+      </div>
+      <div class="field">
+        <span class="lab">רוחב ערוץ</span>
+        <div class="seg seg3" role="group" aria-label="רוחב ערוץ">
+          <button type="button" aria-pressed="true" data-bw="12500"><span class="num">12.5</span> kHz</button>
+          <button type="button" aria-pressed="false" data-bw="25000"><span class="num">25</span> kHz</button>
+          <button type="button" aria-pressed="false" data-bw="50000"><span class="num">50</span> kHz</button>
+        </div>
+        <p class="hint">אם לא בטוח, השאר <span class="num">12.5</span>. נקבע לקמפיין, כמו ההגבר.</p>
+      </div>
+      <div class="row2">
+        <div class="field"><label for="adv-center">תדר מרכז MHz <span class="auto" id="adv-auto">אוטומטי</span></label><input id="adv-center" class="num" inputmode="decimal"></div>
+        <div class="field"><label for="adv-rate">קצב דגימה MS/s</label><input id="adv-rate" class="num" inputmode="decimal"></div>
+      </div>
+      <div class="field"><span class="lab">הגבר</span><div class="readout num" id="adv-gain">–</div></div>
+      <p class="hint">תדר מרכז, קצב ורוחב ניתנים לשינוי רק לפני המדידה הראשונה בקמפיין. אחרי זה: "התחל מחדש".</p>
+      <details id="adv-truth-box">
+        <summary>אימות מול מיקום ידוע</summary>
+        <div class="screen inner">
+          <div class="row2">
+            <div class="field"><label for="adv-lat">קו רוחב</label><input id="adv-lat" class="num" inputmode="decimal" placeholder="32.0812"></div>
+            <div class="field"><label for="adv-lon">קו אורך</label><input id="adv-lon" class="num" inputmode="decimal" placeholder="34.7804"></div>
+          </div>
+          <div class="field"><label for="adv-src">מקור המיקום</label><input id="adv-src" placeholder="למשל: רשימת אתרים מפורסמת"></div>
+          <p class="hint">המיקום לא משמש לחישוב ולא מוצג בזמן הנסיעה. בסוף מוצג המרחק ממנו, והאם הוא בתוך אזור ה-90%.</p>
+        </div>
+      </details>
+      <div class="notice bad" id="adv-error" hidden></div>
+      <button class="primary" id="adv-save">שמור</button>
+      <button class="secondary" id="adv-restart" hidden>התחל מחדש: קמפיין חדש וכיול חדש</button>
+      <div class="row2" id="adv-restart-confirm" hidden>
+        <button class="danger" id="adv-restart-yes">כן, קמפיין חדש</button>
+        <button class="secondary" id="adv-restart-no">ביטול</button>
+      </div>
+    </div>
+
+    <!-- Menu -->
+    <div class="screen" data-screen="menu" hidden>
+      <div class="top">
+        <h1>תפריט</h1>
+        <button class="iconbtn" data-back aria-label="סגירה"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="menu">
+        <button data-go="advanced">הגדרות היעד<span>שם, אופי שידור, רוחב ערוץ, כיוונון, אימות מול מיקום ידוע</span></button>
+        <a class="menulink" id="classic-link" href="/">מתקדם<span>הקלטת IQ בתחנה, אתרי P25, רשימת עצירות, KML/GPX: האפליקציה הקיימת</span></a>
+        <button id="share-gps">GPS מהטלפון<span id="share-gps-state">לא משתף</span></button>
+      </div>
+      <p class="hint" id="menu-info"></p>
+    </div>
+  </section>
+</div>
+<script src="/locate.js"></script>
+</body>
+</html>
