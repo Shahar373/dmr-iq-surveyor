@@ -350,6 +350,12 @@ class FieldSettings:
     map_center: tuple[float, float] = (32.0853, 34.7818)
     map_zoom: int = 11
     token: str | None = None
+    # Which `Host` header values a request may carry, or None for no check
+    # (every deployment before `web serve --no-auth` existed). Set only when
+    # the API runs without a token: then nothing else ties a request to this
+    # server, and a page on another domain that resolves to this address (DNS
+    # rebinding) would otherwise count as same-origin.
+    allowed_request_hosts: tuple[str, ...] | None = None
 
     @property
     def capture_campaign_id(self) -> str | None:

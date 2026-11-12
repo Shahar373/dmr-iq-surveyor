@@ -285,6 +285,9 @@ load_env() {
     : "${FIELD_DATABASE:=/var/lib/dmr-field/inventory/dmr_inventory.sqlite3}"
     : "${FIELD_KEEP_RECORDINGS:=1}"
     : "${FIELD_TOKEN_FILE:=/etc/dmr-field/token}"
+    # `token` (the default, and every install before this existed) or `none`.
+    # Changed with `fieldctl auth off|on --write`, never by default.
+    : "${FIELD_AUTH:=token}"
     : "${FIELD_TLS_CERT:=/var/lib/dmr-field/tls/field-app.crt}"
     : "${FIELD_TLS_KEY:=/var/lib/dmr-field/tls/field-app.key}"
     : "${FIELD_TAILSCALE_BIN:=tailscale}"
@@ -365,7 +368,6 @@ build_argv() {
         --database "$FIELD_DATABASE"
         --output "$FIELD_OUTPUT"
         --keep-recordings "$FIELD_KEEP_RECORDINGS"
-        --token-file "$FIELD_TOKEN_FILE"
         --tls-cert "$FIELD_TLS_CERT"
         --tls-key "$FIELD_TLS_KEY"
     )
@@ -374,6 +376,13 @@ build_argv() {
     # reach project resolution and fail on the empty string; omitting the
     # flag is what leaves the app behaving exactly as it did before projects
     # existed.
+    case "$FIELD_AUTH" in
+        token) ARGV+=( --token-file "$FIELD_TOKEN_FILE" ) ;;
+        # Deliberate and explicit: `web serve --no-auth` refuses any address
+        # that is not Tailscale or loopback, and answers only its own names.
+        none)  ARGV+=( --no-auth ) ;;
+        *)     die "FIELD_AUTH must be 'token' or 'none', not '${FIELD_AUTH}'" ;;
+    esac
     if [[ -n "$FIELD_PROJECT" ]]; then
         ARGV+=( --project "$FIELD_PROJECT" )
     fi
@@ -398,9 +407,15 @@ api_get() {
     local path="$1" host url config status
     host="$(resolve_host)" || return 1
     command -v curl >/dev/null 2>&1 || return 1
+    url="https://${host}:${FIELD_PORT}${path}"
+    if [[ "$FIELD_AUTH" == "none" ]]; then
+        status=0
+        curl --silent --show-error --max-time 5 --cacert "$FIELD_TLS_CERT" \
+             "$url" 2>/dev/null || status=$?
+        return "$status"
+    fi
     [[ -r "$FIELD_TOKEN_FILE" ]] || return 1
 
-    url="https://${host}:${FIELD_PORT}${path}"
     scratch_file config
     {
         printf 'header = "X-Auth-Token: '
@@ -422,6 +437,15 @@ api_get() {
 # --- subcommands --------------------------------------------------------
 
 cmd_exec() {
+    if [[ "$FIELD_AUTH" == "none" ]]; then
+        # Checked at every start, not only when the token was turned off: a
+        # Funnel enabled since then would put a receiver with no token on the
+        # internet. Exit 1, so systemd retries and the service comes back by
+        # itself once the exposure is removed.
+        local refusal
+        refusal="$(auth_off_refusal)"
+        [[ -z "$refusal" ]] || die "refusing to start without a token: ${refusal}"
+    fi
     build_argv
     exec "${ARGV[@]}"
 }
@@ -510,6 +534,7 @@ cmd_status() {
         printf 'bind     UNRESOLVED -- no FIELD_HOST and no Tailscale address\n'
     fi
 
+    auth_report
     if [[ -e "$FIELD_TOKEN_FILE" ]]; then
         mode="$(stat -c '%a' "$FIELD_TOKEN_FILE" 2>/dev/null || echo '?')"
         # The mode, never the value.
@@ -580,13 +605,18 @@ cmd_url() {
     # in this script goes out of its way to keep the value out of argv and
     # out of the journal, so the warning goes to stderr and the URL to
     # stdout -- `fieldctl url | qrencode -t ansiutf8` stays useful.
-    local host token page="/"
+    local host token page="/" query=""
     case "${1:-}" in
         --locate) page="/locate" ;;   # the Phase 8 Locate page
         "") ;;
         *) die "unknown option $1 for 'url' (use --locate for the Locate page)" ;;
     esac
     host="$(resolve_host)" || die "no address to bind: FIELD_HOST is unset and no Tailscale IPv4 address is available"
+    if [[ "$FIELD_AUTH" == "none" ]]; then
+        log "No token (FIELD_AUTH=none): every device on your Tailscale network can use this address."
+        printf 'https://%s:%s%s\n' "$host" "$FIELD_PORT" "$page"
+        return 0
+    fi
     [[ -r "$FIELD_TOKEN_FILE" ]] || die "cannot read ${FIELD_TOKEN_FILE}"
     token="$(tr -d '\r\n' < "$FIELD_TOKEN_FILE")"
     [[ -n "$token" ]] || die "${FIELD_TOKEN_FILE} is empty"
@@ -804,7 +834,8 @@ print("" if document is None else document)
 local_env() {
     # The only writer of the local environment file.
     #
-    #   local_env set     PATH PROJECT CAMPAIGN
+    #   local_env set      PATH PROJECT CAMPAIGN
+    #   local_env set-auth PATH token|none      (FIELD_AUTH only)
     #   local_env backup  PATH DESTINATION
     #   local_env restore PATH BACKUP|--absent
     #
@@ -873,7 +904,7 @@ def read_text_verbatim(path):
         return handle.read()
 
 
-def apply_settings(path, values):
+def apply_settings(path, values, keys=None):
     try:
         original = read_text_verbatim(path)
     except FileNotFoundError:
@@ -889,7 +920,7 @@ def apply_settings(path, values):
         # the key, and is put back on any line this rewrites.
         bare = line[:-1] if line.endswith("\r") else line
         ending = "\r" if line.endswith("\r") else ""
-        for key in KEYS:
+        for key in keys or KEYS:
             if bare.startswith(key + "="):
                 # EVERY occurrence, not just the first: systemd and this
                 # script both take the LAST assignment of a key, so rewriting
@@ -904,11 +935,12 @@ def apply_settings(path, values):
     # newline; appending before it keeps that final newline where it was, and
     # a file that did not end with one gains exactly the newline the next
     # setting needs.
+    wanted = keys or KEYS
     if lines and lines[-1] == "":
-        lines[-1:] = ["%s=%s" % (key, values[key]) for key in KEYS if key not in seen] + [""]
+        lines[-1:] = ["%s=%s" % (key, values[key]) for key in wanted if key not in seen] + [""]
     else:
-        lines.extend("%s=%s" % (key, values[key]) for key in KEYS if key not in seen)
-        if any(key not in seen for key in KEYS) or not lines:
+        lines.extend("%s=%s" % (key, values[key]) for key in wanted if key not in seen)
+        if any(key not in seen for key in wanted) or not lines:
             lines.append("")
     return "\n".join(lines)
 
@@ -919,6 +951,12 @@ path = sys.argv[2]
 if operation == "set":
     refuse_symlink(path)
     write_atomically(path, apply_settings(path, {"FIELD_PROJECT": sys.argv[3], "FIELD_CAMPAIGN": sys.argv[4]}))
+elif operation == "set-auth":
+    # `fieldctl auth`: FIELD_AUTH and nothing else, by the same rules.
+    if sys.argv[3] not in ("token", "none"):
+        raise SystemExit("FIELD_AUTH must be token or none")
+    refuse_symlink(path)
+    write_atomically(path, apply_settings(path, {"FIELD_AUTH": sys.argv[3]}, keys=("FIELD_AUTH",)))
 elif operation == "backup":
     destination = sys.argv[3]
     if not os.path.exists(path):
@@ -1524,6 +1562,183 @@ assert_token_not_in_argv() {
     printf 'argv     clean -- the token is passed as a path, not a value\n'
 }
 
+# --- running without a token --------------------------------------------
+
+serve_exposure() {
+    # How Tailscale Serve/Funnel exposes this app's port, from
+    # `tailscale serve status --json`. Prints one line:
+    #   public HOST:PORT...   Funnel puts FIELD_PORT on the internet
+    #   others HOST:PORT...   Funnel is on, for other ports only
+    #   none                  nothing of ours or anyone's is on the internet
+    # Exit 3 when it cannot tell, which every caller treats as a refusal.
+    # Serve without Funnel ("tailnet only") is not exposure: it reaches the
+    # same devices the Tailscale address already does.
+    command -v "$FIELD_TAILSCALE_BIN" >/dev/null 2>&1 || return 3
+    local status
+    status="$("$FIELD_TAILSCALE_BIN" serve status --json 2>/dev/null)" || return 3
+    printf '%s' "$status" | python3 -c '
+import json, re, sys
+
+port = sys.argv[1]
+text = sys.stdin.read().strip()
+try:
+    document = json.loads(text) if text else {}
+except ValueError:
+    sys.exit(3)
+if not isinstance(document, dict):
+    sys.exit(3)
+
+def targets_port(target):
+    return re.search(r":%s(?:/|$)" % re.escape(port), str(target or "")) is not None
+
+funnel = sorted(key for key, value in (document.get("AllowFunnel") or {}).items() if value)
+web = document.get("Web") or {}
+tcp = document.get("TCP") or {}
+ours, others = [], []
+for hostport in funnel:
+    exposed = False
+    for handler in ((web.get(hostport) or {}).get("Handlers") or {}).values():
+        if isinstance(handler, dict) and targets_port(handler.get("Proxy")):
+            exposed = True
+    forward = tcp.get(hostport.rsplit(":", 1)[-1]) or {}
+    if isinstance(forward, dict) and targets_port(forward.get("TCPForward")):
+        exposed = True
+    (ours if exposed else others).append(hostport)
+if ours:
+    print("public " + " ".join(ours))
+elif others:
+    print("others " + " ".join(others))
+else:
+    print("none")
+' "$FIELD_PORT"
+}
+
+auth_off_refusal() {
+    # Why this deployment must keep its token, as one sentence; nothing when
+    # it may run without one. Two conditions, both checked every time:
+    #   - it listens only on a Tailscale (or loopback) address, so "no token"
+    #     means "the owner's devices", never "anyone on this Wi-Fi";
+    #   - Tailscale Funnel does not put its port on the internet.
+    local host exposure status=0
+    if ! host="$(resolve_host)"; then
+        printf 'there is no address to listen on (no FIELD_HOST and no Tailscale address)\n'
+        return 0
+    fi
+    if ! python3 -c '
+import ipaddress, sys
+try:
+    address = ipaddress.ip_address(sys.argv[1].strip("[]"))
+except ValueError:
+    sys.exit(1)
+networks = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+sys.exit(0 if address.is_loopback or any(address in network for network in networks) else 1)
+' "$host"; then
+        printf 'the service listens on %s, which is not a Tailscale address; without a token everyone on that network could control the receiver\n' "$host"
+        return 0
+    fi
+    exposure="$(serve_exposure)" || status=$?
+    if (( status != 0 )); then
+        printf 'could not read `%s serve status --json`, so it cannot be shown that Tailscale Funnel does not put this app on the internet\n' "$FIELD_TAILSCALE_BIN"
+        return 0
+    fi
+    if [[ "$exposure" == public* ]]; then
+        printf 'Tailscale Funnel puts port %s on the internet (%s); turn that off first (`tailscale funnel reset`, or remove that entry)\n' "$FIELD_PORT" "${exposure#public }"
+        return 0
+    fi
+}
+
+auth_report() {
+    local exposure status=0
+    if [[ "$FIELD_AUTH" == "none" ]]; then
+        printf 'auth     OFF [%s] -- no token: every device on your Tailscale network can control this receiver\n' \
+            "$(env_source FIELD_AUTH)"
+    else
+        printf 'auth     token\n'
+    fi
+    exposure="$(serve_exposure)" || status=$?
+    if (( status != 0 )); then
+        printf 'funnel   unknown -- `%s serve status --json` could not be read\n' "$FIELD_TAILSCALE_BIN"
+    elif [[ "$exposure" == public* ]]; then
+        printf 'funnel   WARNING: port %s is on the internet through Tailscale Funnel (%s)\n' \
+            "$FIELD_PORT" "${exposure#public }"
+    elif [[ "$exposure" == others* ]]; then
+        printf 'funnel   on for other ports only (%s); this app is not exposed\n' "${exposure#others }"
+    fi
+}
+
+cmd_auth() {
+    local action="${1:-status}" write=0
+    [[ $# -gt 0 ]] && shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --write) write=1; shift ;;
+            *)       die "unknown option $1 for 'auth'" ;;
+        esac
+    done
+    case "$action" in
+        status) auth_report ;;
+        off)    auth_switch none "$write" ;;
+        on)     auth_switch token "$write" ;;
+        *)      die "auth takes status, off or on" ;;
+    esac
+}
+
+auth_switch() {
+    # Reports by default; changes FIELD_AUTH and restarts only with --write,
+    # like every other command here that writes under /etc.
+    local want="$1" write="$2" word refusal backup jobs active deadline
+    word="$([[ "$want" == none ]] && echo off || echo on)"
+    if [[ "$want" == "$FIELD_AUTH" ]]; then
+        log "The token is already ${word}. Nothing to do."
+        return 0
+    fi
+    if [[ "$want" == none ]]; then
+        refusal="$(auth_off_refusal)"
+        [[ -z "$refusal" ]] || die "the token stays on: ${refusal}"
+    else
+        [[ -s "$FIELD_TOKEN_FILE" ]] || die "${FIELD_TOKEN_FILE} is missing or empty, and the service will not start on it. Re-run the installer, or write a token into it (chmod 600) first."
+    fi
+    if (( ! write )); then
+        log "Would set FIELD_AUTH=${want} in ${ENV_LOCAL_FILE} and restart ${FIELD_UNIT}."
+        if [[ "$want" == none ]]; then
+            log "Afterwards every device on your Tailscale network can control this receiver, and \`fieldctl url\` prints an address with no token."
+        else
+            log "Afterwards the address needs the token again: \`fieldctl url\`. The token file is unchanged, so an old bookmark with it works."
+        fi
+        log "Run: sudo fieldctl auth ${word} --write"
+        return 0
+    fi
+    require_root_for "$ENV_LOCAL_FILE" auth "$word" --write
+    # A restart abandons whatever the receiver is doing; refuse rather than
+    # lose a drive to a settings change.
+    if service_is_active && jobs="$(api_get /api/jobs)" \
+            && active="$(printf '%s' "$jobs" | api_active_job)"; then
+        die "a job is running (${active}); stop it first, then run this again"
+    fi
+
+    scratch_file backup
+    if ! local_env backup "$ENV_LOCAL_FILE" "$backup"; then
+        backup="--absent"
+    fi
+    local_env set-auth "$ENV_LOCAL_FILE" "$want" || die "could not write ${ENV_LOCAL_FILE}"
+    FIELD_AUTH="$want"
+    systemctl restart "$FIELD_UNIT" || true
+    deadline=$(( SECONDS + FIELD_TAILSCALE_WAIT + 15 ))
+    while :; do
+        if api_get /api/state >/dev/null; then
+            log "The token is now ${word}. $( [[ "$want" == none ]] && echo 'Address: `fieldctl url --locate`.' || echo 'Address with the token: `fieldctl url --locate`.')"
+            return 0
+        fi
+        (( SECONDS < deadline )) || break
+        sleep 2
+    done
+    # The service did not come back answering the way it was asked to: put the
+    # previous setting back rather than leave the receiver down in the field.
+    local_env restore "$ENV_LOCAL_FILE" "$backup" || true
+    systemctl restart "$FIELD_UNIT" || true
+    die "${FIELD_UNIT} did not answer after the change, so the previous setting was restored. See \`fieldctl logs\`."
+}
+
 cmd_campaign() {
     [[ $# -ge 1 ]] || usage
     local subcommand="$1"
@@ -1546,6 +1761,7 @@ usage: fieldctl <command>
   status                      one screen of diagnosis
   logs [journalctl args...]   default: -n 50
   url [--locate]              the phone bookmark, token included (--locate: the Locate page)
+  auth [status|off|on]        the API token; off/on report only, unless --write
 
   print-command [--null]      the exact argv the service would run
   wait-network                block until a bind address exists (ExecStartPre)
@@ -1581,6 +1797,7 @@ main() {
         exec)           cmd_exec "$@" ;;
         render-unit)    [[ $# -eq 4 ]] || usage; cmd_render_unit "$@" ;;
         campaign)       cmd_campaign "$@" ;;
+        auth)           cmd_auth "$@" ;;
         *)              usage ;;
     esac
 }

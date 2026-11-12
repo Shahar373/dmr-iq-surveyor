@@ -166,6 +166,29 @@ class _Handler(BaseHTTPRequestHandler):
         # response at all instead of returning 401.
         return secrets.compare_digest(supplied.encode("utf-8"), token.encode("utf-8"))
 
+    def _host_allowed(self) -> bool:
+        """Whether this request was addressed to this server by a known name.
+
+        Only enforced without a token (`allowed_request_hosts` is set by
+        `web serve --no-auth`). The comparison is on the host alone, port
+        stripped, case-folded, IPv6 brackets removed.
+        """
+        allowed = self.service.settings.allowed_request_hosts
+        if allowed is None:
+            return True
+        return request_host(self.headers.get("Host") or "") in allowed
+
+    def _refuse_unknown_host(self) -> bool:
+        if self._host_allowed():
+            return False
+        self._discard_body()
+        self._send_error_json(
+            421,
+            "this server answers only to its own address; open it by the address "
+            "`fieldctl url` prints",
+        )
+        return True
+
     def _same_origin(self) -> bool:
         """Reject a cross-origin state-changing request.
 
@@ -183,6 +206,8 @@ class _Handler(BaseHTTPRequestHandler):
     # -- routing -----------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        if self._refuse_unknown_host():
+            return
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         path = parsed.path
@@ -262,6 +287,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_error_json(500, f"{type(exc).__name__}: {exc}")
 
     def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        if self._refuse_unknown_host():
+            return
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         if not self._authorised(query):
@@ -503,6 +530,16 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
+
+
+def request_host(header: str) -> str:
+    """The host part of a `Host` header: no port, no IPv6 brackets, lower case."""
+    value = header.strip().lower().rstrip(".")
+    if value.startswith("["):
+        return value[1:].split("]", 1)[0]
+    if value.count(":") == 1:
+        return value.split(":", 1)[0].rstrip(".")
+    return value
 
 
 class FieldServer(ThreadingHTTPServer):

@@ -24,7 +24,9 @@ The field app has a page for exactly this workflow, in Hebrew: type the frequenc
 
 2. **Open the page.** `fieldctl url --locate` prints its address with the token. Bookmark it
    on the phone. The classic app is still at the old address (`fieldctl url`), and each page
-   links to the other.
+   links to the other. On a tailnet with only your own devices the token can be turned off
+   (`sudo fieldctl auth off --write`, see `OPERATIONS.md`), and the address is then just
+   `https://<tailscale address>:8765/locate`.
 3. **Type the frequency** (for example `469.350`) and press **התחל**. The first time for a
    frequency, park somewhere the carrier is heard: the page calibrates the gain for about a
    minute, then starts the drive by itself. Later drives on the same frequency resume its

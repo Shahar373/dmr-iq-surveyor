@@ -427,6 +427,44 @@ when neither says anything, saying so when it does.
   address only. `FIELD_HOST=0.0.0.0` is accepted but opens it to every network
   the Pi is on; it is never a default and never a fallback.
 
+### Running without a token
+
+On a tailnet that holds only your own devices, the token protects against
+nothing those devices could not already do, and it makes the bookmark long. It
+can be turned off, deliberately:
+
+```bash
+fieldctl auth off                 # reports the checks and what would change
+sudo fieldctl auth off --write    # sets FIELD_AUTH=none, restarts, verifies
+fieldctl url --locate             # https://<tailscale address>:8765/locate
+```
+
+`sudo fieldctl auth on --write` turns it back on. The token file is never
+touched, so the old bookmark with the token works again. `fieldctl auth status`
+(also part of `fieldctl status`) says which is in force.
+
+What "off" means, and what stops it from meaning more:
+
+- **Every device on your tailnet can control the receiver**: start a drive,
+  switch the campaign, delete a stop. If anyone else's device is ever added
+  to the tailnet, turn the token back on first.
+- **Refused unless the service listens on Tailscale** (or loopback). With
+  `FIELD_HOST` set to a LAN or hotspot address, the token stays on: there,
+  "no token" would mean "anyone on that Wi-Fi". `web serve --no-auth` refuses
+  the same, with exit 2, so it holds for a manual run too.
+- **Refused while Tailscale Funnel puts port 8765 on the internet**, and when
+  `tailscale serve status --json` cannot be read. This is checked again at
+  every start (`fieldctl exec`), so a Funnel added later stops the service
+  from coming up without a token rather than exposing it. A Funnel for other
+  ports, and Serve that stays on the tailnet ("tailnet only"), do not block it;
+  `fieldctl status` lists them.
+- **The server answers only its own names.** Without a token, a request whose
+  `Host` is not the bind address or a name on the certificate gets 421. A page
+  on another domain that resolves to the Pi (DNS rebinding) is therefore not
+  served, and the existing cross-origin check on every POST still applies.
+- A running job blocks the switch (the restart would abandon it). If the
+  service does not answer after the restart, the previous setting is put back.
+
 ## About the TLS certificate
 
 The certificate is self-signed, so the first visit from each device shows a

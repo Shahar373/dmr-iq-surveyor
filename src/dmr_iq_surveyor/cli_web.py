@@ -5,6 +5,7 @@ Mounted additively; no existing command changes.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import secrets
 import socket
@@ -231,6 +232,45 @@ def _resolve_capture_gain(
 # authenticate. Non-ASCII in particular is the case web/server.py documents as
 # having dropped the connection with no response at all.
 _TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._~-]+$")
+
+
+# Where a server with no token may listen: Tailscale's address ranges, where
+# only the owner's devices can reach it, and loopback. A LAN or a hotspot is
+# exactly where "no token" would mean "anyone nearby".
+_TAILSCALE_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("fd7a:115c:a1e0::/48"),
+)
+
+
+def no_auth_refusal(host: str, *, token: str | None, token_file: Path | None) -> str:
+    """Why `--no-auth` cannot be used with these options, or "" when it can."""
+    if token is not None or token_file is not None:
+        return "it cannot be combined with --token or --token-file; give one or the other"
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return (
+            f"{host!r} is not an IP address. Without a token the server must listen on a "
+            "Tailscale or loopback address, given as a number"
+        )
+    if address.is_loopback or any(address in network for network in _TAILSCALE_NETWORKS):
+        return ""
+    return (
+        f"{host} is neither a Tailscale address nor loopback. Without a token every device "
+        "that can reach it could control the receiver; bind to the Tailscale address, or "
+        "keep the token"
+    )
+
+
+def allowed_request_hosts(host: str, certificate: Any | None) -> tuple[str, ...]:
+    """The `Host` values a token-less server answers: its address and certificate names."""
+    names = {host.strip("[]").lower()}
+    if certificate is not None:
+        names.update(name.strip("[]").lower() for name in certificate.hosts)
+    if ipaddress.ip_address(host.strip("[]")).is_loopback:
+        names.update({"localhost", "127.0.0.1", "::1"})
+    return tuple(sorted(names))
 
 
 class TokenError(ValueError):
@@ -636,6 +676,19 @@ def web_serve(
             ),
         ),
     ] = None,
+    no_auth: Annotated[
+        bool,
+        typer.Option(
+            "--no-auth",
+            help=(
+                "Serve the API with no token at all: every device that can reach the "
+                "address may use it. Refused unless the address is a Tailscale one "
+                "(100.64.0.0/10, fd7a:115c:a1e0::/48) or loopback, and the server then "
+                "answers only requests addressed to its own names. `fieldctl auth off` "
+                "is the way to turn this on for the installed service"
+            ),
+        ),
+    ] = False,
     capture_enabled: Annotated[
         bool,
         typer.Option(
@@ -841,6 +894,13 @@ def web_serve(
         # whose source is invisible is one nobody checks.
         console.print(f"[green]Gain:[/green] {gain.describe()}")
 
+        if no_auth:
+            refusal = no_auth_refusal(host, token=token, token_file=token_file)
+            if refusal:
+                console.print(f"[bold red]--no-auth refused:[/bold red] {refusal}")
+                # 2, like a usage error: retrying the same command cannot help,
+                # and the service unit does not restart on it.
+                raise typer.Exit(code=2)
         try:
             resolved = resolve_token(token, token_file)
         except TokenError as exc:
@@ -926,6 +986,8 @@ def web_serve(
                 console.print(f"[bold red]TLS could not be configured:[/bold red] {exc}")
                 raise typer.Exit(code=1) from exc
 
+        if no_auth:
+            settings.allowed_request_hosts = allowed_request_hosts(host, certificate)
         scheme = "https" if certificate is not None else "http"
         suffix = token_query_suffix(resolved)
         console.print("[bold]Field app[/bold]")
@@ -954,7 +1016,14 @@ def web_serve(
                 "[yellow]Bound to loopback only.[/yellow] Re-run with --host 0.0.0.0 to open it "
                 "from a phone on the same network."
             )
-        if not resolved_token and host != "127.0.0.1":
+        if no_auth:
+            console.print(
+                "[bold yellow]No token (--no-auth).[/bold yellow] Every device that can reach "
+                f"{host} -- on Tailscale, every device on your tailnet -- can control this "
+                "receiver. Requests are answered only when addressed to: "
+                + ", ".join(settings.allowed_request_hosts or ())
+            )
+        elif not resolved_token and host != "127.0.0.1":
             console.print(
                 "[yellow]No token set.[/yellow] Anyone on this network can start a capture; "
                 "pass --token auto on a shared network."
