@@ -293,6 +293,15 @@ widens the posterior to what the data supports; it does not model the shared sha
 - `geo calibrate --model-correlation-m` sets the solver's `L`; `--correlation-m` is the simulated truth.
 - Phase 7's `geo solve` is unchanged (`L = 0`); a test pins that `L = 0` is bit-identical to before.
 - Each solution's diagnostics record `shadowing_correlation.effective_measurements`.
+- Memory is bounded (review of 2026-11-12). The weights are summed in row blocks of at most 2^20
+  pairs, visiting only stops within 40 L in east (each skipped pair is worth exp(-40)), instead of
+  dense N × N × 2 and N × N arrays (~1 GB at 5,000 measurements). `_evaluate_grid` now sizes its
+  cell chunk by the measurement count as well as the offset count; sized by offsets alone it built
+  65,536 × N temporaries. Measured with production settings along a drive: peak 530 MB / 2.1 GB /
+  4.3 GB at 250 / 1,000 / 2,000 measurements before, 162 MB at all three after. Results match the
+  dense code to within 5e-13 relative, and `L = 0` solves are still bit-identical
+  (`tests/test_geo_solver_memory.py`). Memory is bounded; time is not: a few thousand measurements
+  with many non-detections still take minutes to hours.
 
 Measured (test-grade grid, 30 trials per row, true sigma 6 dB):
 
