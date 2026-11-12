@@ -671,3 +671,66 @@ def test_without_a_target_a_request_may_still_name_its_own_tuning(tmp_path: Path
         assert "reload it" not in str(refused.value)
     finally:
         service.close()
+
+
+def test_a_page_opened_before_the_target_cannot_use_another_band_profile(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    try:
+        service.select_locate_target({"frequency_mhz": 469.35})
+        with pytest.raises(ValueError, match="band profile"):
+            service.start_live({"band": "central_800"})
+        with pytest.raises(ValueError, match="band profile"):
+            service.start_capture({"band": "central_800"})
+    finally:
+        service.close()
+
+
+def test_the_listing_survives_the_active_emitter_being_removed(tmp_path: Path) -> None:
+    from dmr_iq_surveyor.geo.emitters import remove_emitter
+
+    service = _service(tmp_path)
+    try:
+        active = service.select_locate_target({"frequency_mhz": 469.35})["active"]
+        connection = connect_locate_database(tmp_path / "db.sqlite3")
+        try:
+            remove_emitter(connection, active["emitter_key"])
+        finally:
+            connection.close()
+        listed = service.locate_targets()
+        assert listed == {"active": None, "targets": []}
+        # Choosing it again declares it afresh and resumes the same campaign.
+        again = service.select_locate_target({"frequency_mhz": 469.35})["active"]
+        assert again["campaign_id"] == active["campaign_id"]
+    finally:
+        service.close()
+
+
+def test_a_failed_solve_is_reported_not_hidden_behind_the_previous_region(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from dmr_iq_surveyor.web import service as service_module
+
+    service = _service(tmp_path)
+    try:
+        campaign = service.select_locate_target({"frequency_mhz": 469.35})["active"][
+            "campaign_id"
+        ]
+        with service._live_lock:
+            service._locate_result = {
+                "campaign_id": campaign,
+                "solved_at_utc": "earlier", "error": None,
+                "solution": {"status": "ok"}, "regions": None, "plan": None,
+            }
+
+        def explode(**_kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(service_module, "solve_emitters", explode)
+        started = service.request_locate_solve()
+        snapshot = _wait(service.jobs.get(started["job_id"]))
+        assert snapshot["status"] == "failed"
+        result = service.locate_result()["result"]
+        assert result["solution"] is None
+        assert "database is locked" in result["error"]
+    finally:
+        service.close()

@@ -352,3 +352,33 @@ def test_re_saving_the_same_bandwidth_keeps_a_tolerance_set_on_purpose(tmp_path:
     assert _prepare(connection, tmp_path, channel_bandwidth_hz=12_500)["tolerance_hz"] == 3_000.0
     # A new bandwidth does move it, to half a channel.
     assert _prepare(connection, tmp_path, channel_bandwidth_hz=25_000)["tolerance_hz"] == 12_500.0
+
+
+def test_a_removed_emitter_chosen_again_resumes_its_campaign(tmp_path: Path) -> None:
+    """`geo emitter remove` leaves the campaign and its runs. Choosing the
+    frequency again re-declares the emitter and resumes that campaign rather
+    than colliding with it."""
+    from dmr_iq_surveyor.geo.emitters import remove_emitter
+
+    connection = _connection(tmp_path)
+    first = _prepare(connection, tmp_path, label="cc")
+    _add_run(connection, first["campaign_id"])
+    remove_emitter(connection, first["emitter_key"])
+    assert list_targets(connection) == []
+
+    again = _prepare(connection, tmp_path)
+    assert again["campaign_id"] == first["campaign_id"]
+    assert again["emitter_key"] == first["emitter_key"]
+    assert again["run_count"] == 1
+    assert again["gain"] == first["gain"]
+
+
+def test_a_removed_cli_emitter_comes_back_under_its_own_key(tmp_path: Path) -> None:
+    from dmr_iq_surveyor.geo.emitters import remove_emitter
+
+    connection = _connection(tmp_path)
+    upsert_emitter(connection, emitter_key="cc469", frequency_hz=469.35e6)
+    first = _prepare(connection, tmp_path)
+    remove_emitter(connection, "cc469")
+    again = _prepare(connection, tmp_path)
+    assert again["emitter_key"] == "cc469" and again["campaign_id"] == first["campaign_id"]

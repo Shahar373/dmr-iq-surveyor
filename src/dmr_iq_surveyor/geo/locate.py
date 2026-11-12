@@ -341,6 +341,7 @@ def _resolve_emitter(
     payload: dict[str, Any],
     *,
     implied_tolerance_hz: float | None,
+    emitter_key: str | None = None,
 ) -> dict[str, Any]:
     """Declare the target's emitter, or reuse the one already at this frequency.
 
@@ -379,7 +380,7 @@ def _resolve_emitter(
         return payload[name] if payload.get(name) is not None else fallback
 
     base = existing or {
-        "emitter_key": target_key(hertz),
+        "emitter_key": emitter_key or target_key(hertz),
         "frequency_hz": float(hertz),
         "label": "",
         "emission": EMISSION_CONTINUOUS,
@@ -474,7 +475,21 @@ def prepare_target(
     )
 
     known = _emitter_at(connection, hertz)
-    latest = _latest_row(connection, str(known["emitter_key"])) if known else None
+    if known is not None:
+        latest = _latest_row(connection, str(known["emitter_key"]))
+        key_for_new = str(known["emitter_key"])
+    else:
+        # The emitter may have been removed (`geo emitter remove`) after
+        # Locate opened a campaign for it. Its campaigns and runs stay; the
+        # frequency resumes the latest of them, under the key it had, rather
+        # than colliding with it as a "new" generation 1.
+        orphan = connection.execute(
+            "SELECT emitter_key FROM locate_targets WHERE ABS(frequency_hz - ?) <= 1.0 "
+            "ORDER BY created_at_utc DESC, generation DESC LIMIT 1",
+            (float(hertz),),
+        ).fetchone()
+        key_for_new = str(orphan[0]) if orphan is not None else target_key(hertz)
+        latest = _latest_row(connection, key_for_new) if orphan is not None else None
     resuming = latest is not None and not start_over
     frequency = float(known["frequency_hz"]) if known else float(hertz)
 
@@ -512,8 +527,7 @@ def prepare_target(
         centre = float(given.get("center_frequency_hz") or auto_centre)
         rate = float(given.get("sample_rate_hz") or auto_rate)
         check_tuning(frequency, centre, rate)
-        key_guess = str(known["emitter_key"]) if known else target_key(hertz)
-        campaign = campaign_id_for(key_guess, generation)
+        campaign = campaign_id_for(key_for_new, generation)
         if campaign_run_count(connection, campaign):
             # A campaign id the operator used by hand for something else.
             raise LocateError(
@@ -532,6 +546,7 @@ def prepare_target(
     )
     emitter = _resolve_emitter(
         connection, frequency, given,
+        emitter_key=key_for_new,
         implied_tolerance_hz=(
             default_tolerance_hz(bandwidth)
             if known is None or bandwidth != previous_bandwidth else None
