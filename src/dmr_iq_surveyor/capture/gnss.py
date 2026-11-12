@@ -196,31 +196,68 @@ class FixAssembler:
     that epoch vetoes the RMC, because the two disagreeing means one of them
     is wrong and a misplaced measurement is the error this system cannot see
     afterwards.
+
+    Receivers disagree on the order within an epoch. A u-blox 7 sends RMC
+    first (RMC, VTG, GGA, GSA, GSV, GLL); others send GGA first. So a valid
+    RMC whose GGA has already arrived is emitted at once, and one whose GGA
+    has not is *held*: it is emitted, with GGA's satellites, HDOP and
+    altitude, when the same-epoch GGA arrives (or suppressed, if that GGA
+    says quality 0). If the epoch ends without one -- the next RMC or a GGA
+    for another time arrives, or the reader calls `flush()` -- the held RMC
+    is emitted on its own, as it would have been with no GGA at all.
     """
 
     def __init__(self) -> None:
         self._gga: dict[str, Any] | None = None
+        # A held RMC, with its same-epoch GGA if one was already in hand.
+        self._pending: tuple[dict[str, Any], dict[str, Any] | None] | None = None
 
     def feed(self, sentence: dict[str, Any]) -> GnssFix | None:
         if sentence["type"] == "GGA":
             self._gga = sentence
+            if self._pending is None:
+                return None
+            rmc, matched = self._pending
+            self._pending = None
+            if rmc["time_utc"] == sentence["time_utc"]:
+                return self._build(rmc, sentence)
+            return self._build(rmc, matched)  # its epoch ended without a new GGA
+        if sentence["type"] != "RMC":
             return None
-        if sentence["type"] != "RMC" or not sentence["valid"]:
-            return None
+        # An RMC for another time starts a new epoch: the held one's GGA never came.
+        flushed = None
+        if self._pending is not None and self._pending[0]["time_utc"] != sentence["time_utc"]:
+            flushed = self.flush()
+        if not sentence["valid"]:
+            return flushed
         if sentence["latitude"] is None or sentence["longitude"] is None:
-            return None
+            return flushed
         gga = self._gga if self._gga and self._gga["time_utc"] == sentence["time_utc"] else None
+        if gga is None or flushed is not None:
+            # Wait for this epoch's GGA. (When an older RMC was just flushed
+            # this call has already returned a fix; this one waits its turn.)
+            self._pending = (sentence, gga)
+            return flushed
+        return self._build(sentence, gga)
+
+    def flush(self) -> GnssFix | None:
+        """Emit a held RMC whose epoch produced no GGA; None if none is held."""
+        pending, self._pending = self._pending, None
+        return self._build(*pending) if pending is not None else None
+
+    @staticmethod
+    def _build(rmc: dict[str, Any], gga: dict[str, Any] | None) -> GnssFix | None:
         if gga is not None and gga["quality"] == 0:
             return None
         return GnssFix(
-            latitude=float(sentence["latitude"]),
-            longitude=float(sentence["longitude"]),
-            speed_mps=sentence["speed_mps"],
-            course_deg=sentence["course_deg"],
+            latitude=float(rmc["latitude"]),
+            longitude=float(rmc["longitude"]),
+            speed_mps=rmc["speed_mps"],
+            course_deg=rmc["course_deg"],
             satellites=gga["satellites"] if gga else None,
             hdop=gga["hdop"] if gga else None,
             altitude_m=gga["altitude_m"] if gga else None,
-            time_utc=sentence["time_utc"],
+            time_utc=rmc["time_utc"],
         )
 
     def last_gga(self) -> dict[str, Any] | None:
@@ -287,10 +324,17 @@ class SerialLineSource:
         self.path = path
         self._timeout = read_timeout_s
         self._fd = os.open(path, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+        import termios
+
         try:
             self._configure()
-        except OSError:
-            pass  # not a terminal (a FIFO in a test, a pty): read it as-is
+        except (OSError, termios.error):
+            # Not a terminal (a FIFO, a socat pipe, a file replay): read it
+            # as-is. termios raises its own error, which is not an OSError.
+            pass
+        except BaseException:
+            self.close()  # do not leak the descriptor
+            raise
 
     def _configure(self) -> None:
         import termios
@@ -533,6 +577,14 @@ class GnssReader:
                           error=f"cannot open {path}: {exc}{hint}")
                 self._stop.wait(self._retry_s)
                 continue
+            except Exception as exc:  # noqa: BLE001 - the thread must outlive any open failure
+                # A bad gpsd address, a termios failure, a driver oddity: an
+                # error state with the reason, retried, never a dead thread
+                # that leaves the status at "searching" forever.
+                self._set(state=STATE_ERROR, device=path,
+                          error=f"cannot open {path}: {type(exc).__name__}: {exc}")
+                self._stop.wait(self._retry_s)
+                continue
             with self._lock:
                 self._status.device = path
                 self._status.state = STATE_NO_FIX
@@ -557,6 +609,10 @@ class GnssReader:
             if self._stop.is_set():
                 return
             if line is None:
+                # A quiet read timeout: no GGA is coming for a held RMC.
+                held = assembler.flush()
+                if held is not None:
+                    self._deliver(held, self._clock())
                 continue
             if line.lstrip().startswith("{"):
                 self._consume_gpsd(line)
@@ -578,22 +634,25 @@ class GnssReader:
                 with self._lock:
                     self._status.satellites = sentence["satellites"]
                     self._status.hdop = sentence["hdop"]
-                    if sentence["quality"] == 0:
-                        self._status.state = STATE_NO_FIX
+            if fix is not None:
+                self._deliver(fix, now)
+            # The current sentence has the last word on the state: a fix the
+            # assembler emits can be a held RMC from the previous epoch.
+            if sentence["type"] == "GGA" and sentence["quality"] == 0:
+                self._set(state=STATE_NO_FIX)
             elif sentence["type"] == "RMC" and not sentence["valid"]:
                 self._set(state=STATE_NO_FIX)
-            if fix is None:
-                continue
-            with self._lock:
-                self._status.state = STATE_FIX
-                self._status.fixes += 1
-                self._status.last_fix_at = now
-                self._status.last_fix = fix.to_dict()
-            try:
-                self._on_fix(fix)
-            except Exception as exc:  # noqa: BLE001 - a consumer bug must not kill the reader
-                self._set(error=f"fix consumer failed: {type(exc).__name__}: {exc}")
 
+    def _deliver(self, fix: GnssFix, now: float) -> None:
+        with self._lock:
+            self._status.state = STATE_FIX
+            self._status.fixes += 1
+            self._status.last_fix_at = now
+            self._status.last_fix = fix.to_dict()
+        try:
+            self._on_fix(fix)
+        except Exception as exc:  # noqa: BLE001 - a consumer bug must not kill the reader
+            self._set(error=f"fix consumer failed: {type(exc).__name__}: {exc}")
 
     def _consume_gpsd(self, line: str) -> None:
         try:
