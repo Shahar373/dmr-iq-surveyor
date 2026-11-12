@@ -221,7 +221,16 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._authorised(query):
                 self._send_error_json(401, "missing or invalid token")
                 return
-            self._serve_tile(path)
+            try:
+                self._serve_tile(path)
+            except (BrokenPipeError, ConnectionResetError):
+                # Leaflet cancels in-flight tiles on every pan and zoom, so a
+                # closed socket mid-tile is routine -- the same as for the API.
+                self.close_connection = True
+            except Exception as exc:  # noqa: BLE001 - one bad tile must not stop the server
+                # Anything `cache.get` did not turn into a TileError is still
+                # an upstream-side failure from the phone's point of view.
+                self._send_error_json(502, f"tile failed: {type(exc).__name__}: {exc}")
             return
         if not path.startswith("/api/"):
             # `/` stays the classic app; `/locate` is the Phase 8 Locate page.
