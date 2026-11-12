@@ -440,10 +440,12 @@ cmd_exec() {
     if [[ "$FIELD_AUTH" == "none" ]]; then
         # Checked at every start, not only when the token was turned off: a
         # Funnel enabled since then would put a receiver with no token on the
-        # internet. Exit 1, so systemd retries and the service comes back by
-        # itself once the exposure is removed.
+        # internet. A refusal exits 1; systemd retries a few times and then
+        # stops (StartLimitBurst), leaving the receiver down rather than
+        # exposed -- `fieldctl start` once the exposure is gone. An unreadable
+        # Funnel state is waited out first, for tailscaled still starting.
         local refusal
-        refusal="$(auth_off_refusal)"
+        refusal="$(auth_off_refusal patient)"
         [[ -z "$refusal" ]] || die "refusing to start without a token: ${refusal}"
     fi
     build_argv
@@ -605,7 +607,7 @@ cmd_url() {
     # in this script goes out of its way to keep the value out of argv and
     # out of the journal, so the warning goes to stderr and the URL to
     # stdout -- `fieldctl url | qrencode -t ansiutf8` stays useful.
-    local host token page="/" query=""
+    local host token page="/"
     case "${1:-}" in
         --locate) page="/locate" ;;   # the Phase 8 Locate page
         "") ;;
@@ -1591,19 +1593,33 @@ if not isinstance(document, dict):
 def targets_port(target):
     return re.search(r":%s(?:/|$)" % re.escape(port), str(target or "")) is not None
 
-funnel = sorted(key for key, value in (document.get("AllowFunnel") or {}).items() if value)
-web = document.get("Web") or {}
-tcp = document.get("TCP") or {}
+def configs(node):
+    # The top-level config, and every config nested in it: a foreground
+    # `tailscale funnel` session is stored under Foreground.<session>, and
+    # newer versions keep per-service configs under Services. A Funnel in any
+    # of them is as public as one at the top.
+    if not isinstance(node, dict):
+        return
+    yield node
+    for key in ("Foreground", "Services"):
+        for child in (node.get(key) or {}).values():
+            yield from configs(child)
+
 ours, others = [], []
-for hostport in funnel:
-    exposed = False
-    for handler in ((web.get(hostport) or {}).get("Handlers") or {}).values():
-        if isinstance(handler, dict) and targets_port(handler.get("Proxy")):
+for config in configs(document):
+    web = config.get("Web") or {}
+    tcp = config.get("TCP") or {}
+    for hostport, allowed in sorted((config.get("AllowFunnel") or {}).items()):
+        if not allowed:
+            continue
+        exposed = False
+        for handler in ((web.get(hostport) or {}).get("Handlers") or {}).values():
+            if isinstance(handler, dict) and targets_port(handler.get("Proxy")):
+                exposed = True
+        forward = tcp.get(hostport.rsplit(":", 1)[-1]) or {}
+        if isinstance(forward, dict) and targets_port(forward.get("TCPForward")):
             exposed = True
-    forward = tcp.get(hostport.rsplit(":", 1)[-1]) or {}
-    if isinstance(forward, dict) and targets_port(forward.get("TCPForward")):
-        exposed = True
-    (ours if exposed else others).append(hostport)
+        (ours if exposed else others).append(hostport)
 if ours:
     print("public " + " ".join(ours))
 elif others:
@@ -1619,7 +1635,12 @@ auth_off_refusal() {
     #   - it listens only on a Tailscale (or loopback) address, so "no token"
     #     means "the owner's devices", never "anyone on this Wi-Fi";
     #   - Tailscale Funnel does not put its port on the internet.
-    local host exposure status=0
+    #
+    # `patient` (the start itself) keeps asking for up to 30 s when the Funnel
+    # state cannot be read yet: at boot tailscaled may have its address before
+    # it answers `serve status`, and a refusal there would leave the receiver
+    # down after systemd's few retries (StartLimitBurst).
+    local host exposure status=0 patience="${1:-}" deadline
     if ! host="$(resolve_host)"; then
         printf 'there is no address to listen on (no FIELD_HOST and no Tailscale address)\n'
         return 0
@@ -1636,7 +1657,19 @@ sys.exit(0 if address.is_loopback or any(address in network for network in netwo
         printf 'the service listens on %s, which is not a Tailscale address; without a token everyone on that network could control the receiver\n' "$host"
         return 0
     fi
-    exposure="$(serve_exposure)" || status=$?
+    # Without Tailscale installed there is no Funnel to ask about, and a
+    # loopback address is the only one that passed the check above.
+    if ! command -v "$FIELD_TAILSCALE_BIN" >/dev/null 2>&1 && [[ "$host" == 127.* || "$host" == "::1" ]]; then
+        return 0
+    fi
+    deadline=$(( SECONDS + 30 ))
+    while :; do
+        status=0
+        exposure="$(serve_exposure)" || status=$?
+        (( status == 0 )) && break
+        [[ "$patience" == patient ]] && (( SECONDS < deadline )) || break
+        sleep 2
+    done
     if (( status != 0 )); then
         printf 'could not read `%s serve status --json`, so it cannot be shown that Tailscale Funnel does not put this app on the internet\n' "$FIELD_TAILSCALE_BIN"
         return 0
@@ -1644,6 +1677,41 @@ sys.exit(0 if address.is_loopback or any(address in network for network in netwo
     if [[ "$exposure" == public* ]]; then
         printf 'Tailscale Funnel puts port %s on the internet (%s); turn that off first (`tailscale funnel reset`, or remove that entry)\n' "$FIELD_PORT" "${exposure#public }"
         return 0
+    fi
+}
+
+api_http_code() {
+    # The HTTP status of GET PATH, asked with the token (1) or without it (0);
+    # 000 when nothing answered. How `fieldctl auth` verifies a switch: an
+    # answer is not enough, it has to be the answer of the mode asked for.
+    local path="$1" with_token="$2" host url config code=""
+    host="$(resolve_host)" || { printf '000'; return 0; }
+    command -v curl >/dev/null 2>&1 || { printf '000'; return 0; }
+    url="https://${host}:${FIELD_PORT}${path}"
+    if (( with_token )); then
+        [[ -r "$FIELD_TOKEN_FILE" ]] || { printf '000'; return 0; }
+        scratch_file config
+        {
+            printf 'header = "X-Auth-Token: '
+            tr -d '\r\n' < "$FIELD_TOKEN_FILE"
+            printf '"\n'
+        } > "$config"
+        code="$(curl --silent --max-time 5 --cacert "$FIELD_TLS_CERT" --config "$config" \
+                     --output /dev/null --write-out '%{http_code}' "$url" 2>/dev/null)" || true
+        rm -f "$config"
+    else
+        code="$(curl --silent --max-time 5 --cacert "$FIELD_TLS_CERT" \
+                     --output /dev/null --write-out '%{http_code}' "$url" 2>/dev/null)" || true
+    fi
+    printf '%s' "${code:-000}"
+}
+
+auth_in_force() {
+    # Whether the running service answers the way FIELD_AUTH=$1 means.
+    if [[ "$1" == none ]]; then
+        [[ "$(api_http_code /api/state 0)" == 200 ]]
+    else
+        [[ "$(api_http_code /api/state 0)" == 401 && "$(api_http_code /api/state 1)" == 200 ]]
     fi
 }
 
@@ -1709,26 +1777,59 @@ auth_switch() {
         return 0
     fi
     require_root_for "$ENV_LOCAL_FILE" auth "$word" --write
-    # A restart abandons whatever the receiver is doing; refuse rather than
-    # lose a drive to a settings change.
-    if service_is_active && jobs="$(api_get /api/jobs)" \
-            && active="$(printf '%s' "$jobs" | api_active_job)"; then
-        die "a job is running (${active}); stop it first, then run this again"
+    if [[ -L "$ENV_LOCAL_FILE" ]]; then
+        die "${ENV_LOCAL_FILE} is a symbolic link. Writing would replace the link with a regular file and leave its target unchanged, so this is refused."
+    fi
+    if ! service_is_settled; then
+        die "${FIELD_UNIT} is $(service_state): neither running nor stopped (starting, or restarting after a failure). Wait for it to settle, then run this again."
+    fi
+    # The same lock as `campaign use`: both rewrite this file and restore it
+    # from a backup, and two of them interleaved would undo each other.
+    campaign_lock
+
+    local was_active=0 looked=0
+    if service_is_active; then
+        was_active=1
+        # A restart abandons whatever the receiver is doing. An API that
+        # cannot be asked is a refusal, not a "nothing is running".
+        if ! jobs="$(api_get /api/jobs)"; then
+            die "the service is running but its API could not be reached, so it cannot be asked whether a capture is in progress. Refusing to restart it blind; check \`fieldctl status\`."
+        fi
+        active="$(printf '%s' "$jobs" | api_active_job)" || looked=$?
+        case "$looked" in
+            0) die "a job has not finished: ${active}. Restarting would abandon it. Wait for it, or cancel it in the app, then run this again." ;;
+            1) ;;
+            *) die "the service answered its job list in a form this could not read. Refusing to restart it blind; check \`fieldctl status\` and the app." ;;
+        esac
     fi
 
     scratch_file backup
-    if ! local_env backup "$ENV_LOCAL_FILE" "$backup"; then
+    if [[ -e "$ENV_LOCAL_FILE" ]]; then
+        # A failed backup must never be read as "there was no file": the
+        # rollback would then delete the operator's whole local configuration.
+        local_env backup "$ENV_LOCAL_FILE" "$backup" \
+            || die "could not back up ${ENV_LOCAL_FILE}, so nothing was changed"
+    else
         backup="--absent"
     fi
     local_env set-auth "$ENV_LOCAL_FILE" "$want" || die "could not write ${ENV_LOCAL_FILE}"
     FIELD_AUTH="$want"
+
+    if (( ! was_active )); then
+        # Stopped on purpose (to free the SDR, say): it stays stopped.
+        log "FIELD_AUTH=${want} is set in ${ENV_LOCAL_FILE}. ${FIELD_UNIT} is not running, so nothing was started; it applies at the next start (\`fieldctl start\`)."
+        return 0
+    fi
     systemctl restart "$FIELD_UNIT" || true
     deadline=$(( SECONDS + FIELD_TAILSCALE_WAIT + 15 ))
     while :; do
-        if api_get /api/state >/dev/null; then
-            log "The token is now ${word}. $( [[ "$want" == none ]] && echo 'Address: `fieldctl url --locate`.' || echo 'Address with the token: `fieldctl url --locate`.')"
+        if auth_in_force "$want"; then
+            log "The token is now ${word}. Address: \`fieldctl url --locate\`."
             return 0
         fi
+        # A unit that has already failed will not start answering; do not sit
+        # out the whole startup budget waiting for it.
+        service_has_failed && break
         (( SECONDS < deadline )) || break
         sleep 2
     done
@@ -1736,7 +1837,7 @@ auth_switch() {
     # previous setting back rather than leave the receiver down in the field.
     local_env restore "$ENV_LOCAL_FILE" "$backup" || true
     systemctl restart "$FIELD_UNIT" || true
-    die "${FIELD_UNIT} did not answer after the change, so the previous setting was restored. See \`fieldctl logs\`."
+    die "${FIELD_UNIT} did not answer as asked after the change, so the previous setting was restored. See \`fieldctl logs\`."
 }
 
 cmd_campaign() {

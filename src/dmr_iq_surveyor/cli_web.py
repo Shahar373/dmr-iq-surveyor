@@ -40,7 +40,7 @@ from dmr_iq_surveyor.survey.profiles import (
 )
 from dmr_iq_surveyor.survey.provenance import ProvenanceError, normalise_campaign_id
 from dmr_iq_surveyor.web.recordings import GIB, disk_status
-from dmr_iq_surveyor.web.server import serve_forever
+from dmr_iq_surveyor.web.server import request_host, serve_forever
 from dmr_iq_surveyor.web.service import FieldSettings
 from dmr_iq_surveyor.web.tls import (
     Certificate,
@@ -264,10 +264,15 @@ def no_auth_refusal(host: str, *, token: str | None, token_file: Path | None) ->
 
 
 def allowed_request_hosts(host: str, certificate: Any | None) -> tuple[str, ...]:
-    """The `Host` values a token-less server answers: its address and certificate names."""
-    names = {host.strip("[]").lower()}
+    """The `Host` values a token-less server answers: its address and certificate names.
+
+    Each in `request_host`'s form -- an IP literal canonical (a browser sends
+    `[fd7a:115c:a1e0::1]`, never the long spelling), a name lower case -- so
+    the two sides compare equal however the address was typed.
+    """
+    names = {request_host(host)}
     if certificate is not None:
-        names.update(name.strip("[]").lower() for name in certificate.hosts)
+        names.update(request_host(name) for name in certificate.hosts)
     if ipaddress.ip_address(host.strip("[]")).is_loopback:
         names.update({"localhost", "127.0.0.1", "::1"})
     return tuple(sorted(names))

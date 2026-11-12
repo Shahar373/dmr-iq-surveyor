@@ -188,3 +188,11 @@ def test_a_tokenless_server_refuses_a_request_addressed_to_another_name(tokenles
     )
     assert status == 421
     assert "own address" in answer["error"]
+
+
+def test_a_long_form_ipv6_bind_address_matches_what_a_browser_sends() -> None:
+    """Browsers send the canonical, compressed literal; the bind address may
+    have been typed long. Both sides are compared canonical."""
+    allowed = allowed_request_hosts("fd7a:115c:a1e0:0:0:0:0:1", None)
+    assert request_host("[fd7a:115c:a1e0::1]:8765") in allowed
+    assert request_host("[FD7A:115C:A1E0:0:0:0:0:1]:8765") == "fd7a:115c:a1e0::1"

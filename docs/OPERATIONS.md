@@ -452,18 +452,28 @@ What "off" means, and what stops it from meaning more:
   `FIELD_HOST` set to a LAN or hotspot address, the token stays on: there,
   "no token" would mean "anyone on that Wi-Fi". `web serve --no-auth` refuses
   the same, with exit 2, so it holds for a manual run too.
-- **Refused while Tailscale Funnel puts port 8765 on the internet**, and when
+- **Refused while Tailscale Funnel puts port 8765 on the internet** (a
+  foreground `tailscale funnel` session included), and when
   `tailscale serve status --json` cannot be read. This is checked again at
-  every start (`fieldctl exec`), so a Funnel added later stops the service
-  from coming up without a token rather than exposing it. A Funnel for other
-  ports, and Serve that stays on the tailnet ("tailnet only"), do not block it;
-  `fieldctl status` lists them.
+  every start (`fieldctl exec`, which waits up to 30 s for tailscaled to
+  answer at boot), so a Funnel added later keeps the service from coming up
+  without a token rather than exposing it: systemd retries a few times, then
+  leaves it down until the Funnel is removed and `fieldctl start` is run. A
+  Funnel for other ports, and Serve that stays on the tailnet ("tailnet
+  only"), do not block it; `fieldctl status` lists them.
 - **The server answers only its own names.** Without a token, a request whose
   `Host` is not the bind address or a name on the certificate gets 421. A page
   on another domain that resolves to the Pi (DNS rebinding) is therefore not
   served, and the existing cross-origin check on every POST still applies.
-- A running job blocks the switch (the restart would abandon it). If the
-  service does not answer after the restart, the previous setting is put back.
+- **The switch never restarts blind.** A running job blocks it, and so does an
+  API that cannot be asked about jobs; a service that is still starting is
+  left to settle first; a service that was stopped stays stopped (the setting
+  applies at its next start). It takes the same lock as `campaign use`.
+- **It is verified by status codes,** not by "something answered": with the
+  token off, a request without one must get 200; with it on, a request
+  without one must get 401 and one with it 200. Otherwise the previous
+  setting is put back and the service restarted on it. A file that cannot be
+  backed up first is not changed at all.
 
 ## About the TLS certificate
 

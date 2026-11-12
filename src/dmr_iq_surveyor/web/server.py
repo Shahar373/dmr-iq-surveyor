@@ -15,6 +15,7 @@ an internet-facing service.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import mimetypes
 import secrets
@@ -533,13 +534,17 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def request_host(header: str) -> str:
-    """The host part of a `Host` header: no port, no IPv6 brackets, lower case."""
+    """The host part of a `Host` header: no port, no IPv6 brackets, lower case,
+    and an IP literal in its canonical form."""
     value = header.strip().lower().rstrip(".")
     if value.startswith("["):
-        return value[1:].split("]", 1)[0]
-    if value.count(":") == 1:
-        return value.split(":", 1)[0].rstrip(".")
-    return value
+        value = value[1:].split("]", 1)[0]
+    elif value.count(":") == 1:
+        value = value.split(":", 1)[0].rstrip(".")
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return value
 
 
 class FieldServer(ThreadingHTTPServer):
