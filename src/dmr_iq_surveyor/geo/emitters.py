@@ -51,6 +51,7 @@ from dmr_iq_surveyor.geo.model import SolveSettings
 from dmr_iq_surveyor.geo.pipeline import (
     METHOD,
     _as_gain,
+    _build_plan,
     _campaign_gain_readings,
     _campaign_noise_floors,
     _flag_gain_drift,
@@ -59,6 +60,7 @@ from dmr_iq_surveyor.geo.pipeline import (
     _modal_gain,
     _to_geo_measurements,
 )
+from dmr_iq_surveyor.geo.planning import PlanSettings, plan_to_geojson
 from dmr_iq_surveyor.geo.solver import (
     FIT_NOT_FITTED,
     GEOLOCATION_MATURITY,
@@ -875,8 +877,16 @@ def solve_emitters(
     common_mode: CommonModeSettings | None = None,
     model_position_uncertainty: bool = False,
     scope: CampaignScope = WHOLE_DATABASE,
+    plan: bool = False,
+    plan_settings: PlanSettings | None = None,
 ) -> dict[str, Any]:
     """Rebuild the scope's emitter measurements, then solve every declared emitter.
+
+    With `plan`, the report also carries where a next stop would teach the
+    most (`report["plan"]`), computed from the final posteriors by the same
+    `_build_plan` Phase 7 uses for sites -- including its refusal to plan from
+    a fit that was never identified. Off by default, so `geo emitter solve`
+    is unchanged.
 
     The rebuild is pure SQL over stored observations and costs little, and it
     means a run excluded or re-imported since the last solve can never be read
@@ -920,8 +930,10 @@ def solve_emitters(
             usable_by[emitter["emitter_key"]] = usable
             excluded_by[emitter["emitter_key"]] = len(everything) - len(usable)
 
+        results: dict[str, Any] = {}
+
         def solve(emitter: dict[str, Any], offsets: dict[str, float]) -> dict[str, Any]:
-            row, _ = _solve_emitter(
+            row, result = _solve_emitter(
                 emitter=emitter,
                 usable=usable_by[emitter["emitter_key"]],
                 excluded=excluded_by[emitter["emitter_key"]],
@@ -930,6 +942,7 @@ def solve_emitters(
                 offsets=offsets,
                 model_position_uncertainty=model_position_uncertainty,
             )
+            results[emitter["emitter_key"]] = result
             return row
 
         rows = {emitter["emitter_key"]: solve(emitter, {}) for emitter in emitters}
@@ -976,6 +989,17 @@ def solve_emitters(
             {key: value for key, value in row.items() if key != "geojson"} for row in ordered
         ],
     }
+    if plan:
+        built = _build_plan(
+            # The planner names what it ranks by `site_key`; here that is the emitter.
+            rows=[{**row, "site_key": row["emitter_key"]} for row in ordered],
+            results=results,
+            usable_by_site=usable_by,
+            settings=resolved,
+            plan_settings=plan_settings or PlanSettings(),
+        )
+        built["geojson"] = plan_to_geojson(built)
+        report["plan"] = built
     if output_root is not None:
         destination = Path(output_root).expanduser().resolve()
         (destination / "reports").mkdir(parents=True, exist_ok=True)

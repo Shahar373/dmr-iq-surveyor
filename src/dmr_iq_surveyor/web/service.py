@@ -39,6 +39,7 @@ from dmr_iq_surveyor.capture.probe import (
     ProbeRunner,
     SubprocessProbeRunner,
 )
+from dmr_iq_surveyor.geo.emitters import EMITTER_SHADOWING_CORRELATION_M, solve_emitters
 from dmr_iq_surveyor.geo.export import to_gpx, to_kml
 from dmr_iq_surveyor.geo.locate import (
     connect_locate_database,
@@ -47,7 +48,7 @@ from dmr_iq_surveyor.geo.locate import (
     record_target_gain,
 )
 from dmr_iq_surveyor.geo.measurements import MeasurementSettings
-from dmr_iq_surveyor.geo.model import SolveSettings
+from dmr_iq_surveyor.geo.model import SolveSettings, bearing_deg, haversine_m
 from dmr_iq_surveyor.geo.pipeline import (
     VALIDATION_NOTE,
     build_map_geojson,
@@ -425,6 +426,35 @@ def _fix_age_seconds(value: Any) -> float | None:
     return min(max(age, 0.0), _MAX_REPORTED_FIX_AGE_S)
 
 
+def _target_in_bin(info: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+    """Whether one drive bin heard the Locate target, and how loud.
+
+    The same nearest-within-tolerance match `materialise_emitter_measurements`
+    makes later, on the observations the bin just wrote, so the HUD says what
+    the solve will read. The level is excess S/N, the emitter default, with
+    the Phase 7 `snr_db` as the fallback a run without it would also use.
+    For an intermittent target "not heard" may only mean it was off, and the
+    flag says so.
+    """
+    best = None
+    best_error = float("inf")
+    for level in info.get("levels") or []:
+        error = abs(float(level["frequency_hz"]) - float(target["frequency_hz"]))
+        if error <= float(target["tolerance_hz"]) and error < best_error:
+            best, best_error = level, error
+    heard = best is not None
+    return {
+        "survey_run_id": info.get("survey_run_id"),
+        "heard": heard,
+        "level_db": (
+            None if best is None
+            else best["excess_snr_db"] if best.get("excess_snr_db") is not None
+            else best["snr_db"]
+        ),
+        "absence_is_evidence": heard or target.get("emission") != "intermittent",
+    }
+
+
 class FieldService:
     """Stateful glue between HTTP requests and the analysis pipeline."""
 
@@ -496,6 +526,10 @@ class FieldService:
         # every two-second poll from the phone.
         self._live_cc_index: list[tuple[float, str]] = []
         self._live_cc_tolerance_hz: float = 6_250.0
+        # The Locate target the running (or last) drive measured, and how
+        # many of its bins heard it. None for a drive without a target.
+        self._live_target: dict[str, Any] | None = None
+        self._live_target_counts: dict[str, int] = {"heard": 0, "not_heard": 0}
         # Which receiver the fix in `_live_fix` came from.
         self._live_fix_source: str | None = None
         # The Pi's own GNSS receiver, when one is configured. Started here so
@@ -510,6 +544,11 @@ class FieldService:
         # None until one is chosen, and after every restart: the service then
         # writes into its startup campaign, exactly as before Locate existed.
         self._locate_active: dict[str, Any] | None = None
+        # The last Locate solve of this process (regions, plan), and whether
+        # one is running. Held in memory: the solution itself is stored in
+        # `emitter_solutions`, and `locate_result` falls back to it.
+        self._locate_result: dict[str, Any] | None = None
+        self._locate_solving = False
         # The radio a calibration opens. A seam for tests, exactly like the
         # one `LiveSession` takes; in the field it is the real SDRplay.
         self.calibration_device_factory: Callable[[], IqDevice] = SoapyIqDevice
@@ -960,7 +999,7 @@ class FieldService:
             "tiles_via_pi": self.tile_cache is not None,
             "calibration": self.last_calibration(),
             "gnss": self.gnss_status(),
-            "locate": {"active": self.locate_active()},
+            "locate": self.locate_state(),
         }
 
     def geojson(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
@@ -1831,9 +1870,14 @@ class FieldService:
             adaptive_bin_size=bool(
                 given.get("adaptive_bin_size", self.settings.live_adaptive_bins)
             ),
+            # A Locate drive spreads its windows over each bin's span, as
+            # Phase 8 Stage 3.3 recommends for field drives; every other
+            # drive keeps the configured default.
             spread_windows_over_bin=bool(
                 given.get(
-                    "spread_windows_over_bin", self.settings.live_spread_windows_over_bin
+                    "spread_windows_over_bin",
+                    True if self.locate_active() is not None
+                    else self.settings.live_spread_windows_over_bin,
                 )
             ),
             fft_size=int(given.get("fft_size", self.settings.live_fft_size)),
@@ -1878,12 +1922,24 @@ class FieldService:
                 "holds_written": session.stats.holds_written if session else 0,
             }
             payload["pull_over"] = self._pull_over_hint(running)
+            payload["target"] = self._live_target_status()
         payload["position_age_seconds"] = self.live_position_age_seconds()
         with self._live_lock:
             payload["position_source"] = self._live_fix_source
         payload["gnss"] = self.gnss_status()
         payload["job"] = job.snapshot() if job is not None else None
         return payload
+
+    def _live_target_status(self) -> dict[str, Any] | None:
+        """The Locate target's line on the drive HUD. Caller holds `_live_lock`."""
+        target = self._live_target
+        if target is None:
+            return None
+        last = next(
+            (entry.get("target") for entry in reversed(self._live_bins) if "target" in entry),
+            None,
+        )
+        return {**target, **self._live_target_counts, "last_bin": last}
 
     def _pull_over_hint(self, running: bool) -> dict[str, Any]:
         """Whether the last bin suggests a longer, stationary measurement here.
@@ -1905,11 +1961,19 @@ class FieldService:
         if not near:
             return empty
         sites: dict[str, float] = {}
+        target = self._live_target
         for entry in near:
             frequency = float(entry["frequency_hz"])
             for cc_hz, site_key in self._live_cc_index:
                 if abs(cc_hz - frequency) <= self._live_cc_tolerance_hz:
                     sites[site_key] = max(sites.get(site_key, -99.0), float(entry["p95_snr_db"]))
+            # The Locate target counts like a registry control channel: it is
+            # the one channel this drive exists to measure.
+            if target is not None and abs(target["frequency_hz"] - frequency) <= target[
+                "tolerance_hz"
+            ]:
+                key = str(target["emitter_key"])
+                sites[key] = max(sites.get(key, -99.0), float(entry["p95_snr_db"]))
         if not sites:
             return {**empty, "channels": len(near),
                     "reason": f"{len(near)} channel(s) near threshold, none a registry control channel"}
@@ -2053,6 +2117,18 @@ class FieldService:
                     self._live_hold_request = None
                     self._live_cc_index = cc_index
                     self._live_cc_tolerance_hz = float(band.comparison.frequency_tolerance_hz)
+                    # The Locate target this drive measures for, fixed for the
+                    # drive: the target cannot change while a job runs.
+                    target = self._locate_active
+                    self._live_target = (
+                        None if target is None else {
+                            "emitter_key": target["emitter_key"],
+                            "frequency_hz": float(target["frequency_hz"]),
+                            "tolerance_hz": float(target["tolerance_hz"]),
+                            "emission": target["emission"],
+                        }
+                    )
+                    self._live_target_counts = {"heard": 0, "not_heard": 0}
 
                 def work(job: Job) -> dict[str, Any]:
                     return self._run_live(
@@ -2097,6 +2173,11 @@ class FieldService:
 
         def on_bin(info: dict[str, Any]) -> None:
             with self._live_lock:
+                target = self._live_target
+                if target is not None:
+                    info["target"] = _target_in_bin(info, target)
+                    counts = self._live_target_counts
+                    counts["heard" if info["target"]["heard"] else "not_heard"] += 1
                 self._live_bins.append(info)
                 self._live_pending_runs.append(info["survey_run_id"])
                 written = len(self._live_bins)
@@ -2158,6 +2239,19 @@ class FieldService:
                 run_ids=pending,
                 scope=self._scope(),
             )
+        with self._live_lock:
+            locate_drive = self._live_target is not None
+        if locate_drive:
+            # A Locate drive is solved as an emitter, when the operator asks
+            # (`request_locate_solve`). A Phase 7 site solve here would only
+            # cost the Pi minutes for a map the Locate screen does not show.
+            return {
+                "session_id": session_id,
+                "live": stats.to_dict(),
+                "settings": live.to_dict(),
+                "elapsed_seconds": round(time.monotonic() - started, 1),
+                "solutions": 0,
+            }
         report = self._solve(
             job, progress_from=0.96, progress_to=0.99,
             settings=self.field_solve_settings(),
@@ -2495,6 +2589,181 @@ class FieldService:
             self._live_pending_runs = []
             self._live_stats = {}
             self._live_last_solve = None
+            self._live_target = None
+            self._live_target_counts = {"heard": 0, "not_heard": 0}
+            self._locate_result = None
+
+    def locate_state(self) -> dict[str, Any]:
+        """The small Locate block of `/api/state`; the regions are on `/api/locate/result`."""
+        with self._live_lock:
+            result = self._locate_result
+            return {
+                "active": dict(self._locate_active) if self._locate_active else None,
+                "solving": self._locate_solving,
+                "solved_at_utc": result["solved_at_utc"] if result else None,
+            }
+
+    def _locate_solve_settings(self) -> SolveSettings:
+        """The field grid, with the emitter default for shared shadowing."""
+        return replace(
+            self.field_solve_settings(), shadowing_correlation_m=EMITTER_SHADOWING_CORRELATION_M
+        )
+
+    def request_locate_solve(self, view: ViewScope = CURRENT_VIEW) -> dict[str, Any]:
+        """Solve the active target now, on the operator's word.
+
+        During a drive it runs on a side thread, exactly as `request_live_solve`
+        does, so the SDR keeps being read; otherwise it is an ordinary job.
+        Either way it is `solve_emitters` for this one target and its campaign,
+        with the plan, and nothing else.
+        """
+        refuse_if_read_only(view, "solving", self.settings.capture_campaign_id)
+        active = self.locate_active()
+        if active is None:
+            raise ValueError("choose a frequency to locate first")
+        with self._live_lock:
+            if self._locate_solving:
+                return {"started": False, "reason": "a solve is already running"}
+            self._locate_solving = True
+        try:
+            running = self.jobs.active_job()
+            if running is not None and running.kind == "live":
+                threading.Thread(
+                    target=self._locate_solve, args=(active, None),
+                    name="locate-solve", daemon=True,
+                ).start()
+                return {"started": True, "during_drive": True, "job_id": None, "reason": ""}
+            job = self.jobs.submit(
+                kind="solve",
+                label=f"locate {active['frequency_hz'] / 1e6:.6f} MHz",
+                work=lambda job: self._locate_solve(active, job),
+            )
+        except BaseException:
+            with self._live_lock:
+                self._locate_solving = False
+            raise
+        return {"started": True, "during_drive": False, "job_id": job.job_id, "reason": ""}
+
+    def _locate_solve(self, active: dict[str, Any], job: Job | None) -> dict[str, Any]:
+        try:
+            if job is not None:
+                job.emit("solve", f"solving {active['emitter_key']}", progress=0.05)
+            report = solve_emitters(
+                database_path=self.settings.database_path,
+                output_root=Path(self.settings.output_root).expanduser().resolve() / "emitters",
+                emitter_keys=[active["emitter_key"]],
+                scope=CampaignScope(active["campaign_id"]),
+                settings=self._locate_solve_settings(),
+                plan=True,
+            )
+            result = self._locate_result_from(active, report)
+            with self._live_lock:
+                self._locate_result = result
+            if job is not None:
+                job.emit("solve", f"status {result['solution']['status']}", progress=0.99)
+            return result
+        except Exception as exc:
+            if job is not None:
+                raise
+            # A side-thread solve has no job to fail; the drive must go on.
+            with self._live_lock:
+                self._locate_result = {
+                    "emitter_key": active["emitter_key"],
+                    "campaign_id": active["campaign_id"],
+                    "solved_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "solution": None, "regions": None, "plan": None,
+                }
+            return {}
+        finally:
+            with self._live_lock:
+                self._locate_solving = False
+
+    def _locate_result_from(
+        self, active: dict[str, Any], report: dict[str, Any]
+    ) -> dict[str, Any]:
+        solution = report["solutions"][0]
+        with self._locate_connection() as connection:
+            stored = connection.execute(
+                """
+                SELECT s.geojson FROM emitter_solutions s
+                JOIN emitter_targets t ON t.emitter_id = s.emitter_id
+                WHERE s.solve_batch_id = ? AND t.emitter_key = ?
+                """,
+                (report["solve_batch_id"], active["emitter_key"]),
+            ).fetchone()
+        plan = report.get("plan") or {}
+        mode = (solution.get("mode_latitude"), solution.get("mode_longitude"))
+        stops = []
+        for stop in plan.get("top_stops", []):
+            entry = dict(stop)
+            if mode[0] is not None and mode[1] is not None:
+                # For a sentence like "measure north-east of the area": where
+                # the stop lies as seen from the most likely cell.
+                entry["bearing_from_mode_deg"] = round(
+                    bearing_deg(mode[0], mode[1], stop["latitude"], stop["longitude"]), 1
+                )
+                entry["distance_from_mode_m"] = round(
+                    haversine_m(mode[0], mode[1], stop["latitude"], stop["longitude"])
+                )
+            stops.append(entry)
+        return {
+            "emitter_key": active["emitter_key"],
+            "campaign_id": active["campaign_id"],
+            "solve_batch_id": report["solve_batch_id"],
+            "solved_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+            "error": None,
+            "solution": solution,
+            "regions": json.loads(stored["geojson"]) if stored is not None else None,
+            "plan": {
+                "status": plan.get("status"),
+                "reason": plan.get("reason", ""),
+                "top_stops": stops,
+                "geojson": plan.get("geojson"),
+            },
+            "report_dir": report.get("output_dir"),
+        }
+
+    def locate_result(self) -> dict[str, Any]:
+        """The last solve of the active target, or the last one stored for its campaign.
+
+        After a restart there is no plan in memory, but the solution and its
+        regions are in `emitter_solutions`, so the map is not empty.
+        """
+        active = self.locate_active()
+        with self._live_lock:
+            result = self._locate_result
+            solving = self._locate_solving
+        if active is None:
+            return {"active": None, "solving": solving, "result": None}
+        if result is None or result.get("campaign_id") != active["campaign_id"]:
+            result = None
+            with self._locate_connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT s.* FROM emitter_solutions s
+                    JOIN emitter_targets t ON t.emitter_id = s.emitter_id
+                    WHERE t.emitter_key = ? AND s.campaign_id = ?
+                    ORDER BY s.emitter_solution_id DESC LIMIT 1
+                    """,
+                    (active["emitter_key"], active["campaign_id"]),
+                ).fetchone()
+            if row is not None:
+                stored = dict(row)
+                result = {
+                    "emitter_key": active["emitter_key"],
+                    "campaign_id": active["campaign_id"],
+                    "solve_batch_id": stored["solve_batch_id"],
+                    "solved_at_utc": stored["solved_at"],
+                    "error": None,
+                    "solution": {
+                        key: value for key, value in stored.items() if key != "geojson"
+                    },
+                    "regions": json.loads(stored["geojson"] or "{}") or None,
+                    "plan": None,
+                    "report_dir": None,
+                }
+        return {"active": active, "solving": solving, "result": result}
 
     def _locate_calibration_targets(self, center_hz: float, sample_rate_hz: float) -> list[float]:
         """The active target, when this tuning can see it; else nothing."""

@@ -1,6 +1,6 @@
 # Phase 8 field app: "Locate" (design)
 
-Status: **approved 2026-11-12. PR 1 (section 4.1–4.5) implemented; PRs 2–4 to follow.**
+Status: **approved 2026-11-12. PRs 1–2 (section 4) implemented; PRs 3–4 to follow.**
 Mockup: [`mockups/field-app-locate.html`](mockups/field-app-locate.html), also published at
 <https://claude.ai/artifact/7yU3JPrZwgGRu1M1Mi5oBX> (private to the owner). Open it in a phone
 browser; every screen in section 3 can be clicked through.
@@ -120,7 +120,8 @@ heard after a silence or lost after hearing it ("נשמע שוב", "אבד"), wo
 
 ### 3.5 Advanced (per target, collapsed by default)
 
-Label; emission (continuous / intermittent, with the one-line consequence); tolerance;
+Label; emission (continuous / intermittent, with the one-line consequence); **channel
+bandwidth** (12.5 / 25 / 50 kHz, default 12.5; section 4.8); tolerance;
 centre frequency and sample rate (auto values shown, editable before the first measurement
 of a campaign only); gain (read-only after calibration); shadowing correlation (500 m,
 "1000 בשטח פתוח"); known position for validation (lat/lon or tap on map, and its source).
@@ -217,15 +218,42 @@ Each PR keeps every existing test passing unmodified, and `ruff` stays clean.
 
 1. **Server: targets, tuning, campaign switch, stored gain** (4.1–4.5), with tests for the
    switch rules and for a restart resuming a target at its gain.
-2. **Drive and result: the target's drive defaults and HUD, the solve endpoint, and a plan
-   for emitters** (4.6–4.7), with tests that `plan=False` is unchanged and that an
-   under-determined fit is not planned from.
+2. **Drive and result: the target's drive defaults and HUD, the solve endpoint, a plan
+   for emitters, and the channel bandwidth** (4.6–4.8), with tests that `plan=False` is
+   unchanged.
 3. **Front end: the new page** (section 3), with `/classic` unchanged.
 4. **Field procedure**: `FIELD-DRIVE-USB-GPS-AND-GAIN.md` rewritten around the new screen; the
    command-line route kept as the fallback.
 
 The first drive after PR 3 should be a validation drive against a transmitter with a known
 position (3.5), as Phase 8 §4.3 asks.
+
+### 4.8 Channel bandwidth (added 2026-11-12, owner's request)
+
+A target is declared with a channel bandwidth of 12.5, 25 or 50 kHz, default 12.5. It is
+fixed per campaign, like the gain and tuning: levels integrated over two widths are not
+comparable. Changing it is accepted only while the campaign holds no runs; "start over"
+opens a campaign with another.
+
+The generated profile scales its width-like values (scan step, integration width, the
+equivalent and 90 % width limits, merge tolerance, comparison tolerance, rasters) by the
+bandwidth over 12.5 kHz and leaves every SNR gate unchanged. At 12.5 kHz it is exactly the
+`uhf_469_narrow` profile. The emitter's match tolerance defaults to half the bandwidth.
+
+Why it is needed, measured on synthetic carriers through the real survey pipeline at
+469.35 MHz:
+
+| signal width | 12.5 kHz profile | its own profile |
+|---|---|---|
+| 8 kHz | one observation at the centre | (same profile) |
+| 16–20 kHz | one observation at the centre | one, at the centre |
+| 32–40 kHz | **split in two, 14 kHz either side: read as *not heard*** | one, at the centre |
+
+A wide carrier under the narrow profile becomes a non-detection beside the transmitter,
+which for a continuous emitter is false evidence pulling the region away from it. A test
+pins both rows of the last line. The SNR read through a wider profile is lower (the same
+power against more noise bandwidth), which is why the bandwidth cannot change inside a
+campaign.
 
 ## 7. Implemented in PR 1
 
@@ -257,7 +285,24 @@ Choices made while building it:
 `center_frequency_hz`, `sample_rate_hz` and `start_over`. It answers 400 with the reason
 when the target cannot be prepared, and 409 while a job runs or from a read-only view.
 
-Not in PR 1: the drive defaults and per-target HUD of 4.6, and the solve and plan of 4.7.
+## 7a. Implemented in PR 2
+
+- **Drive (4.6).** With a target chosen, a drive spreads its windows over each bin's span
+  unless the request says otherwise; other drives keep the configured default. Each bin
+  reports whether the target was heard and at what level (`_target_in_bin`: the same
+  nearest-within-tolerance match the emitter measurements make, on excess S/N), and
+  `/api/live` carries a `target` block with heard / not-heard counts and the last bin. The
+  pull-over hint names the target like a registry control channel. A Locate drive ends
+  without the Phase 7 site solve. The live session's bin callback gained an additive
+  `levels` list (centre, `snr_db`, `excess_snr_db` per observation) for this.
+- **Solve and plan (4.7).** `POST /api/locate/solve` runs `solve_emitters` for the active
+  target and its campaign on the field grid with L = 500 m and `plan=True`: during a drive
+  on a side thread, otherwise as a job. `GET /api/locate/result` returns the solution, its
+  regions (GeoJSON), the plan's top stops with their bearing and distance from the most
+  likely cell, and the plan as GeoJSON. After a restart it falls back to the stored
+  solution, without a plan. `solve_emitters(plan=False)` is unchanged; a test pins that the
+  plan changes no solution.
+- **Channel bandwidth (4.8).**
 
 ## 8. Open points
 

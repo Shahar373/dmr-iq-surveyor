@@ -251,3 +251,94 @@ def test_an_existing_database_upgrades_in_place(tmp_path: Path) -> None:
     assert tables <= upgraded and "locate_targets" in upgraded
     assert after.execute("SELECT COUNT(*) FROM p25_sites").fetchone()[0] == sites
     after.close()
+
+
+# -- channel bandwidth --------------------------------------------------------------
+
+
+def test_a_wider_channel_scales_the_widths_and_keeps_the_snr_gates() -> None:
+    narrow = band_profile_mapping("k", 469.35e6)
+    for bandwidth, scale in ((25_000.0, 2), (50_000.0, 4)):
+        wide = band_profile_mapping("k", 469.35e6, bandwidth)
+        for name in ("scan_step_hz", "integration_width_hz", "min_equivalent_width_hz",
+                     "min_width_90_hz", "max_width_90_hz", "merge_tolerance_hz"):
+            assert wide["detection"][name] == narrow["detection"][name] * scale, name
+        for name in ("min_p95_channel_snr_db", "min_average_channel_snr_db",
+                     "max_peak_to_channel_mean_db", "min_fill_ratio", "fill_threshold_db"):
+            assert wide["detection"][name] == narrow["detection"][name], name
+        assert wide["comparison"]["frequency_tolerance_hz"] == 6250 * scale
+        assert wide["name"] == f"target_k_bw{bandwidth / 1e3:g}k"
+    with pytest.raises(LocateError, match="bandwidth"):
+        band_profile_mapping("k", 469.35e6, 20_000.0)
+
+
+def test_a_target_carries_its_bandwidth_into_profile_and_tolerance(tmp_path: Path) -> None:
+    connection = _connection(tmp_path)
+    target = _prepare(connection, tmp_path, channel_bandwidth_hz=25_000)
+    assert target["channel_bandwidth_hz"] == 25_000.0
+    assert target["tolerance_hz"] == 12_500.0
+    assert target["band_profile_path"].endswith("target_f469_350000_bw25k.yaml")
+    # Resumed without saying, it keeps it.
+    assert _prepare(connection, tmp_path)["channel_bandwidth_hz"] == 25_000.0
+    # Changed before any run, it moves profile and tolerance together.
+    moved = _prepare(connection, tmp_path, channel_bandwidth_hz=50_000)
+    assert moved["tolerance_hz"] == 25_000.0
+    assert moved["band_profile_path"].endswith("_bw50k.yaml")
+    assert moved["campaign_id"] == target["campaign_id"]
+
+
+def test_a_campaign_with_runs_keeps_its_bandwidth_and_nothing_is_half_written(
+    tmp_path: Path,
+) -> None:
+    connection = _connection(tmp_path)
+    target = _prepare(connection, tmp_path, label="before")
+    _add_run(connection, target["campaign_id"])
+    with pytest.raises(LocateError, match="channel bandwidth"):
+        _prepare(connection, tmp_path, channel_bandwidth_hz=25_000, label="after")
+    kept = _prepare(connection, tmp_path)
+    assert kept["channel_bandwidth_hz"] == 12_500.0
+    assert kept["label"] == "before", "a refused change must not leave part of itself behind"
+    assert kept["tolerance_hz"] == 6_250.0
+    # Starting over is the way to a new bandwidth.
+    fresh = _prepare(connection, tmp_path, start_over=True, channel_bandwidth_hz=25_000)
+    assert fresh["campaign_id"].endswith("-2") and fresh["channel_bandwidth_hz"] == 25_000.0
+    assert _prepare(connection, tmp_path, start_over=True)["channel_bandwidth_hz"] == 25_000.0
+
+
+def test_a_wide_channel_is_heard_at_its_centre_only_with_its_own_profile(
+    tmp_path: Path,
+) -> None:
+    """Measured, not assumed: a ~40 kHz-wide carrier under the 12.5 kHz profile
+    is split into pieces away from its centre, so the target would read as
+    *not heard* beside the transmitter. Under the 50 kHz profile it is one
+    observation at the centre."""
+    from fixtures.live_profiles import write_profiles
+    from fixtures.synthetic import SyntheticTone, write_synthetic_iq_wav
+
+    from dmr_iq_surveyor.survey.pipeline import run_survey
+
+    _, site = write_profiles(tmp_path / "profiles", center_hz=469_250_000.0)
+    wav = tmp_path / "wide.wav"
+    write_synthetic_iq_wav(
+        wav, sample_rate_hz=1_000_000, center_frequency_hz=469_250_000, duration_seconds=3,
+        tones=[SyntheticTone(offset_hz=100_000, amplitude=0.05, modulation_bandwidth_hz=40_000)],
+    )
+
+    def centres(bandwidth: float) -> list[float]:
+        database = tmp_path / f"bw{bandwidth:g}.sqlite3"
+        run_survey(
+            wav, tmp_path / f"out{bandwidth:g}",
+            band=write_band_profile(tmp_path, "f469_350000", 469.35e6, bandwidth),
+            site=site, run_id=f"bw{bandwidth:g}", database_path=database,
+        )
+        with sqlite3.connect(database) as reader:
+            return [
+                row[0] - 469.35e6
+                for row in reader.execute("SELECT measured_center_hz FROM rf_observations")
+                if abs(row[0] - 469.35e6) < 60_000
+            ]
+
+    narrow = centres(12_500.0)
+    assert not [offset for offset in narrow if abs(offset) <= 6_250], narrow
+    wide = centres(50_000.0)
+    assert len(wide) == 1 and abs(wide[0]) <= 2_000, wide

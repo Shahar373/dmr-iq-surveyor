@@ -165,6 +165,7 @@ h2 { font-family: var(--font-display); font-weight: 600; font-size: 18px; margin
 .seg { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 .seg button { border: 0; background: transparent; padding: 10px; font-weight: 600; }
 .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
+.seg.seg3 { grid-template-columns: 1fr 1fr 1fr; }
 .auto { font-size: 12px; color: var(--accent); font-weight: 700; }
 details { border-top: 1px solid var(--line); padding-top: 10px; }
 summary { cursor: pointer; font-weight: 700; }
@@ -317,6 +318,15 @@ summary { cursor: pointer; font-weight: 700; }
           <button aria-pressed="false" data-emission="intermittent">לסירוגין</button>
         </div>
         <p class="hint" id="emission-hint">מקום שבו לא נשמע נחשב ראיה, וזה חלק חשוב מהתוצאה.</p>
+      </div>
+      <div class="field">
+        <span class="lab">רוחב ערוץ</span>
+        <div class="seg seg3" role="group" aria-label="רוחב ערוץ">
+          <button aria-pressed="true" data-bw><span class="num">12.5</span> kHz</button>
+          <button aria-pressed="false" data-bw><span class="num">25</span> kHz</button>
+          <button aria-pressed="false" data-bw><span class="num">50</span> kHz</button>
+        </div>
+        <p class="hint">אם לא בטוח, השאר <span class="num">12.5</span>. ננעל לקמפיין, כמו ההגבר.</p>
       </div>
       <div class="row2">
         <div class="field"><label for="adv-center">תדר מרכז <span class="auto">אוטומטי</span></label><input id="adv-center" class="num" value="469.250"></div>
@@ -509,6 +519,9 @@ summary { cursor: pointer; font-weight: 700; }
   $$(".chip").forEach(c => c.addEventListener("click", () => {
     $$(".chip").forEach(o => o.setAttribute("aria-pressed", String(o === c)));
     $("#freq-input").value = c.dataset.freq;
+  }));
+  $$("[data-bw]").forEach(b => b.addEventListener("click", () => {
+    $$("[data-bw]").forEach(o => o.setAttribute("aria-pressed", String(o === b)));
   }));
   $$("[data-emission]").forEach(b => b.addEventListener("click", () => {
     $$("[data-emission]").forEach(o => o.setAttribute("aria-pressed", String(o === b)));

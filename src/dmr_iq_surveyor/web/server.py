@@ -231,6 +231,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"gnss": self.service.gnss_status()})
             elif path == "/api/locate/targets":
                 self._send_json(self.service.locate_targets())
+            elif path == "/api/locate/result":
+                self._send_json(self.service.locate_result())
             elif path == "/api/export":
                 self._send_export((query.get("format") or ["geojson"])[0], view)
             elif path.startswith("/api/history/"):
@@ -285,6 +287,17 @@ class _Handler(BaseHTTPRequestHandler):
                 self._start(lambda: self.service.start_live(payload, view))
             elif path == "/api/calibrate/gain":
                 self._start(lambda: self.service.start_gain_calibration(payload, view))
+            elif path == "/api/locate/solve":
+                try:
+                    started = self.service.request_locate_solve(view)
+                except ReadOnlyViewError:
+                    raise
+                except ValueError as exc:
+                    self._send_error_json(400, str(exc))
+                except RuntimeError as exc:
+                    self._send_error_json(409, str(exc))
+                else:
+                    self._send_json(started, status=202 if started["started"] else 200)
             elif path == "/api/locate/target":
                 try:
                     chosen = self.service.select_locate_target(payload, view)

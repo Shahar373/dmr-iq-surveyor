@@ -1048,6 +1048,21 @@ class LiveSession:
                     "longitude": longitude,
                     "windows": visit.window_count,
                     "observations": len(detection["observations"]),
+                    # What each observation's centre and level were, so a
+                    # caller tracking one frequency (the field app's Locate
+                    # HUD) can say "heard, 14 dB" without a database read.
+                    # Additive; nothing that read this dict before reads it.
+                    "levels": [
+                        {
+                            "frequency_hz": float(observation.measured_center_hz),
+                            "snr_db": round(float(observation.snr_db), 1),
+                            "excess_snr_db": (
+                                None if observation.excess_snr_db is None
+                                else round(float(observation.excess_snr_db), 1)
+                            ),
+                        }
+                        for observation in detection["observations"]
+                    ],
                     "near_threshold": detection.get("near_threshold", []),
                     "spread_m": round(spread, 1),
                     "bins_written": self.stats.bins_written,

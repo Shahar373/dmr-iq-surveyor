@@ -80,7 +80,9 @@ def test_choosing_a_target_switches_campaign_tuning_profile_and_gain(tmp_path: P
 def test_without_a_target_nothing_changes(tmp_path: Path) -> None:
     service = _service(tmp_path)
     try:
-        assert service.state()["locate"] == {"active": None}
+        assert service.state()["locate"] == {
+            "active": None, "solving": False, "solved_at_utc": None
+        }
         assert service.settings.capture_campaign_id == "startup_round"
         assert service.settings.band == "central_800"
         assert service.locate_targets() == {"active": None, "targets": []}
@@ -266,6 +268,11 @@ def test_the_locate_endpoints_choose_list_and_refuse(tmp_path: Path, monkeypatch
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         assert _call(base, "/api/locate/targets") == (200, {"active": None, "targets": []})
+        status, refused = _call(base, "/api/locate/solve", {})
+        assert status == 400 and "frequency to locate" in refused["error"]
+        assert _call(base, "/api/locate/result") == (
+            200, {"active": None, "solving": False, "result": None}
+        )
 
         status, answer = _call(base, "/api/locate/target", {"frequency_mhz": 469.35})
         assert status == 200, answer
@@ -379,5 +386,154 @@ def test_a_drive_after_choosing_a_target_writes_into_its_campaign(
             connection.close()
         assert {row[0] for row in rows} == {active["campaign_id"]}
         assert {row[1] for row in rows} == {"target_f469_350000"}
+
+        # The HUD line: noise only, so every bin looked and did not hear it.
+        hud = service.live_status()["target"]
+        assert hud["emitter_key"] == "f469_350000"
+        assert hud["not_heard"] == len(written) and hud["heard"] == 0
+        assert hud["last_bin"]["heard"] is False
+        # A Locate drive leaves solving to the operator: no Phase 7 site solve.
+        assert job.snapshot()["result"]["solutions"] == 0
+    finally:
+        service.close()
+
+
+# -- stage 2: the drive HUD, the solve and the plan ---------------------------------
+
+_TX_HZ = 867_612_500.0
+_STOPS = [
+    (32.045, 34.795), (32.056, 34.806), (32.041, 34.809), (32.059, 34.791),
+    (32.020, 34.760), (32.085, 34.770), (32.075, 34.855), (32.015, 34.850),
+    (31.950, 34.700), (32.200, 34.700), (32.200, 34.950), (31.950, 34.950),
+]
+
+
+def _seed_target_campaign(tmp_path: Path, campaign_id: str) -> None:
+    """Twelve stops around a transmitter, written into the target's campaign."""
+    from fixtures.geo_scenario import Transmitter, seed_run
+
+    from dmr_iq_surveyor.geo.store import connect_geo_database
+
+    transmitter = Transmitter(_TX_HZ, 32.050, 34.800, reference_level_db=30.0)
+    connection = connect_geo_database(tmp_path / "db.sqlite3")
+    try:
+        for index, (latitude, longitude) in enumerate(_STOPS):
+            seed_run(
+                connection, run_id=f"loc_{index:02d}", latitude=latitude,
+                longitude=longitude, transmitters=[transmitter],
+                capture_start_utc=f"2026-11-01T{8 + index:02d}:00:00+00:00",
+                campaign_id=campaign_id,
+            )
+    finally:
+        connection.close()
+
+
+def test_a_solve_needs_a_target(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="frequency to locate"):
+            service.request_locate_solve()
+        assert service.locate_result() == {"active": None, "solving": False, "result": None}
+    finally:
+        service.close()
+
+
+def test_a_solve_gives_regions_status_and_where_to_go_next(tmp_path: Path) -> None:
+    service = _service(tmp_path, solve_resolution_m=1_000.0, solve_max_cells=3_000)
+    try:
+        active = service.select_locate_target({"frequency_hz": _TX_HZ})["active"]
+        _seed_target_campaign(tmp_path, active["campaign_id"])
+        started = service.request_locate_solve()
+        assert started["started"] is True and started["during_drive"] is False
+        snapshot = _wait(service.jobs.get(started["job_id"]), 300.0)
+        assert snapshot["status"] == "succeeded", snapshot
+
+        answer = service.locate_result()
+        result = answer["result"]
+        assert answer["solving"] is False
+        assert result["campaign_id"] == active["campaign_id"]
+        solution = result["solution"]
+        assert solution["detection_count"] + solution["non_detection_count"] == len(_STOPS)
+        assert solution["status"] in {"ok", "unbounded_region", "weak_geometry"}
+        assert result["regions"]["type"] == "FeatureCollection"
+        plan = result["plan"]
+        assert plan["status"] is not None
+        for stop in plan["top_stops"]:
+            assert 0.0 <= stop["bearing_from_mode_deg"] < 360.0
+            assert stop["distance_from_mode_m"] >= 0
+        assert service.locate_state()["solved_at_utc"] == result["solved_at_utc"]
+    finally:
+        service.close()
+
+    # After a restart there is no plan in memory, but the stored solution is shown.
+    restarted = _service(tmp_path, build=False)
+    try:
+        restarted.select_locate_target({"frequency_hz": _TX_HZ})
+        stored = restarted.locate_result()["result"]
+        assert stored["solution"]["status"] == solution["status"]
+        assert stored["regions"] is not None and stored["plan"] is None
+    finally:
+        restarted.close()
+
+
+def test_the_emitter_plan_is_opt_in_and_changes_no_solution(tmp_path: Path) -> None:
+    from dmr_iq_surveyor.geo.emitters import solve_emitters
+    from dmr_iq_surveyor.geo.model import SolveSettings
+    from dmr_iq_surveyor.survey.scope import CampaignScope
+
+    service = _service(tmp_path)
+    try:
+        active = service.select_locate_target({"frequency_hz": _TX_HZ})["active"]
+    finally:
+        service.close()
+    _seed_target_campaign(tmp_path, active["campaign_id"])
+    coarse = SolveSettings(
+        resolution_m=1_000.0, coarse_resolution_m=3_000.0, max_coarse_cells=3_000,
+        max_fine_cells=3_000, target_fine_cells=1_000, shadowing_correlation_m=500.0,
+    )
+    common = {
+        "database_path": tmp_path / "db.sqlite3", "settings": coarse,
+        "scope": CampaignScope(active["campaign_id"]),
+    }
+    without = solve_emitters(solve_batch_id="a", **common)
+    with_plan = solve_emitters(solve_batch_id="b", plan=True, **common)
+    assert "plan" not in without
+    assert with_plan["plan"]["status"] in {"ok", "no_targets"}
+    assert "geojson" in with_plan["plan"]
+    ignore = {"solve_batch_id", "solved_at", "emitter_solution_id"}
+    first, second = without["solutions"][0], with_plan["solutions"][0]
+    assert {k: v for k, v in first.items() if k not in ignore} == {
+        k: v for k, v in second.items() if k not in ignore
+    }
+
+
+def test_a_bin_reports_the_target_heard_with_its_level_or_not_heard() -> None:
+    from dmr_iq_surveyor.web.service import _target_in_bin
+
+    target = {"frequency_hz": 469.35e6, "tolerance_hz": 6_250.0, "emission": "continuous"}
+    levels = [
+        {"frequency_hz": 469.30e6, "snr_db": 30.0, "excess_snr_db": 29.9},
+        {"frequency_hz": 469.3510e6, "snr_db": 15.2, "excess_snr_db": 14.1},
+    ]
+    heard = _target_in_bin({"survey_run_id": "b1", "levels": levels}, target)
+    assert heard == {"survey_run_id": "b1", "heard": True, "level_db": 14.1,
+                     "absence_is_evidence": True}
+    silent = _target_in_bin({"survey_run_id": "b2", "levels": levels[:1]}, target)
+    assert silent["heard"] is False and silent["level_db"] is None
+    bursty = _target_in_bin({"levels": []}, {**target, "emission": "intermittent"})
+    assert bursty["absence_is_evidence"] is False
+
+
+def test_a_target_drive_spreads_its_windows_and_others_keep_the_default(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    try:
+        assert service.live_settings({}).spread_windows_over_bin is False
+        service.select_locate_target({"frequency_mhz": 469.35})
+        assert service.live_settings({}).spread_windows_over_bin is True
+        assert service.live_settings(
+            {"spread_windows_over_bin": False}
+        ).spread_windows_over_bin is False
     finally:
         service.close()
