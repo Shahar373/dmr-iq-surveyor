@@ -233,7 +233,7 @@ clips each bin at zero (`mean(max(avg − noise, 0))`), while the conversion ass
 `mean(avg − noise)`. Clipping can only raise the measured excess, so a channel at the gate could read
 above the converted level. Measured by synthesising a flat ~8 kHz carrier plus noise and passing it
 through `accumulate_segment_spectrum` and `observations_from_segments` unchanged (12–30 trials per
-level, `central_800_narrow` detection settings):
+level, `central_800_narrow` detection settings; `scripts/measure_censor_level.py`):
 
 | regime | clipped bins | excess at the `(S+N)/N` = 4 dB gate (converted level 1.80 dB) |
 |---|---:|---|
@@ -248,7 +248,8 @@ average therefore sits ~1.44× above the floor and is seldom clipped. The mismat
 neighbouring carriers lift that median.
 
 What a censor level that is too low costs, measured with the `geo calibrate` engine (40 trials,
-test-grade grid, model L = 500 m, the solver told a censor level Δ below the simulated threshold):
+test-grade grid, model L = 500 m, the solver told a censor level Δ below the simulated threshold;
+`scripts/calibrate_censor_offset.py`):
 
 | scenario | 90 % coverage, Δ = 0 / 0.5 / 1.5 / 3 dB | median mode error, Δ = 0 / 0.5 / 1.5 / 3 dB |
 |---|---|---|
