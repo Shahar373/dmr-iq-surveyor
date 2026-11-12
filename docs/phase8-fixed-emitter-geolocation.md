@@ -228,6 +228,47 @@ occupancy-gated level for an intermittent emitter: it is measured while the emit
 Still open for intermittent emitters: a dwell long enough that a non-detection can be admitted as
 evidence.
 
+**Is the converted censor level on the measured scale?** (Review of 2026-11-12.) `excess_snr_db`
+clips each bin at zero (`mean(max(avg − noise, 0))`), while the conversion assumes the unclipped
+`mean(avg − noise)`. Clipping can only raise the measured excess, so a channel at the gate could read
+above the converted level. Measured by synthesising a flat ~8 kHz carrier plus noise and passing it
+through `accumulate_segment_spectrum` and `observations_from_segments` unchanged (12–30 trials per
+level, `central_800_narrow` detection settings):
+
+| regime | clipped bins | excess at the `(S+N)/N` = 4 dB gate (converted level 1.80 dB) |
+|---|---:|---|
+| live window, 24 frames, quiet band | 3–4 % | 1.80 dB; clipping adds ≤ 0.015 dB at any level |
+| offline segment, 151 frames | 0 % | identical to unclipped |
+| 4 frames (not a shipped setting) | ~20 % | 1.94 dB (+0.14) |
+| neighbouring carriers filling the 200 kHz noise window | ~55 % | 2.29 dB (+0.45–0.5) |
+
+Clipping rarely bites because the local noise floor is the mean of per-frame *medians* in dB, about
+1.6 dB below the mean noise power (the median of an exponential is ln 2 of its mean). A noise bin's
+average therefore sits ~1.44× above the floor and is seldom clipped. The mismatch is real only where
+neighbouring carriers lift that median.
+
+What a censor level that is too low costs, measured with the `geo calibrate` engine (40 trials,
+test-grade grid, model L = 500 m, the solver told a censor level Δ below the simulated threshold):
+
+| scenario | 90 % coverage, Δ = 0 / 0.5 / 1.5 / 3 dB | median mode error, Δ = 0 / 0.5 / 1.5 / 3 dB |
+|---|---|---|
+| random, 16 stops, ~5 unheard | 98 / 100 / 100 / 100 % | 666 / 694 / 724 / 742 m |
+| ring, 12 stops, ~6 unheard | 93 / 93 / 93 / 93 % | 1,161 / 1,196 / 1,324 / 1,296 m |
+| drive, 40 bins @ 150 m, ~12 unheard, true L 500 m | 95 / 95 / 95 / 95 % | 3,741 / 3,904 / 3,692 / 3,548 m |
+
+Regions stay honest; a too-low censor level widens them slightly. The stationary random layout's
+mode error grows monotonically, by ~4 % per 0.5 dB. At the ≤ 0.015 dB of a quiet band this is nil,
+so the conversion is **not changed**. Runs whose excess is derived from `snr_db` use the unclipped
+formula. They differ from new runs by the same ≤ 0.015 dB in a quiet band, which is far less than
+the max-over-windows bias they are already flagged for (`level_derived_from_snr_db`).
+
+The same measurement found a larger gap, with a different cause. The `(S+N)/N` gate is not what
+decides detection near threshold. The shape checks (fill ratio, equivalent width) are, so the 50 %
+detection point falls at a measured excess of ~3–4 dB in the live regime, 1–2 dB above the
+converted level. It applies equally to the `snr_db` path. By the table above it costs up to ~10 %
+of mode error and no coverage. Calibrating the censor level to a measured detection curve is a
+candidate Stage 3 item, not yet done.
+
 #### 3.2 Where a measurement was taken — implemented
 
 **Fix age.** The page now sends `fix_age_s` = `Date.now() − fix.timestamp`, two readings of the
