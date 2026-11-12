@@ -233,9 +233,10 @@ class SolveSettings:
     # the grid size, the same discipline the IQ stages use for sample data.
     chunk_cells: int = 65_536
     # Upper bound on the elements of the largest temporary array the
-    # solver builds (cells x non-detections x reference levels). The
-    # cell chunk is derived from this, so peak memory is set by one
-    # number rather than varying with how many non-detections a site has.
+    # solver builds: (cells x reference levels) or (cells x measurements),
+    # whichever is wider. The cell chunk is derived from this, so peak
+    # memory is set by one number rather than varying with how many
+    # measurements a site has.
     max_working_elements: int = 4_000_000
     # Decorrelation distance of shadow fading assumed by the likelihood
     # (Phase 8, Stage 4). 0 -- the default, and what every Phase 7 solve

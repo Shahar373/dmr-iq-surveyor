@@ -274,13 +274,18 @@ def _evaluate_grid(
         float(np.sum(detection_weights)) if detection_weights is not None else detection_count
     )
 
-    # The largest temporary is (cells x offsets): censored measurements are
-    # accumulated one at a time rather than broadcast into a three-axis
-    # array, which keeps peak memory independent of how many of them a site
-    # has, at identical total arithmetic. The offset count is the same for
-    # every sigma -- only the window WIDTH scales -- so the chunk size does
-    # not depend on which sigma is being evaluated.
-    per_cell_elements = max(1, settings.reference_level_samples)
+    # Censored measurements are accumulated one at a time rather than
+    # broadcast into a three-axis array, so no temporary is (cells x
+    # non-detections x offsets). Two kinds remain: (cells x offsets) -- the
+    # offset count is the same for every sigma, only the window WIDTH scales
+    # -- and (cells x measurements): the distance ratios, the fitted levels,
+    # the residuals and the censored shifts. The second kind grows with the
+    # measurement count, so the chunk is sized by whichever is larger; sized
+    # by the offsets alone, a 5,000-measurement solve built 65,536 x 5,000
+    # arrays (~2.6 GB each). Per-cell results do not depend on the chunk.
+    per_cell_elements = max(
+        1, settings.reference_level_samples, detection_count + censored_count
+    )
     chunk = int(
         min(settings.chunk_cells, max(1, settings.max_working_elements // per_cell_elements))
     )
@@ -504,8 +509,24 @@ def _positional_terms(
     return marginal, peak, offsets[argument], best_level
 
 
+# Pairs further apart than this many correlation lengths are skipped when the
+# shadowing weights are summed. Each would add exp(-40) ~ 4e-18 to a sum that
+# is at least 1 (the measurement's own term), so even a million of them change
+# a weight by less than 5e-12 relative -- below anything the solver can see.
+SHADOWING_CUTOFF_CORRELATION_LENGTHS = 40.0
+# Upper bound on the (rows x columns) block of pairwise distances evaluated at
+# once: 2^20 float64 elements is 8 MB per temporary, whatever the measurement
+# count. The previous dense form built N x N x 2 plus two N x N arrays, ~1 GB
+# at 5,000 measurements.
+SHADOWING_BLOCK_ELEMENTS = 1 << 20
+
+
 def shadowing_weights(
-    east: np.ndarray, north: np.ndarray, correlation_m: float
+    east: np.ndarray,
+    north: np.ndarray,
+    correlation_m: float,
+    *,
+    block_elements: int = SHADOWING_BLOCK_ELEMENTS,
 ) -> np.ndarray | None:
     """Per-measurement weights for spatially correlated shadow fading.
 
@@ -514,13 +535,54 @@ def shadowing_weights(
     stops on top of each other each get ~1/k, so together they count as one.
     `None` when correlation is not modelled, which callers treat as the
     original unweighted likelihood.
+
+    Memory is bounded: the sums are taken in row blocks of at most
+    `block_elements` pairs (or one row, if a single row is wider), never as a
+    full N x N matrix. Points are sorted by east so each block only visits
+    the columns within `SHADOWING_CUTOFF_CORRELATION_LENGTHS` correlation
+    lengths in east; the pairs skipped that way are numerically nil (see the
+    constant). Within the visited columns every pair is summed exactly.
     """
     if correlation_m <= 0:
         return None
-    points = np.column_stack([np.asarray(east, dtype=float), np.asarray(north, dtype=float)])
-    deltas = points[:, None, :] - points[None, :, :]
-    distances = np.hypot(deltas[..., 0], deltas[..., 1])
-    return 1.0 / np.exp(-distances / correlation_m).sum(axis=1)
+    if block_elements < 1:
+        raise ValueError("block_elements must be at least 1")
+    x = np.asarray(east, dtype=float).reshape(-1)
+    y = np.asarray(north, dtype=float).reshape(-1)
+    count = x.size
+    if count == 0:
+        return np.empty(0, dtype=np.float64)
+    order = np.argsort(x, kind="stable")
+    sorted_x, sorted_y = x[order], y[order]
+    cutoff = SHADOWING_CUTOFF_CORRELATION_LENGTHS * float(correlation_m)
+    first_column = np.searchsorted(sorted_x, sorted_x - cutoff, side="left")
+    end_column = np.searchsorted(sorted_x, sorted_x + cutoff, side="right")
+
+    sums = np.empty(count, dtype=np.float64)
+    start = 0
+    while start < count:
+        # As many rows as fit the budget given the first row's window; halve
+        # until the block's actual window (which widens with each extra row)
+        # fits too. One row always fits within `count` columns.
+        rows = max(1, block_elements // int(end_column[start] - first_column[start]))
+        stop = min(count, start + rows)
+        while stop - start > 1 and (stop - start) * int(
+            end_column[stop - 1] - first_column[start]
+        ) > block_elements:
+            stop = start + (stop - start) // 2
+        low, high = int(first_column[start]), int(end_column[stop - 1])
+        distances = np.hypot(
+            sorted_x[start:stop, None] - sorted_x[None, low:high],
+            sorted_y[start:stop, None] - sorted_y[None, low:high],
+        )
+        np.divide(distances, -float(correlation_m), out=distances)
+        np.exp(distances, out=distances)
+        sums[start:stop] = distances.sum(axis=1)
+        start = stop
+
+    weights = np.empty(count, dtype=np.float64)
+    weights[order] = 1.0 / sums
+    return weights
 
 
 # Suspect-stop check (Phase 8, Stage 4.2). The Gaussian likelihood absorbs a

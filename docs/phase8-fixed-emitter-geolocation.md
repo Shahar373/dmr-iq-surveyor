@@ -228,6 +228,48 @@ occupancy-gated level for an intermittent emitter: it is measured while the emit
 Still open for intermittent emitters: a dwell long enough that a non-detection can be admitted as
 evidence.
 
+**Is the converted censor level on the measured scale?** (Review of 2026-11-12.) `excess_snr_db`
+clips each bin at zero (`mean(max(avg − noise, 0))`), while the conversion assumes the unclipped
+`mean(avg − noise)`. Clipping can only raise the measured excess, so a channel at the gate could read
+above the converted level. Measured by synthesising a flat ~8 kHz carrier plus noise and passing it
+through `accumulate_segment_spectrum` and `observations_from_segments` unchanged (12–30 trials per
+level, `central_800_narrow` detection settings; `scripts/measure_censor_level.py`):
+
+| regime | clipped bins | excess at the `(S+N)/N` = 4 dB gate (converted level 1.80 dB) |
+|---|---:|---|
+| live window, 24 frames, quiet band | 3–4 % | 1.80 dB; clipping adds ≤ 0.015 dB at any level |
+| offline segment, 151 frames | 0 % | identical to unclipped |
+| 4 frames (not a shipped setting) | ~20 % | 1.94 dB (+0.14) |
+| neighbouring carriers filling the 200 kHz noise window | ~55 % | 2.29 dB (+0.45–0.5) |
+
+Clipping rarely bites because the local noise floor is the mean of per-frame *medians* in dB, about
+1.6 dB below the mean noise power (the median of an exponential is ln 2 of its mean). A noise bin's
+average therefore sits ~1.44× above the floor and is seldom clipped. The mismatch is real only where
+neighbouring carriers lift that median.
+
+What a censor level that is too low costs, measured with the `geo calibrate` engine (40 trials,
+test-grade grid, model L = 500 m, the solver told a censor level Δ below the simulated threshold;
+`scripts/calibrate_censor_offset.py`):
+
+| scenario | 90 % coverage, Δ = 0 / 0.5 / 1.5 / 3 dB | median mode error, Δ = 0 / 0.5 / 1.5 / 3 dB |
+|---|---|---|
+| random, 16 stops, ~5 unheard | 98 / 100 / 100 / 100 % | 666 / 694 / 724 / 742 m |
+| ring, 12 stops, ~6 unheard | 93 / 93 / 93 / 93 % | 1,161 / 1,196 / 1,324 / 1,296 m |
+| drive, 40 bins @ 150 m, ~12 unheard, true L 500 m | 95 / 95 / 95 / 95 % | 3,741 / 3,904 / 3,692 / 3,548 m |
+
+Regions stay honest; a too-low censor level widens them slightly. The stationary random layout's
+mode error grows monotonically, by ~4 % per 0.5 dB. At the ≤ 0.015 dB of a quiet band this is nil,
+so the conversion is **not changed**. Runs whose excess is derived from `snr_db` use the unclipped
+formula. They differ from new runs by the same ≤ 0.015 dB in a quiet band, which is far less than
+the max-over-windows bias they are already flagged for (`level_derived_from_snr_db`).
+
+The same measurement found a larger gap, with a different cause. The `(S+N)/N` gate is not what
+decides detection near threshold. The shape checks (fill ratio, equivalent width) are, so the 50 %
+detection point falls at a measured excess of ~3–4 dB in the live regime, 1–2 dB above the
+converted level. It applies equally to the `snr_db` path. By the table above it costs up to ~10 %
+of mode error and no coverage. Calibrating the censor level to a measured detection curve is a
+candidate Stage 3 item, not yet done.
+
 #### 3.2 Where a measurement was taken — implemented
 
 **Fix age.** The page now sends `fix_age_s` = `Date.now() − fix.timestamp`, two readings of the
@@ -293,6 +335,15 @@ widens the posterior to what the data supports; it does not model the shared sha
 - `geo calibrate --model-correlation-m` sets the solver's `L`; `--correlation-m` is the simulated truth.
 - Phase 7's `geo solve` is unchanged (`L = 0`); a test pins that `L = 0` is bit-identical to before.
 - Each solution's diagnostics record `shadowing_correlation.effective_measurements`.
+- Memory is bounded (review of 2026-11-12). The weights are summed in row blocks of at most 2^20
+  pairs, visiting only stops within 40 L in east (each skipped pair is worth exp(-40)), instead of
+  dense N × N × 2 and N × N arrays (~1 GB at 5,000 measurements). `_evaluate_grid` now sizes its
+  cell chunk by the measurement count as well as the offset count; sized by offsets alone it built
+  65,536 × N temporaries. Measured with production settings along a drive: peak 530 MB / 2.1 GB /
+  4.3 GB at 250 / 1,000 / 2,000 measurements before, 162 MB at all three after. Results match the
+  dense code to within 5e-13 relative, and `L = 0` solves are still bit-identical
+  (`tests/test_geo_solver_memory.py`). Memory is bounded; time is not: a few thousand measurements
+  with many non-detections still take minutes to hours.
 
 Measured (test-grade grid, 30 trials per row, true sigma 6 dB):
 
