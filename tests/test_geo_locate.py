@@ -342,3 +342,13 @@ def test_a_wide_channel_is_heard_at_its_centre_only_with_its_own_profile(
     assert not [offset for offset in narrow if abs(offset) <= 6_250], narrow
     wide = centres(50_000.0)
     assert len(wide) == 1 and abs(wide[0]) <= 2_000, wide
+
+
+def test_re_saving_the_same_bandwidth_keeps_a_tolerance_set_on_purpose(tmp_path: Path) -> None:
+    connection = _connection(tmp_path)
+    upsert_emitter(connection, emitter_key="cc469", frequency_hz=469.35e6, tolerance_hz=3_000.0)
+    target = _prepare(connection, tmp_path, channel_bandwidth_hz=12_500)
+    assert target["tolerance_hz"] == 3_000.0, "the page sends the bandwidth with every save"
+    assert _prepare(connection, tmp_path, channel_bandwidth_hz=12_500)["tolerance_hz"] == 3_000.0
+    # A new bandwidth does move it, to half a channel.
+    assert _prepare(connection, tmp_path, channel_bandwidth_hz=25_000)["tolerance_hz"] == 12_500.0
