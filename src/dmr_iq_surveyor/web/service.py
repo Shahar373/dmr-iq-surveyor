@@ -433,6 +433,11 @@ def _fix_age_seconds(value: Any) -> float | None:
     return min(max(age, 0.0), _MAX_REPORTED_FIX_AGE_S)
 
 
+# What a Locate target pins for its campaign (`_refuse_locate_override`).
+_LOCATE_PINNED_TUNING = ("center_frequency_hz", "sample_rate_hz")
+_LOCATE_PINNED_ALL = (*_LOCATE_PINNED_TUNING, "if_gain_reduction_db", "lna_state")
+
+
 def _target_in_bin(info: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
     """Whether one drive bin heard the Locate target, and how loud.
 
@@ -1265,6 +1270,7 @@ class FieldService:
     ) -> Job:
         refuse_if_read_only(view, "recording a stop", self.settings.capture_campaign_id)
         self.refuse_if_campaign_closed("recording a stop")
+        self._refuse_locate_override(payload, "recording a stop", _LOCATE_PINNED_ALL)
         if not self.settings.allow_capture:
             raise RuntimeError("captures are disabled on this server (--no-capture)")
 
@@ -2040,6 +2046,7 @@ class FieldService:
         everything it measured."""
         refuse_if_read_only(view, "starting a drive", self.settings.capture_campaign_id)
         self.refuse_if_campaign_closed("starting a drive")
+        self._refuse_locate_override(payload, "starting a drive", _LOCATE_PINNED_ALL)
         if not self.settings.allow_capture:
             raise RuntimeError("captures are disabled on this server (--no-capture)")
         running = self.jobs.active_job()
@@ -2310,6 +2317,9 @@ class FieldService:
         that cannot mix two gains inside one campaign (`_apply_calibration`).
         """
         refuse_if_read_only(view, "calibrating gain", self.settings.capture_campaign_id)
+        # The gain ladder starts from whatever LNA state it is given; only the
+        # tuning is pinned here.
+        self._refuse_locate_override(payload, "calibrating gain", _LOCATE_PINNED_TUNING)
         if not self.settings.allow_capture:
             raise RuntimeError("captures are disabled on this server (--no-capture)")
         running = self.jobs.active_job()
@@ -2799,6 +2809,43 @@ class FieldService:
                     "report_dir": None,
                 }
         return {"active": active, "solving": solving, "result": result}
+
+    def _refuse_locate_override(
+        self, payload: dict[str, Any], action: str, keys: tuple[str, ...]
+    ) -> None:
+        """Refuse a request that names another tuning or gain than the target's.
+
+        A Locate campaign is measured at one tuning and one gain; that is what
+        makes its levels comparable. Every write reads them from the settings,
+        but the classic page sends its own Record-tab values with each stop,
+        drive and calibration -- and a classic page loaded before the target
+        was chosen still holds the previous ones. Without this, one tap there
+        would add measurements at another gain to the target's campaign.
+        A request that names the same values, or none, is unaffected.
+        """
+        if self.locate_active() is None:
+            return
+        current = {
+            "center_frequency_hz": float(self.settings.center_frequency_hz),
+            "sample_rate_hz": float(self.settings.sample_rate_hz),
+            "if_gain_reduction_db": float(self.settings.if_gain_reduction_db),
+            "lna_state": float(self.settings.lna_state),
+        }
+        for key in keys:
+            if payload.get(key) is None:
+                continue
+            try:
+                asked = float(payload[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key} must be a number") from exc
+            # Hertz from a page multiply MHz by 1e6 in floating point.
+            if abs(asked - current[key]) > (1.0 if key.endswith("_hz") else 1e-6):
+                raise ValueError(
+                    f"{action} is refused: the Locate target in force pins {key} at "
+                    f"{current[key]:g} for its campaign, and this request asked for "
+                    f"{asked:g}. The page was probably opened before the target was "
+                    "chosen; reload it"
+                )
 
     def _locate_calibration_targets(self, center_hz: float, sample_rate_hz: float) -> list[float]:
         """The active target, when this tuning can see it; else nothing."""

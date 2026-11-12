@@ -616,3 +616,58 @@ def test_the_listed_active_target_counts_runs_measured_since_it_was_chosen(
         assert service.locate_active()["run_count"] == 1
     finally:
         service.close()
+
+
+# -- review fixes ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("action", "payload"), [
+    ("start_live", {"center_frequency_hz": 867_406_250.0}),
+    ("start_live", {"if_gain_reduction_db": 30.0}),
+    ("start_capture", {"sample_rate_hz": 5_000_000.0}),
+    ("start_capture", {"lna_state": 2}),
+    ("start_gain_calibration", {"center_frequency_hz": 867_406_250.0}),
+])
+def test_a_page_opened_before_the_target_cannot_measure_at_its_old_tuning_or_gain(
+    tmp_path: Path, action: str, payload: dict
+) -> None:
+    """The classic page sends its Record-tab values with every stop, drive
+    and calibration. One loaded before the target was chosen still holds the
+    previous ones, and a tap there must not mix them into the target's
+    campaign."""
+    service = _service(tmp_path)
+    try:
+        service.select_locate_target({"frequency_mhz": 469.35})
+        with pytest.raises(ValueError, match="reload it"):
+            getattr(service, action)(payload)
+    finally:
+        service.close()
+
+
+def test_the_same_values_or_none_pass_the_target_guard(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    try:
+        service.select_locate_target({"frequency_mhz": 469.35})
+        same = {
+            "center_frequency_hz": 469.25 * 1e6,   # as a page computes it
+            "sample_rate_hz": 2e6,
+            "if_gain_reduction_db": 40,
+            "lna_state": 4,
+        }
+        for payload in (same, {}):
+            with pytest.raises(ValueError) as refused:
+                service.start_live(payload)
+            assert "reload it" not in str(refused.value)
+            assert "GPS" in str(refused.value)
+    finally:
+        service.close()
+
+
+def test_without_a_target_a_request_may_still_name_its_own_tuning(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    try:
+        with pytest.raises(ValueError) as refused:
+            service.start_live({"center_frequency_hz": 469.25e6, "if_gain_reduction_db": 30})
+        assert "reload it" not in str(refused.value)
+    finally:
+        service.close()

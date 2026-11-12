@@ -522,11 +522,19 @@ def prepare_target(
             )
 
     # Every refusal above is made; from here on, write.
+    #
+    # The emitter's tolerance follows the bandwidth only where the bandwidth
+    # is new: a new emitter, or a campaign whose bandwidth differs from the
+    # one before it. Re-saving the same bandwidth must not overwrite a
+    # tolerance set on purpose (`geo emitter add --tolerance-hz`).
+    previous_bandwidth = (
+        float(latest["channel_bandwidth_hz"]) if latest else DEFAULT_CHANNEL_BANDWIDTH_HZ
+    )
     emitter = _resolve_emitter(
         connection, frequency, given,
         implied_tolerance_hz=(
-            default_tolerance_hz(requested_bandwidth) if requested_bandwidth is not None
-            else None if known else default_tolerance_hz(bandwidth)
+            default_tolerance_hz(bandwidth)
+            if known is None or bandwidth != previous_bandwidth else None
         ),
     )
     key = str(emitter["emitter_key"])
