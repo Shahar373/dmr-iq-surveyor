@@ -18,6 +18,7 @@
       <div id="hud-gps"><div class="v" id="hud-gps-v">–</div><div class="l" id="hud-gps-l">GPS</div></div>
     </div>
     <div class="mapnote" id="region-age" hidden></div>
+    <div class="mapnote picknote" id="pick-note" hidden>הקש על המיקום הידוע</div>
   </div>
 
   <section class="sheet" id="sheet" aria-live="polite">
@@ -125,6 +126,11 @@
       <details id="adv-truth-box">
         <summary>אימות מול מיקום ידוע</summary>
         <div class="screen inner">
+          <div class="row2 pick">
+            <button type="button" class="secondary" id="adv-pick" aria-pressed="false">סמן על המפה</button>
+            <button type="button" class="secondary" id="adv-clear">נקה</button>
+          </div>
+          <p class="hint" id="adv-pick-hint">הקש "סמן על המפה" ואז הקש על המיקום הידוע. אפשר לגרור את הסימן כדי לדייק.</p>
           <div class="row2">
             <div class="field"><label for="adv-lat">קו רוחב</label><input id="adv-lat" class="num" inputmode="decimal" placeholder="32.0812"></div>
             <div class="field"><label for="adv-lon">קו אורך</label><input id="adv-lon" class="num" inputmode="decimal" placeholder="34.7804"></div>

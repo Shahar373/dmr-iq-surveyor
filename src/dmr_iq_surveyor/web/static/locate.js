@@ -42,6 +42,7 @@ const S = {
   lastHeard: null,
   pullOverBin: null,
   gpsLost: false,
+  picking: false,        // the next map tap sets the known position
 };
 
 /* ------------------------------------------------------------- helpers */
@@ -175,6 +176,12 @@ function show(name) {
     loadTargets().then(() => { if (S.screen === "advanced") fillAdvanced(); });
   }
   if (name === "menu") fillMenu();
+  // The known position is never on the map outside its own settings screen:
+  // the driver must not steer toward it.
+  if (name !== "advanced") {
+    stopPicking();
+    if (layers.truth) layers.truth.clearLayers();
+  }
   if (map) setTimeout(() => map.invalidateSize(), 50);
 }
 
@@ -231,9 +238,16 @@ function initMap() {
     ? "/tiles/{z}/{x}/{y}.png" + (TOKEN ? "?token=" + encodeURIComponent(TOKEN) : "")
     : settings.tile_url;
   L.tileLayer(tileUrl, { attribution: settings.tile_attribution, maxZoom: 19 }).addTo(map);
-  for (const name of ["regions", "track", "bins", "plan", "mode", "here"]) {
+  for (const name of ["regions", "track", "bins", "plan", "mode", "here", "truth"]) {
     layers[name] = L.layerGroup().addTo(map);
   }
+  map.on("click", (event) => {
+    if (!S.picking || S.screen !== "advanced") return;
+    setTruthFields(event.latlng.lat, event.latlng.lng);
+    drawTruthMarker();
+    stopPicking();
+  });
+  if (S.screen === "advanced") drawTruthMarker();
 }
 
 function binColour(target) {
@@ -956,11 +970,82 @@ function fillAdvanced() {
     $("#adv-restart").hidden = true;
     $("#adv-save").textContent = "שמור לתדר הבא";
   }
+  $("#adv-pick-hint").textContent = editingActive && active.has_known_position
+    ? "מיקום ידוע כבר שמור ליעד הזה (הוא לא מוצג). סימון חדש ושמירה יחליפו אותו."
+    : "הקש \"סמן על המפה\" ואז הקש על המיקום הידוע. אפשר לגרור את הסימן כדי לדייק.";
+  stopPicking();
+  drawTruthMarker();
 }
 
 function pressed(attribute) {
   const node = $$(`[data-${attribute}]`).find((item) => item.getAttribute("aria-pressed") === "true");
   return node ? node.dataset[attribute] : null;
+}
+
+/* The known position: tapped on the map (typing stays as a fallback for when
+   the map library did not load). Shown only on this screen. */
+
+function truthFieldsValue() {
+  const lat = Number($("#adv-lat").value.trim());
+  const lon = Number($("#adv-lon").value.trim());
+  const filled = $("#adv-lat").value.trim() && $("#adv-lon").value.trim();
+  if (!filled || !Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  return [lat, lon];
+}
+
+function setTruthFields(lat, lon) {
+  $("#adv-lat").value = lat.toFixed(6);
+  $("#adv-lon").value = L.Util.wrapNum(lon, [-180, 180], true).toFixed(6);
+}
+
+function drawTruthMarker() {
+  if (!map || !layers.truth) return;
+  layers.truth.clearLayers();
+  const point = truthFieldsValue();
+  if (!point || S.screen !== "advanced") return;
+  // A page-drawn pin: Leaflet's default icon needs image files the Pi may not have.
+  const marker = L.marker(point, {
+    draggable: true, autoPan: true, keyboard: false,
+    icon: L.divIcon({
+      className: "", html: '<div class="truth-marker"><span>מיקום ידוע</span></div>',
+      iconSize: [22, 22], iconAnchor: [11, 11],
+    }),
+  }).addTo(layers.truth);
+  marker.on("dragend", () => {
+    const at = marker.getLatLng();
+    setTruthFields(at.lat, at.lng);
+  });
+}
+
+function startPicking() {
+  if (!map) {
+    $("#adv-pick-hint").textContent = "המפה לא נטענה, אז אי אפשר לסמן עליה. הזן קו רוחב וקו אורך.";
+    return;
+  }
+  S.picking = true;
+  $("#adv-pick").setAttribute("aria-pressed", "true");
+  $("#adv-pick").textContent = "הקש על המפה…";
+  $("#pick-note").hidden = false;
+  map.getContainer().classList.add("picking");
+  const point = truthFieldsValue();
+  if (point) map.panTo(point, { animate: true });
+}
+
+function stopPicking() {
+  S.picking = false;
+  const button = $("#adv-pick");
+  button.setAttribute("aria-pressed", "false");
+  button.textContent = truthFieldsValue() ? "סמן שוב על המפה" : "סמן על המפה";
+  $("#pick-note").hidden = true;
+  if (map) map.getContainer().classList.remove("picking");
+}
+
+function clearTruth() {
+  $("#adv-lat").value = "";
+  $("#adv-lon").value = "";
+  stopPicking();
+  drawTruthMarker();
 }
 
 function truthFromForm() {
@@ -1067,6 +1152,11 @@ function wire() {
   }));
   $$("[data-bw]").forEach((node) => node.addEventListener("click", () => setSeg("bw", node.dataset.bw)));
   $("#adv-save").addEventListener("click", saveAdvanced);
+  $("#adv-pick").addEventListener("click", () => {
+    if (S.picking) stopPicking(); else startPicking();
+  });
+  $("#adv-clear").addEventListener("click", clearTruth);
+  ["#adv-lat", "#adv-lon"].forEach((id) => $(id).addEventListener("input", drawTruthMarker));
   $("#adv-restart").addEventListener("click", () => { $("#adv-restart-confirm").hidden = false; });
   $("#adv-restart-no").addEventListener("click", () => { $("#adv-restart-confirm").hidden = true; });
   $("#adv-restart-yes").addEventListener("click", restartCampaign);
